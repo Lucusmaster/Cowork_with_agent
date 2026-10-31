@@ -1949,7 +1949,9 @@ ul.files li:before{content:"•";position:absolute;left:var(--sp-0);color:var(--
 body.picking .main,body.picking .side,body.picking .inspector{pointer-events:none}
 
 /* ---------- 删除确认框 ---------- */
-.confirm{position:fixed;inset:0;z-index:80;display:flex;align-items:center;
+/* 层级：确认框是「二级弹窗」，必须压在所有面板之上（回收站 81 / 选择器 75 / 菜单 78）。
+   80 那一档以前是够的，后来回收站挪到 81，确认框就钻到遮罩下面去了——点「清空」看不到它。 */
+.confirm{position:fixed;inset:0;z-index:90;display:flex;align-items:center;
   justify-content:center;padding:var(--sp-4);background:#05070ac7}
 .confirm[hidden]{display:none}
 .confirm-card{width:min(440px,100%);background:var(--panel);border:var(--hair) solid var(--line2);
@@ -3850,7 +3852,13 @@ function closeSessMenu(focusBack){
 
 function sessKeys(ev){
   if(confirmEl && !confirmEl.hidden){                 // 确认框开着：Esc 取消、Tab 只在两个按钮间转
-    if(ev.key === 'Escape'){ ev.preventDefault(); closeConfirm(true); return; }
+    if(ev.key === 'Escape'){
+      ev.preventDefault();
+      // 模态优先：别让同一个 Esc 继续传到下面那层（回收站会把面板也关掉）
+      ev.stopImmediatePropagation();
+      closeConfirm(true);
+      return;
+    }
     if(ev.key === 'Tab'){
       const ring = [$('confirm-cancel'), $('confirm-ok')];
       const at = ring.indexOf(document.activeElement);
@@ -4852,6 +4860,8 @@ if(trashEl) trashEl.addEventListener('click', ev => {
   if(ev.target === trashEl) closeTrash(true);          // 点遮罩 = 关闭
 });
 document.addEventListener('keydown', ev => {
+  // 两层叠着时 Esc 只收最上面那层：确认框已经 preventDefault 处理过的，这里不再管
+  if(ev.defaultPrevented || (confirmEl && !confirmEl.hidden)) return;
   if(ev.key === 'Escape' && trashEl && !trashEl.hidden) closeTrash(true);
 });
 

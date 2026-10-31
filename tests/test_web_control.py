@@ -1625,6 +1625,35 @@ class PageContractTests(unittest.TestCase):
         self.assertIn("彻底删除", page, "清空是不可逆的，文案要说清楚")
         self.assertIn("runConfirm", page, "确认框要能带着动作跑，别写死成只删会话")
 
+    def test_confirm_layer_sits_above_every_panel(self) -> None:
+        """确认框是二级弹窗：必须压在回收站 / 选择器 / 会话菜单之上。
+
+        0.9.9 的 bug：回收站挪到 z-index 81，确认框还停在 80，于是点「清空回收站」
+        弹出来的确认框钻到遮罩底下——用户得先关掉回收站才看得见，还以为没弹。
+        """
+        page = room_web.PAGE
+
+        def z_of(selector: str) -> int:
+            match = re.search(re.escape(selector) + r"\{[^}]*?z-index:(\d+)", page, re.S)
+            self.assertIsNotNone(match, f"找不到 {selector} 的 z-index")
+            return int(match.group(1))
+
+        confirm_z = z_of(".confirm")
+        for lower in (".trash", ".picker", ".sess-menu"):
+            self.assertGreater(confirm_z, z_of(lower),
+                               f"确认框（z={confirm_z}）必须高于 {lower}，否则二级确认看不见")
+
+    def test_esc_only_closes_the_top_layer(self) -> None:
+        """回收站上叠着确认框时，Esc 不能把两层一起关掉。
+
+        两道保险：确认框那一层 stopImmediatePropagation（模态优先），
+        回收站那层再看一眼 defaultPrevented / 确认框是否还开着。
+        """
+        page = room_web.PAGE
+        self.assertIn("ev.stopImmediatePropagation()", page, "确认框处理 Esc 时不能让事件继续往下传")
+        self.assertIn("if(ev.defaultPrevented || (confirmEl && !confirmEl.hidden)) return;", page,
+                      "回收站的 Esc 处理要先让位给确认框")
+
 
 if __name__ == "__main__":
     unittest.main()
