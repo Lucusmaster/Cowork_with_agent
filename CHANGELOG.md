@@ -1,3 +1,32 @@
+## 0.8.0 — 长任务不再被误判成死引擎
+
+用户真机跑长任务时抓到的问题：Codex 执行超过 90 秒，`room/worker.lock` 心跳过期，
+页面显示"引擎没在跑"、四个控制按钮全灰、`start-all --stop` 也说"本来就没在跑"没杀掉进程。
+
+### 修复
+- **独立心跳线程**：worker 主循环被长任务占住时，心跳仍每 10 秒刷新。
+  真机验证：150 秒连续执行期间心跳年龄始终 0.6~9.5 秒，界面状态一直是 `running`。
+- **判断存活只看进程**：新增 `agent_team/procs.py`（`pid_alive` / `lock_state`）。
+  `take_lock` 不再因为心跳旧就抢锁（会双开），`start_all` 的 status/stop 也认进程。
+- **`os.kill(pid, 0)` 的地雷**：Windows 上那等于 `TerminateProcess`，会把目标进程直接杀掉。
+  worker 里原来就在用，统一换成 `procs.pid_alive()`。
+- **心跳原子写**：`write_text` 会被网页读到写了一半的 JSON，改成临时文件 + `os.replace`。
+- 界面按 `alive` 启用按钮，心跳旧显示黄色「可能在跑长任务」，不再置灰。
+
+### 新增
+- 引擎三态 `running|busy|stalled|dead`，`/api/state.engine` 直接给。
+- 规划中占位卡：还没建出任务卡时也能看到"正在规划"和当前需求，暂停/停止可用。
+- 消息分页：默认最近 120 条 + 「加载更早」 + 轮询只追加（不再每次全量重画）；
+  `GET /api/messages?before=&limit=`（limit 上限 500）。
+
+### 修复（顺带）
+- 测试会写真实 `room/worker.log`：`log()` 用的是 import 时缓存的路径，改 ROOM 后仍写真实账本。
+  改成每次从 ROOM 现算；全量测试跑完后真实日志字节数不变。
+
+### 验证
+- 212 项测试全绿，`ruff check .` 干净。
+- 真机：150 秒执行期间心跳不过期、界面不误判；任务中途点停止后，任务记为 `stopped / outcome=failure`。
+
 ## 0.7.0 — 会拆活了
 
 ### 新增

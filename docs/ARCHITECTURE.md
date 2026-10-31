@@ -83,7 +83,7 @@ agent_team/      引擎与所有运行时模块（包）
 bin/             兼容壳（老命令 python bin/xxx.py 仍可用）+ 系统启动脚本
 config/          team.json：模型、超时、重试
 agents/          复核者的系统提示词
-tests/           回归测试（177 项）
+tests/           回归测试（212 项）
 docs/            设计文档
 room/ tasks/     运行时账本与任务卡（不进产物仓库）
 ```

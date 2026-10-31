@@ -7,15 +7,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from agent_team import control, room_web
+from agent_team import control, procs, room_web
 
 TASK = "T-261031-160000"
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
@@ -35,6 +37,18 @@ class FakeStore:
             "status": "complete", "created_at": "2026-10-31T16:00:00",
         }]
 
+    def seed(self, count: int) -> None:
+        """造 count 条历史消息：第一条是用户需求，后面交替助手回复。"""
+        self.items = []
+        for i in range(1, count + 1):
+            role = "user" if i == 1 else "assistant"
+            self.items.append({
+                "id": f"msg-{i:03d}", "session_id": "chat-test", "role": role,
+                "agent": "user" if role == "user" else "coordinator",
+                "task_id": None, "content": f"第 {i} 条消息", "artifacts": [],
+                "status": "complete", "created_at": "2026-10-31T16:00:00",
+            })
+
     def sessions(self) -> list[dict]:
         return [{
             "id": "chat-test", "title": "测试会话", "workspace": "",
@@ -46,7 +60,14 @@ class FakeStore:
         return self.sessions()[0]
 
     def messages(self, session_id: str, after_id: str = "", limit: int = 200) -> list[dict]:
-        return [dict(item) for item in self.items]
+        """和 session.messages 一个口径：after 之后、再取最后 limit 条（limit<=0 不截断）。"""
+        rows = [dict(item) for item in self.items]
+        if after_id:
+            position = next((i for i, m in enumerate(rows) if m["id"] == after_id), None)
+            rows = rows[position + 1:] if position is not None else []
+        if limit and limit > 0:
+            rows = rows[-limit:]
+        return rows
 
     def create(self, workspace: str = "", title: str = "") -> dict:
         return self.sessions()[0]
@@ -157,6 +178,16 @@ class WebCase(unittest.TestCase):
         except ValueError:
             return status, raw
 
+    # ---------- 伪造引擎状态 ----------
+    def write_lock(self, pid: int, age: float) -> None:
+        """写一个 worker.lock：pid 用真的（本进程），age 是心跳多少秒前。"""
+        (room_web.ROOM / "worker.lock").write_text(
+            json.dumps({"pid": pid, "beat": time.time() - age}), encoding="utf-8")
+
+    def write_typing(self, who: str = "coordinator") -> None:
+        room_web.TYPING_FILE.write_text(
+            json.dumps({"who": who, "at": time.time()}), encoding="utf-8")
+
 
 class TokenFileTests(WebCase):
     def test_token_is_32_hex_and_reused(self) -> None:
@@ -255,6 +286,7 @@ class ControlEndpointTests(WebCase):
         self.assertEqual(state["paused"]["reason"], "等你批准后再动手")
         self.assertIn("engine", state)
         self.assertFalse(state["engine"]["alive"], "测试目录里没有 worker.lock，应为未运行")
+        self.assertEqual(state["engine"]["status"], "none")
 
     def test_control_get_lists_actions(self) -> None:
         status, data = self.call("/api/control", token=self.token)
@@ -325,6 +357,160 @@ class StateShapeTests(WebCase):
             self.assertIn(key, state, f"旧字段 {key} 不能被改坏")
         self.assertEqual(state["session"]["id"], "chat-test")
         self.assertEqual(len(state["messages"]), 1)
+        for key in ("engine", "busy", "messages_limit", "total_messages"):
+            self.assertIn(key, state, f"新字段 {key} 得在 state 里")
+
+    def test_engine_payload_matches_procs(self) -> None:
+        self.write_lock(os.getpid(), 5)
+        status, state = self.call("/api/state", token=self.token)
+        engine = state["engine"]
+        self.assertTrue(engine["alive"])
+        self.assertEqual(engine["status"], "running")
+        self.assertEqual(engine["pid"], os.getpid())
+        self.assertFalse(engine["stale"])
+        self.assertLess(engine["age"], 90)
+        direct = procs.lock_state(room_web.ROOM / "worker.lock")
+        self.assertEqual(engine["status"], direct["status"], "state 里的引擎态必须和 procs 一致")
+        self.assertEqual(engine["alive"], direct["alive"])
+
+
+class EngineStatusTests(WebCase):
+    """引擎三态：进程活着心跳旧 = stalled，不是「没在跑」。"""
+
+    def test_stalled_when_process_alive_but_heartbeat_old(self) -> None:
+        self.write_lock(os.getpid(), 200)
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200)
+        engine = state["engine"]
+        self.assertTrue(engine["alive"], "进程明明还活着")
+        self.assertEqual(engine["status"], "stalled")
+        self.assertTrue(engine["stale"])
+        self.assertGreaterEqual(engine["age"], 190)
+
+    def test_dead_when_pid_does_not_exist(self) -> None:
+        self.write_lock(999_999_999, 5)
+        status, state = self.call("/api/state", token=self.token)
+        engine = state["engine"]
+        self.assertFalse(engine["alive"])
+        self.assertEqual(engine["status"], "dead")
+
+    def test_none_when_no_lock_file(self) -> None:
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["engine"]["status"], "none")
+        self.assertFalse(state["engine"]["alive"])
+
+    def test_busy_when_beat_is_between_30_and_90(self) -> None:
+        self.write_lock(os.getpid(), 45)
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["engine"]["status"], "busy", "45 秒没刷新算忙，但仍然活着")
+
+    def test_stalled_still_alive_for_buttons(self) -> None:
+        """stalled 时 alive 为真 —— 前端按钮就靠这个，心跳旧也必须能点。"""
+        self.write_lock(os.getpid(), 600)
+        status, state = self.call("/api/state", token=self.token)
+        self.assertTrue(state["engine"]["alive"])
+        self.assertEqual(state["engine"]["status"], "stalled")
+
+
+class PagingTests(WebCase):
+    """消息分页：state 默认最近 120 条，往前翻走 /api/messages?before=。"""
+
+    def test_state_defaults_to_latest_120(self) -> None:
+        self.store.seed(300)
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(state["messages"]), 120)
+        self.assertEqual(state["messages"][0]["id"], "msg-181")
+        self.assertEqual(state["messages"][-1]["id"], "msg-300")
+        self.assertEqual(state["messages_limit"], 120)
+        self.assertEqual(state["total_messages"], 300)
+
+    def test_state_limit_param(self) -> None:
+        self.store.seed(300)
+        status, state = self.call("/api/state?limit=50", token=self.token)
+        self.assertEqual(len(state["messages"]), 50)
+        self.assertEqual(state["messages"][-1]["id"], "msg-300")
+        self.assertEqual(state["messages_limit"], 50)
+
+    def test_state_after_returns_only_new(self) -> None:
+        self.store.seed(300)
+        status, state = self.call("/api/state?after=msg-298", token=self.token)
+        self.assertEqual([m["id"] for m in state["messages"]], ["msg-299", "msg-300"])
+
+    def test_before_pages_backwards(self) -> None:
+        self.store.seed(300)
+        status, page = self.call("/api/messages?before=msg-181&limit=120", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertTrue(page["ok"])
+        self.assertEqual(len(page["messages"]), 120)
+        self.assertEqual(page["messages"][0]["id"], "msg-061")
+        self.assertEqual(page["messages"][-1]["id"], "msg-180")
+        self.assertTrue(page["has_more"], "前面还有 60 条")
+
+        status, page2 = self.call("/api/messages?before=msg-061&limit=120", token=self.token)
+        self.assertEqual(len(page2["messages"]), 60)
+        self.assertEqual(page2["messages"][0]["id"], "msg-001")
+        self.assertFalse(page2["has_more"], "到头了")
+
+    def test_limit_is_clamped(self) -> None:
+        self.store.seed(600)
+        status, page = self.call("/api/messages?limit=99999", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(page["limit"], 500, "limit 上限 500")
+        self.assertEqual(len(page["messages"]), 500)
+        self.assertTrue(page["has_more"])
+
+    def test_bad_limit_falls_back_to_default(self) -> None:
+        self.store.seed(300)
+        status, page = self.call("/api/messages?limit=abc", token=self.token)
+        self.assertEqual(page["limit"], 120)
+        self.assertEqual(len(page["messages"]), 120)
+        self.assertTrue(page["has_more"])
+
+    def test_paging_requires_token(self) -> None:
+        status, data = self.call("/api/messages?before=msg-001")
+        self.assertEqual(status, 401)
+
+
+class BusyTests(WebCase):
+    """规划阶段：有 typing 就是忙着，右栏据此摆占位卡。"""
+
+    def test_busy_true_while_typing_and_engine_alive(self) -> None:
+        self.write_lock(os.getpid(), 5)
+        self.write_typing("coordinator")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200)
+        busy = state["busy"]
+        self.assertTrue(busy["busy"])
+        self.assertEqual(busy["phase"], "plan")
+        self.assertIn("记住我", busy["request"])
+        self.assertTrue(busy["since"])
+
+    def test_busy_false_without_typing(self) -> None:
+        self.write_lock(os.getpid(), 5)
+        status, state = self.call("/api/state", token=self.token)
+        self.assertFalse(state["busy"]["busy"])
+
+    def test_busy_false_when_engine_dead(self) -> None:
+        """typing.json 忘了删也不能骗用户「在规划」。"""
+        self.write_lock(999_999_999, 5)
+        self.write_typing("coordinator")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertFalse(state["busy"]["busy"])
+
+    def test_phase_follows_who(self) -> None:
+        self.write_lock(os.getpid(), 5)
+        self.write_typing("executor")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["busy"]["phase"], "execute")
+
+    def test_typing_short_stays_visible(self) -> None:
+        """typing 的 3 分钟过滤只管「正在思考」气泡，忙不忙另算。"""
+        self.write_lock(os.getpid(), 5)
+        self.write_typing("coordinator")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["typing"]["who"], "coordinator", "刚写的 typing 应该可见")
+        self.assertTrue(state["busy"]["busy"])
 
 
 if __name__ == "__main__":

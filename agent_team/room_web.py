@@ -40,6 +40,11 @@ try:
 except Exception:  # noqa: BLE001 - 控制模块缺失时网页照常能看，只是按钮点了没反应
     control = None
 
+try:
+    from . import procs
+except Exception:  # noqa: BLE001 - 进程判断缺失时退化成"看不到引擎"，不耽误看消息
+    procs = None
+
 # Windows 控制台默认 GBK，中文会炸；统一按 UTF-8 输出。
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -58,6 +63,10 @@ SESSION_STATE = ROOM / "session_state.json"
 TOKEN_FILE = ROOM / "web-token"          # 网页访问令牌；main() 启动时读/生成
 MAX_ARTIFACT = 200 * 1024
 CONTROL_ACTIONS = ("pause", "resume", "stop", "approve", "rerun")
+
+# 消息分页：默认只给最近一页，往前翻页走 /api/messages?before=
+PAGE_SIZE = 120
+MAX_PAGE = 500
 
 # 访问令牌：启动时由 _ensure_token() 填。为空表示"没启用令牌"（安全兜底，不把人锁在外面）。
 TOKEN = ""
@@ -494,19 +503,31 @@ def _project_workspace() -> str:
     return _norm_path(_project_info().get("workspace") or "")
 
 
-def _typing_info() -> dict:
+def _typing_raw() -> dict:
+    """typing.json 原样（不做新旧过滤）：判断"引擎忙不忙"要看它。"""
     try:
         data = json.loads(TYPING_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
-    if not isinstance(data, dict):
-        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _typing_info() -> dict:
+    data = _typing_raw()
     try:
         if time.time() - float(data.get("at") or 0) > 180:   # 超过 3 分钟别一直转
             return {}
     except (TypeError, ValueError):
         return {}
     return data
+
+
+def _session_state_info() -> dict:
+    try:
+        data = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _ensure_token() -> str:
@@ -533,21 +554,131 @@ def _ensure_token() -> str:
     return token
 
 
+_ENGINE_IDLE = {"pid": 0, "beat": 0.0, "age": -1.0, "alive": False,
+                "stale": True, "status": "none"}
+
+# typing.json 的 who 对应流水线阶段（规划阶段 default who 就是 coordinator）
+_PHASE_BY_WHO = {
+    "coordinator": "plan",
+    "planner": "plan",
+    "executor": "execute",
+    "tester": "verify",
+    "reviewer": "review",
+}
+
+_BUSY_IDLE = {"busy": False, "since": "", "request": "", "phase": "",
+              "who": "", "task_stale": False}
+
+
 def _engine_info() -> dict:
-    """工作流引擎在不在跑：只看 worker.lock 的 pid + 心跳，不额外起进程。"""
+    """引擎状态：进程在不在看 alive，心跳旧只算 stalled，绝不是"没在跑"。
+
+    判断交给 procs.lock_state（Windows 上 os.kill(pid, 0) 会真的杀掉进程，
+    这种判断一行都不能自己写）。
+    """
+    if procs is None:
+        return dict(_ENGINE_IDLE)
     try:
-        info = json.loads((ROOM / "worker.lock").read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {"alive": False, "pid": 0, "beat": 0.0}
-    if not isinstance(info, dict):
-        return {"alive": False, "pid": 0, "beat": 0.0}
-    pid = _as_int(info.get("pid"))
+        state = procs.lock_state(ROOM / "worker.lock")
+    except Exception:  # noqa: BLE001 - 锁文件坏了不该让状态接口挂掉
+        return dict(_ENGINE_IDLE)
+    if not isinstance(state, dict):
+        return dict(_ENGINE_IDLE)
+    status = str(state.get("status") or "none")
     try:
-        beat = float(info.get("beat") or 0)
+        age = round(float(state.get("age") if state.get("age") is not None else -1.0), 1)
+    except (TypeError, ValueError):
+        age = -1.0
+    try:
+        beat = round(float(state.get("beat") or 0), 3)
     except (TypeError, ValueError):
         beat = 0.0
-    # 和 worker.take_lock 一个口径：90 秒内有心跳才算活着
-    return {"alive": bool(pid) and (time.time() - beat) < 90, "pid": pid, "beat": beat}
+    return {
+        "pid": _as_int(state.get("pid")),
+        "beat": beat,
+        "age": age,
+        "alive": bool(state.get("alive")),
+        "stale": bool(state.get("stale")),
+        "status": status,
+    }
+
+
+def _busy_info(session: dict, messages: list[dict], task: dict | None) -> dict:
+    """"正在规划/还没有任务卡"的占位信息：给右栏用，别让用户觉得界面卡死。"""
+    raw = _typing_raw()
+    if not raw:
+        return dict(_BUSY_IDLE)
+    who = str(raw.get("who") or "")
+    try:
+        at = float(raw.get("at") or 0)
+    except (TypeError, ValueError):
+        at = 0.0
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(at)) if at else ""
+
+    request_msg = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if request_msg is None:
+        try:
+            # 轮询只带了最近一页，需求可能在更早的地方：全量找最后一条 user
+            sid = str(session.get("id") or "")
+            request_msg = next((m for m in reversed(STORE.messages(sid, "", 0))
+                                if m.get("role") == "user"), None)
+        except Exception:  # noqa: BLE001 - 读会话失败也不能让状态接口挂掉
+            request_msg = None
+    request = str((request_msg or {}).get("content") or "").strip()
+
+    task_stale = False
+    if task:
+        task_stale = bool(task.get("finished_at")) or str(task.get("status") or "") in TERMINAL_STATUS
+        if not task_stale and request_msg:
+            created = str(task.get("created_at") or "")
+            asked = str(request_msg.get("created_at") or "")
+            if created and asked and created < asked:
+                task_stale = True        # 卡片是上一条需求的，这条还在规划
+    return {
+        "busy": True,
+        "since": since,
+        "request": request,
+        "phase": _PHASE_BY_WHO.get(who, who),
+        "who": who,
+        "task_stale": task_stale,
+    }
+
+
+def _page_limit(raw, default: int = PAGE_SIZE) -> int:
+    """一页多少条：默认 120，传 0/乱码也用默认，超过 500 一律按 500 算。"""
+    limit = _as_int(raw, 0)
+    if limit <= 0:
+        limit = default
+    return min(limit, MAX_PAGE)
+
+
+def _messages_page(session_id: str, before_id: str, limit: int) -> dict:
+    """往前翻一页：before 是客户端当前最老那条的 id；给空就返回最新一页。"""
+    limit = max(1, min(limit, MAX_PAGE))
+    sid = str(session_id or "") or str(STORE.active().get("id") or "")
+    rows: list[dict] = []
+    if STORE.ready:
+        try:
+            rows = STORE.messages(sid, "", 0)      # 翻页是点击行为，全量读一次可接受
+        except Exception:  # noqa: BLE001
+            rows = []
+    if not rows:
+        rows = _legacy_messages(0)
+    total = len(rows)
+    end = total
+    if before_id:
+        position = next((i for i, row in enumerate(rows) if str(row.get("id")) == str(before_id)), None)
+        if position is not None:
+            end = position
+    start = max(0, end - limit)
+    return {
+        "ok": True,
+        "session_id": sid,
+        "messages": rows[start:end],
+        "has_more": start > 0,
+        "limit": limit,
+        "total": total,
+    }
 
 
 def _control_state() -> tuple[dict | None, dict | None]:
@@ -680,6 +811,9 @@ def _task_detail(tid: str) -> dict | None:
         "goal": task.get("goal", ""),
         "status": task.get("status", "planned"),
         "workspace": workspace,
+        "created_at": str(task.get("created_at") or ""),
+        "updated_at": str(task.get("updated_at") or ""),
+        "finished_at": str(task.get("finished_at") or ""),
         "acceptance": task.get("acceptance") or [],
         "rounds": task.get("rounds") or [],
         "reviews": task.get("reviews") or [],
@@ -821,19 +955,25 @@ def _agents_state(task: dict | None, typing: dict, messages: list[dict]) -> dict
     return {**roles, **legacy}
 
 
-def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "") -> dict:
+def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "",
+                   limit=None) -> dict:
     active = STORE.active(session_id)
     sid = str(active.get("id") or "")
     sessions = STORE.sessions()
     if not any(s.get("id") == sid for s in sessions):
         sessions = [active, *sessions]
     sessions.sort(key=lambda s: str(s.get("updated_at") or ""), reverse=True)
-    messages = STORE.messages(sid, after_id)
+    page_limit = _page_limit(limit)
+    messages = STORE.messages(sid, after_id, page_limit)
     typing = _typing_info()
+    engine = _engine_info()
     task = _task_detail(task_id) if task_id else _current_task(active, messages)
     project = _project_info()
     changes = _changes(task)
     paused, pending = _control_state()
+    busy = _busy_info(active, messages, task)
+    if not engine.get("alive"):
+        busy = dict(_BUSY_IDLE)          # 引擎都没了，别拿残留的 typing.json 骗用户"在规划"
     workspaces = _workspaces(sessions, str(project.get("workspace") or ""))
     current_ws = _project_workspace() or str(active.get("workspace") or "")
     for item in workspaces:
@@ -844,16 +984,18 @@ def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "") 
         "sessions": sessions,
         "workspaces": workspaces,
         "messages": messages,
+        "messages_limit": page_limit,
         "agents": _agents_state(task, typing, messages),
         "typing": typing,
         "task": task,
         "changes": changes,
         "paused": paused,                        # 暂停中：{task, stage, reason, since}
         "control": pending,                      # 还没被引擎消费的控制指令
-        "engine": _engine_info(),                # 引擎在不在跑，控制按钮据此启停
+        "engine": engine,                        # alive 才算在跑，心跳旧只是 stalled
+        "busy": busy,                            # 规划中占位：{busy, since, request, phase}
         "workspace": current_ws,
         "project": project,                       # 兼容旧前端
-        "total_messages": _as_int(active.get("message_count"), len(messages)),
+        "total_messages": max(_as_int(active.get("message_count"), len(messages)), len(messages)),
         "tasks": _tasks_summary(),
         "now": _now(),
         "root": str(ROOT),
@@ -1136,6 +1278,22 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
 .paused-banner b{color:#ffd27a;font-weight:600}
 .live.paused{color:#f3d08a;border-color:#d2992255;background:#d2992214}
 .live.paused .dot{background:var(--warn);box-shadow:0 0 0 3px #d2992222}
+/* 引擎三态：活着就是绿/黄，只有进程真没了才灰 */
+.live.engine-running{color:#9be3b1;border-color:#3fb95055;background:#3fb95014}
+.live.engine-running .dot{background:var(--ok);box-shadow:0 0 0 3px #3fb95022}
+.live.engine-stalled{color:#f3d08a;border-color:#d2992255;background:#d2992214}
+.live.engine-stalled .dot{background:var(--warn);box-shadow:0 0 0 3px #d2992222}
+.live.engine-dead{color:var(--dim);border-color:var(--line2);background:var(--panel2)}
+.live.engine-dead .dot{background:#4b5563}
+.topbar-title .live{margin-left:auto}
+.earlier{position:sticky;top:0;z-index:2;display:block;margin:0 auto 14px;height:27px;
+  padding:0 13px;border-radius:999px;border:1px solid var(--line2);background:var(--panel2);
+  color:var(--dim);font-size:11.5px}
+.earlier:hover:not(:disabled){color:var(--fg);border-color:#3d4a5c}
+.earlier:disabled{opacity:.55}
+.earlier[hidden]{display:none}
+.task-card.pending{border-color:#d2992244;background:#1b1a14}
+.task-card.pending .ttitle{color:#f0d9a8}
 
 /* ---------- 访问令牌 ---------- */
 .unlock{position:fixed;inset:0;display:grid;place-items:center;padding:32px;z-index:70;
@@ -1203,6 +1361,8 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
       <div class="topbar-row topbar-title">
         <div class="sess-name" id="crumb">新会话</div>
         <div class="live" id="live"><span class="dot"></span><span id="live-txt">空闲</span></div>
+        <div class="live engine-dead" id="engine" title="">
+          <span class="dot"></span><span id="engine-txt">引擎没在跑</span></div>
       </div>
       <div class="topbar-row">
         <input class="ws-input" id="ws-input" spellcheck="false"
@@ -1283,6 +1443,7 @@ let controlCooldown = 0;
 
 const $ = id => document.getElementById(id);
 const streamEl = $('stream'), sessionsEl = $('sessions'), inspEl = $('insp');
+const welcomeHtml = ($('welcome') || {}).outerHTML || '';
 const wsInput = $('ws-input'), wsBtn = $('ws-btn'), wsStatus = $('ws-status');
 const input = $('input'), sendBtn = $('send');
 const modal = $('modal'), modalPath = $('modal-path'), modalBody = $('modal-body');
@@ -1292,12 +1453,19 @@ const unlockBtn = $('unlock-btn'), unlockErr = $('unlock-err');
 
 let st = {};
 let activeId = '';
-let renderedSession = '';
 let localTyping = null;
 let typingEl = null;
 let firstPaint = true;
 let echoSeq = 0;
 const seen = new Map();
+
+/* 消息分页：本地只留已加载的消息，轮询增量合并，翻页只在点击时发生。 */
+const PAGE = 120;
+let msgs = [];                 // 已加载的消息（升序）
+let syncedSession = '';        // msgs 属于哪个会话
+let hasMoreBefore = false;     // 上面还有更早的消息
+
+const asInt = (v, d) => { const n = parseInt(v, 10); return isNaN(n) ? d : n; };
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => (
   {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1435,11 +1603,90 @@ function resetStream(){
   streamEl.innerHTML = '';
   seen.clear();
   if(typingEl){ typingEl.remove(); typingEl = null; }
+  ensureEarlier();
 }
 function nearBottom(){
   return streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 120;
 }
 function scrollDown(){ streamEl.scrollTop = streamEl.scrollHeight; }
+
+/* ---------- 消息增量合并/分页 ---------- */
+function msgSig(m){
+  return JSON.stringify([m.role, m.agent, m.content, m.artifacts || [],
+                         m.status, m.task_id, (m.meta && m.meta.error) || '']);
+}
+function orderKey(m){ return String(m.created_at || '') + '|' + String(m.id || ''); }
+function byOrder(a, b){
+  const ka = orderKey(a), kb = orderKey(b);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+/* 只把新的/变了的消息塞进本地列表，轮询不整表重画。 */
+function mergeMessages(list){
+  if(!Array.isArray(list) || !list.length) return false;
+  const index = new Map(msgs.map(m => [String(m.id), m]));
+  let changed = false;
+  list.forEach(m => {
+    const id = String((m && m.id) || '');
+    if(!id) return;
+    const cur = index.get(id);
+    if(!cur || msgSig(cur) !== msgSig(m)){ index.set(id, m); changed = true; }
+  });
+  if(changed) msgs = Array.from(index.values()).sort(byOrder);
+  return changed;
+}
+function earlierEl(){
+  let btn = document.getElementById('earlier');
+  if(!btn){
+    btn = document.createElement('button');
+    btn.id = 'earlier';
+    btn.className = 'earlier';
+    btn.type = 'button';
+    btn.textContent = '加载更早的 ' + PAGE + ' 条';
+    btn.hidden = true;
+    btn.onclick = loadEarlier;
+  }
+  return btn;
+}
+function ensureEarlier(){
+  const btn = earlierEl();
+  if(streamEl.firstChild !== btn) streamEl.insertBefore(btn, streamEl.firstChild);
+  btn.hidden = !hasMoreBefore;
+  return btn;
+}
+async function loadEarlier(){
+  const btn = earlierEl();
+  if(btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '正在加载…';
+  const before = msgs.length ? String(msgs[0].id) : '';
+  const anchorEl = before ? streamEl.querySelector('[data-id="' + before + '"]') : null;
+  const anchorTop = anchorEl ? anchorEl.getBoundingClientRect().top : 0;
+  const q = new URLSearchParams();
+  q.set('before', before);
+  q.set('limit', String(PAGE));
+  if(activeId) q.set('session', activeId);
+  const data = await apiGet('/api/messages?' + q.toString());
+  btn.disabled = false;
+  btn.textContent = '加载更早的 ' + PAGE + ' 条';
+  if(!data || data.ok === false || !Array.isArray(data.messages) || !data.messages.length){
+    hasMoreBefore = false;
+    ensureEarlier();
+    if(!data) toast('翻页失败：需要访问令牌或服务不在');
+    return;
+  }
+  const index = new Map(msgs.map(m => [String(m.id), m]));
+  data.messages.forEach(m => index.set(String(m.id), m));
+  msgs = Array.from(index.values()).sort(byOrder);
+  hasMoreBefore = !!data.has_more;
+  resetStream();
+  renderMessages(msgs);
+  ensureEarlier();
+  // 翻完别让视线跳走：把原来那条重新对回屏幕同一位置
+  if(before){
+    const again = streamEl.querySelector('[data-id="' + before + '"]');
+    if(again) streamEl.scrollTop += (again.getBoundingClientRect().top - anchorTop);
+  }
+}
 
 function renderMessages(list){
   const ids = new Set();
@@ -1563,16 +1810,34 @@ function renderInspector(){
   }
 
   const engine = st.engine || {};
+  const busyInfo = st.busy || {};
+  const alive = !!engine.alive;
+  const stalled = String(engine.status || '') === 'stalled' || (!alive ? false : !!engine.stale);
   const pausedInfo = st.paused || null;
   const pausedHere = !!pausedInfo && (!pausedInfo.task || !task || pausedInfo.task === task.id);
-  const status = String((task && task.status) || '');
-  const runningStatus = ['planned', 'executing', 'dispatched', 'executed'].indexOf(status) >= 0;
-  const running = !!engine.alive && runningStatus;
+  // 规划中/预审中还没有任务卡：给一张占位卡，别让右栏看起来是空的
+  const planning = !!busyInfo.busy && (!task || !!busyInfo.task_stale);
+  if(planning){
+    const req = String(busyInfo.request || '').trim();
+    const short = req.length > 40 ? req.slice(0, 40) + '…' : req;
+    const phaseLabel = STAGE_LABEL[busyInfo.phase] || busyInfo.phase || '规划';
+    taskBlock = '<div class="task-card pending">'
+      + '<div class="tid">正在规划</div>'
+      + '<div class="ttitle">' + esc(short || '（刚收到需求，正在理解）') + '</div>'
+      + '<div class="chips"><span class="chip executing">' + esc(phaseLabel) + '</span>'
+      +   '<span class="chip">引擎在跑 · 还没有任务卡</span></div>'
+      + '<div class="kv"><div class="k">开始</div><div class="v mono">'
+      +   esc(timeLabel(busyInfo.since) || '刚刚') + '</div>'
+      +   '<div class="k">下一步</div><div class="v">拆完步骤就出任务卡</div></div>'
+      + '</div>';
+  }
+
   const cooling = Date.now() < controlCooldown;
-  const canPause = running && !pausedInfo;
-  const canResume = !!pausedInfo || running;
-  const canStop = !!pausedInfo || running;
-  const canRerun = !!pausedInfo || running;
+  // 只要进程活着（alive）按钮就能点：心跳旧只是"在跑长任务"，不是死机
+  const canPause = alive && !pausedInfo;
+  const canResume = !!pausedInfo || (alive && !planning);
+  const canStop = alive;
+  const canRerun = alive && !!task && !planning;
   const ctrlBtn = (act, label, on, cls) => '<button'
     + (cls ? ' class="' + cls + '"' : '') + ' data-act="' + act + '"'
     + ((on && !cooling) ? '' : ' disabled') + '>' + label + '</button>';
@@ -1582,13 +1847,20 @@ function renderInspector(){
     + ctrlBtn('stop', '停止', canStop, 'danger')
     + ctrlBtn('rerun', '重新执行', canRerun, '')
     + '</div>';
-  const ctrlHint = !task
-    ? '没有任务在跑，四个按钮都灰着。'
-    : pausedHere
-      ? '已暂停：点「继续」接着干，点「停止」就收工。'
-      : running
-        ? '引擎在跑，指令会在下一个步骤边界生效。'
-        : (engine.alive ? '引擎在跑，不过这个任务不在执行中。' : '引擎没在跑，任务卡是历史记录，按钮点不动。');
+  let ctrlHint;
+  if(pausedHere){
+    ctrlHint = '已暂停：点「继续」接着干，点「停止」就收工。';
+  } else if(!alive){
+    ctrlHint = '引擎没在跑（进程都不在了），按钮点不动；先起 worker 再发需求。';
+  } else if(planning){
+    ctrlHint = '正在规划：暂停/停止已经可用，等任务卡出来再点「继续/重新执行」。';
+  } else if(stalled){
+    ctrlHint = '心跳没刷新，但进程还在；点停止仍然能停掉。';
+  } else if(task){
+    ctrlHint = '引擎在跑，指令会在下一个步骤边界生效。';
+  } else {
+    ctrlHint = '引擎在跑，还没有任务卡：暂停/停止对将要派发的任务也有效。';
+  }
   const pausedBanner = pausedHere
     ? '<div class="paused-banner"><b>已暂停</b>' + esc(pausedInfo.reason || '等你决定')
       + (pausedInfo.stage ? '（' + esc(STAGE_LABEL[pausedInfo.stage] || pausedInfo.stage) + '）' : '')
@@ -1612,7 +1884,10 @@ function renderInspector(){
     +   (busyCount ? busyCount + ' 个在忙' : '全部空闲') + '</span></h3>'
     +   '<div class="agents">' + agentRows + '</div></section>'
     + '<section class="panel"><h3>当前任务<span class="n">'
-    +   (engine.alive ? '引擎在跑' : '引擎没在跑') + '</span></h3>'
+    +   (!alive ? '引擎没在跑'
+        : stalled ? '引擎在跑 · 心跳旧'
+        : planning ? '引擎在跑 · 规划中'
+        : '引擎在跑') + '</span></h3>'
     +   taskBlock + pausedBanner + ctrlHtml
     +   '<div class="ctrl-hint">' + esc(ctrlHint) + '</div></section>'
     + '<section class="panel"><h3>测试结果</h3>' + verify + '</section>'
@@ -1625,6 +1900,30 @@ function renderInspector(){
   inspEl.querySelectorAll('.ctrl button[data-act]').forEach(btn => {
     btn.onclick = () => sendControl(btn.dataset.act);
   });
+}
+
+function renderEngine(){
+  const pill = $('engine'), txt = $('engine-txt');
+  if(!pill || !txt) return;
+  const engine = st.engine || {};
+  const status = String(engine.status || (engine.alive ? 'running' : 'none'));
+  const age = Math.max(0, Math.round(Number(engine.age) || 0));
+  pill.classList.remove('engine-running', 'engine-stalled', 'engine-dead');
+  let cls = 'engine-dead', label = '引擎没在跑';
+  if(engine.alive){
+    if(status === 'stalled'){
+      cls = 'engine-stalled';
+      label = '引擎在跑，心跳 ' + age + 's 没刷新（可能在跑长任务）';
+    } else {
+      cls = 'engine-running';
+      label = status === 'busy' ? '引擎在跑（忙）' : '引擎在跑';
+    }
+  }
+  pill.classList.add(cls);
+  txt.textContent = label;
+  pill.title = 'pid ' + (engine.pid || '—')
+    + ' · 心跳 ' + (Number(engine.age) >= 0 ? age + 's 前' : '未知')
+    + ' · 状态 ' + status;
 }
 
 function renderChrome(){
@@ -1646,6 +1945,7 @@ function renderChrome(){
   } else {
     txt.textContent = '空闲';
   }
+  renderEngine();
   const note = $('store-note');
   const store = st.store || {};
   if(store.ready === false){
@@ -1657,17 +1957,29 @@ function renderChrome(){
   }
 }
 
-function applyState(next){
+function applyState(next, fresh){
   const wasNear = nearBottom();
-  st = Object.assign({}, st, next);
-  const sid = (st.session && st.session.id) || '';
-  if(sid !== renderedSession){
+  const sid = String((next.session && next.session.id) || '');
+  if(fresh || sid !== syncedSession){
+    msgs = [];
+    syncedSession = sid;
+    hasMoreBefore = false;
+    renderedSession = '';
     resetStream();
-    renderedSession = sid;
+    firstPaint = true;
   }
+  st = Object.assign({}, st, next);
   activeId = sid;
-  if((st.messages || []).length && $('welcome')) $('welcome').remove();
-  renderMessages(st.messages || []);
+  mergeMessages(next.messages || []);
+  const total = asInt(next.total_messages, msgs.length);
+  hasMoreBefore = msgs.length > 0 && msgs.length < total;
+  if(msgs.length){
+    if($('welcome')) $('welcome').remove();
+  } else if(!$('welcome') && welcomeHtml){
+    streamEl.insertAdjacentHTML('beforeend', welcomeHtml);
+  }
+  renderMessages(msgs);
+  ensureEarlier();
   renderSessions();
   renderWorkspace();
   renderInspector();
@@ -1675,12 +1987,17 @@ function applyState(next){
   if(wasNear || firstPaint){ scrollDown(); firstPaint = false; }
 }
 
-async function load(){
+async function load(opts){
+  const fresh = !!(opts && opts.fresh);
   const q = new URLSearchParams();
   if(activeId) q.set('session', activeId);
+  if(!fresh && msgs.length > 20){
+    q.set('after', String(msgs[msgs.length - 20].id));   // 只取新消息，别再整表拉一遍
+  }
+  q.set('limit', String(PAGE));
   const data = await apiGet('/api/state?' + q.toString());
-  if(!data) return st;      // 没令牌/服务重启中：下一轮再试
-  applyState(data);
+  if(!data) return null;      // 没令牌/服务重启中：下一轮再试
+  applyState(data, fresh);
   return data;
 }
 
@@ -1689,7 +2006,7 @@ async function selectSession(id){
   await apiPost('/api/session/select', {session_id: id});
   localTyping = null;
   activeId = id;
-  await load();
+  await load({fresh: true});
 }
 
 async function newSession(){
@@ -1700,7 +2017,7 @@ async function newSession(){
   if(data.ok && data.session && data.session.id){
     localTyping = null;
     activeId = data.session.id;
-    await load();
+    await load({fresh: true});
     input.focus();
   } else if(data && data.error){
     toast(data.error);
@@ -1791,8 +2108,7 @@ async function send(){
   const data = await apiPost('/api/post', {session_id: activeId || '', content: text});
   if(!data || data.ok === false) toast((data && data.error) || '发送失败');
   const next = await load();
-  const list = (next && next.messages) || [];
-  if(list.some(m => m.role === 'user' && String(m.content || '').trim() === text)) echo.remove();
+  if(msgs.some(m => m.role === 'user' && String(m.content || '').trim() === text)) echo.remove();
   else setTimeout(() => echo.remove(), 8000);
   localTyping = null;
   renderTyping();
@@ -2104,7 +2420,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/state":
             self._touch()
-            self._json(_state_payload(one("session"), one("after"), one("task")))
+            self._json(_state_payload(one("session"), one("after"), one("task"), one("limit")))
             return
         if parsed.path == "/api/alive":
             self._touch()
@@ -2143,6 +2459,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(payload, 200 if payload.get("ok") else 404)
             return
         if parsed.path == "/api/messages":
+            before = one("before")
+            limit_raw = one("limit")
+            if before or limit_raw:
+                # 新式分页：before=<最老那条 id>&limit=120 → 更早的一页（结构同 state.messages）
+                payload = _messages_page(one("session"), before, _page_limit(limit_raw))
+                self._json(payload)
+                return
             after = _as_int(one("after"))
             if room is not None:
                 try:

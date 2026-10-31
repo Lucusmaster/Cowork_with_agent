@@ -18,6 +18,7 @@ import sys
 import time
 from .winproc import quiet_flags
 from pathlib import Path
+from . import procs  # noqa: E402
 from .paths import workbench_root  # noqa: E402
 
 ROOT = workbench_root()
@@ -66,36 +67,28 @@ def spawn(args: list[str]) -> int:
 
 
 def pid_alive(pid: int) -> bool:
-    """跨平台判断进程是否真活着（Windows 不要用 os.kill(pid,0)，那会直接干掉进程）。"""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True, errors="replace", creationflags=quiet_flags()).stdout
-        except OSError:
-            return False
-        return str(pid) in out
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    """跨平台判断进程是否真活着（实现统一在 procs.py）。"""
+    return procs.pid_alive(pid)
+
+
+def worker_state() -> dict:
+    """引擎的真实状态：只看进程在不在。
+
+    心跳旧不代表进程死了——长任务执行期间心跳可能几十秒不刷新，
+    这时 `--stop` 仍然必须能杀掉它。心跳只用来区分"在忙"还是"卡住"。
+    """
+    state = procs.lock_state(LOCK)
+    info = procs.read_lock(LOCK)
+    if Path(str(info.get("root") or "")).resolve() != ROOT.resolve():
+        return {"pid": 0, "alive": False, "stale": True, "age": -1.0, "status": "none"}
+    if not state.get("alive"):
+        state["status"] = "dead" if state.get("pid") else "none"
+    return state
 
 
 def worker_pid() -> int:
-    try:
-        info = json.loads(LOCK.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return 0
-    if Path(str(info.get("root") or "")).resolve() != ROOT.resolve():
-        return 0   # 别的仓库的锁，不认
-    pid = int(info.get("pid") or 0)
-    beat = float(info.get("beat") or 0)
-    # 引擎每 3 秒刷新一次心跳；心跳超过 90 秒就认为它已经不在了（跨平台，不查进程表）
-    if pid and (time.time() - beat) < 90 and pid_alive(pid):
-        return pid
-    return 0
+    state = worker_state()
+    return int(state.get("pid") or 0) if state.get("alive") else 0
 
 
 def kill_pid(pid: int) -> None:
@@ -138,8 +131,15 @@ def find_web_pid(port: int) -> list[int]:
 def status(port: int) -> None:
     print(f"仓库      {ROOT}")
     print(f"协作台    {'在跑' if port_busy(port) else '未启动'}  {web_url(port)}")
-    pid = worker_pid()
-    print(f"引擎      {'在跑 pid ' + str(pid) if pid else '未启动'}")
+    state = worker_state()
+    pid = int(state.get("pid") or 0)
+    if not state.get("alive"):
+        engine = "未启动" if not pid else f"已退出（锁里还留着 pid {pid}，下次 start 会接管）"
+    elif state.get("stale"):
+        engine = f"在跑 pid {pid}（心跳 {state.get('age')}s 没刷新，可能在跑长任务或卡住）"
+    else:
+        engine = f"在跑 pid {pid}（心跳 {state.get('age')}s 前）"
+    print(f"引擎      {engine}")
     print(f"日志      {ROOM / 'worker.log'}")
     active = []
     tasks_dir = ROOT / "tasks"
@@ -191,9 +191,15 @@ def start(port: int) -> int:
 
 
 def stop(port: int) -> int:
-    pid = worker_pid()
-    kill_pid(pid)
-    print(f"引擎已停止 (pid {pid})" if pid else "引擎本来就没在跑")
+    state = worker_state()
+    pid = int(state.get("pid") or 0)
+    if pid and state.get("alive"):
+        kill_pid(pid)
+        print(f"引擎已停止 (pid {pid})")
+    elif pid:
+        print(f"引擎进程早就不在了（锁里残留 pid {pid}），清掉锁")
+    else:
+        print("引擎本来就没在跑")
     LOCK.unlink(missing_ok=True)
     web_pids = find_web_pid(port)
     for item in web_pids:

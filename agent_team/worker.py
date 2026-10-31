@@ -21,6 +21,7 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -33,11 +34,11 @@ ROOM = ROOT / "room"
 LOCK = ROOM / "worker.lock"
 NUDGE = ROOM / "nudge"            # 有新消息时被点一下，引擎立刻处理，不等轮询
 TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在输入…"
-LOG = ROOM / "worker.log"
 
 from . import agents  # noqa: E402
 from . import analysis  # noqa: E402
 from . import control  # noqa: E402
+from . import procs  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
@@ -113,11 +114,16 @@ BANNED_VERIFY = ("rm ", "del ", "rd ", "format ", "shutdown", "reg delete", ">",
 
 
 def log(text: str) -> None:
+    """写日志。
+
+    路径每次都从 ROOM 现算：测试里会把 worker.ROOM 指到临时目录，
+    用 import 时缓存的 LOG 会漏写进真实账本（之前真的漏了）。
+    """
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}"
     print(line, flush=True)
     try:
         ROOM.mkdir(parents=True, exist_ok=True)
-        with LOG.open("a", encoding="utf-8") as fh:
+        with (ROOM / "worker.log").open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:
         pass
@@ -156,35 +162,59 @@ def typing(on: bool, who: str = "coordinator") -> None:
 
 
 def take_lock() -> bool:
+    """拿锁：只要原来的 worker 进程还活着就不接管，跟心跳新旧无关。
+
+    心跳旧只说明它可能在跑长任务/卡住，不代表可以抢它的锁；
+    抢了就会出现两个 worker 同时处理同一条消息。
+    """
     ROOM.mkdir(parents=True, exist_ok=True)
     if LOCK.is_file():
-        try:
-            info = json.loads(LOCK.read_text(encoding="utf-8"))
-            pid = int(info.get("pid") or 0)
-            beat = float(info.get("beat") or 0)
-        except (OSError, ValueError, json.JSONDecodeError):
-            pid, beat = 0, 0
-        alive = False
-        if pid and (time.time() - beat) < 90:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
-        if alive:
+        state = procs.lock_state(LOCK)
+        pid = int(state.get("pid") or 0)
+        if state.get("alive"):
+            log(f"已有 worker 在跑（pid={pid}，心跳 {state.get('age')}s 前），不接管")
             return False
-        log(f"接管过期锁（pid={pid}）")
+        if pid:
+            log(f"接管过期锁（pid={pid} 已不在）")
     LOCK.write_text(json.dumps({"pid": os.getpid(), "beat": time.time(), "root": str(ROOT)}),
                     encoding="utf-8")
     return True
 
 
 def beat() -> None:
+    """原子写心跳：网页每 1.5 秒读一次，不能让它读到写了一半的文件。"""
+    tmp = LOCK.with_suffix(".lock.tmp")
     try:
-        LOCK.write_text(json.dumps({"pid": os.getpid(), "beat": time.time(), "root": str(ROOT)}),
-                        encoding="utf-8")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "beat": time.time(), "root": str(ROOT)}),
+                       encoding="utf-8")
+        os.replace(tmp, LOCK)
     except OSError:
         pass
+
+
+_heartbeat_stop = threading.Event()
+
+
+def start_heartbeat(interval: float = 10.0) -> threading.Thread:
+    """独立心跳线程：主循环被长任务占住时也必须继续报活。
+
+    以前只在主循环里 beat()，Codex 执行超过 90 秒心跳就停了，界面会以为引擎死了、
+    控制按钮全灰、`start_all --stop` 也杀不掉进程。
+    """
+    _heartbeat_stop.clear()
+
+    def loop() -> None:
+        while not _heartbeat_stop.is_set():
+            beat()
+            _heartbeat_stop.wait(interval)
+
+    thread = threading.Thread(target=loop, name="heartbeat", daemon=True)
+    thread.start()
+    return thread
+
+
+def stop_heartbeat() -> None:
+    _heartbeat_stop.set()
 
 
 # ---------------- 规划 ----------------
@@ -1238,6 +1268,7 @@ def main() -> int:
     if not take_lock():
         print("已有另一个 worker 在跑，退出。")
         return 0
+    start_heartbeat()
     log(f"worker 启动 pid={os.getpid()} interval={args.interval}s")
     try:
         repaired = reconcile_unfinished()
