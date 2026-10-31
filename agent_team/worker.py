@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,7 @@ NUDGE = ROOM / "nudge"            # 有新消息时被点一下，引擎立刻�
 TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在输入…"
 LOG = ROOM / "worker.log"
 
+from . import agents  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
@@ -125,15 +127,20 @@ def event(text: str, phase: str, state: str, actor: str, tid: str = "") -> None:
         pass
 
 
-def say(text: str) -> None:
+def say(text: str, task_id: str | None = None, status: str = "complete",
+        artifacts: list[str] | None = None) -> None:
+    """协调者的发言：默认 complete，失败时传 status="failed" 让界面标红。"""
     try:
+        room.post("coordinator", text, "result",
+                  {"task": task_id, "status": status, "artifacts": list(artifacts or [])})
+    except TypeError:            # 过渡期兼容：老版 room.post 只认 (who, text, kind)
         room.post("deepseek", text, "result")
     except Exception:  # noqa: BLE001
         pass
 
 
 # ---------------- 单实例锁 ----------------
-def typing(on: bool, who: str = "deepseek") -> None:
+def typing(on: bool, who: str = "coordinator") -> None:
     try:
         if on:
             TYPING.write_text(json.dumps({"who": who, "at": time.time()}, ensure_ascii=False),
@@ -313,9 +320,10 @@ VAGUE = {"继续", "好的", "好", "嗯", "可以", "ok", "继续吧", "下一�
 def do_report(tid: str) -> int:
     """就地生成报告：子进程偶发 0xC0000142（DLL 初始化失败），这里不再依赖它。"""
     try:
-        import team  # 同目录
         from argparse import Namespace
-        team.cmd_report(Namespace(task=tid))
+
+        from . import team as team_mod
+        team_mod.cmd_report(Namespace(task=tid))
         return 0
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
@@ -328,12 +336,24 @@ def do_report(tid: str) -> int:
 
 
 def mark_finished(tid: str) -> None:
-    """复核和报告都写完才算真收工，给"等结果"的一方一个可靠信号。"""
+    """复核和报告都写完才算真收工，给"等结果"的一方一个可靠信号。
+
+    写 finished_at 的同时落一个 outcome：验收没过 / 复核要求修改的，
+    终态必须是 failure，不能因为流程走完就显示成功。
+    """
     card = TASKS / tid / "task.json"
     try:
         task = json.loads(card.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
+    reviews = task.get("reviews") or []
+    verdict = (reviews[-1].get("verdict") if reviews else None) or ""
+    status = task.get("status")
+    # 成功终态必须有复核 PASS 作证：没复核过、复核要求修改、验收没过的，都算失败
+    ok = status == "passed" and verdict == "PASS"
+    if not ok and status == "passed":
+        task["status"] = "failed"
+    task["outcome"] = "success" if ok else "failure"
     task["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     try:
         card.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -719,6 +739,34 @@ def brain_decide(request: str, workspace: Path | None = None) -> dict | None:
         return None
 
 
+def post_agent(agent: str, tid: str | None, ok: bool, content: str = "",
+               artifacts: list[str] | None = None, error: str = "") -> None:
+    """把某个 Agent 的这一步发成一条聊天消息（带证据引用，不灌日志）。"""
+    arts = list(artifacts or [])
+    if tid:
+        for item in agents._artifact_paths(tid, agent):
+            if item not in arts:
+                arts.append(item)
+    text = content.strip() or f"{agents.ROLE_LABELS.get(agent, agent)}完成"
+    try:
+        room.post(agent, text, "result",
+                  {"task": tid, "artifacts": arts,
+                   "status": "complete" if ok else "failed",
+                   "error": error[-600:] if error else ""})
+    except TypeError:            # 过渡期：老版 room.post 只认 4 个位置参数
+        room.post(agent, text, "result", {"task": tid})
+
+
+@contextmanager
+def thinking(who: str):
+    """告诉网页"当前是谁在干活"，让右栏与输入栏显示正确的角色。"""
+    typing(True, who)
+    try:
+        yield
+    finally:
+        typing(False)
+
+
 def publish_executor_voice(tid: str) -> None:
     """把 Codex 干完的汇报贴进群里，用户和其他 agent 都看得到。"""
     directory = TASKS / tid
@@ -727,7 +775,7 @@ def publish_executor_voice(tid: str) -> None:
         return
     text = _read(candidates[-1], 1500)
     if text:
-        room.post("codex", text, "result", {"task": tid})
+        post_agent("executor", tid, True, text)
 
 
 def publish_reviewer_voice(tid: str) -> None:
@@ -737,7 +785,8 @@ def publish_reviewer_voice(tid: str) -> None:
         return
     text = _read(candidates[-1], 1200)
     if text:
-        room.post("reviewer", text, "result", {"task": tid})
+        verdict_ok = "needs_fix" not in text.lower()
+        post_agent("reviewer", tid, verdict_ok, text)
 
 
 def handle_chat(request: str) -> None:
@@ -840,18 +889,29 @@ def run_card(card: dict, workspace: Path, request: str) -> None:
         + "\n\n## 允许改动的路径\n" + "、".join(card["scope"])
         + f"\n\n## 工作区\n{workspace}\n", encoding="utf-8")
     event(f"建了任务卡 {tid}：{card['title']}", "plan", "ok", "deepseek", tid)
+    post_agent("planner", tid, True,
+               f"需求已拆好：{len(card['acceptance'])} 条验收标准，"
+               f"{len(card['scope'])} 个允许改动的路径，计划写进了 plan.md。")
     pipeline(tid, card, request)
-    publish_executor_voice(tid)
-    publish_reviewer_voice(tid)
 
 
 def pipeline(tid: str, card: dict, request: str) -> None:
-    """执行 → 验收 → 复核 → 报告 → 交接记录。"""
+    """执行 → 验收 → 复核 → 报告 → 交接记录。每一步都单独发一条 Agent 消息。"""
     for round_no in range(1, 3):
-        code, _ = run_step(["dispatch", "-t", tid], timeout=1200, label=f"第 {round_no} 轮执行")
+        with thinking("executor"):
+            code, _ = run_step(["dispatch", "-t", tid], timeout=1200,
+                               label=f"第 {round_no} 轮执行")
+        exec_log = TASKS / tid / f"exec-{round_no:02d}.last.md"
+        post_agent("executor", tid, code == 0,
+                   _read(exec_log, 900) if exec_log.exists() else "",
+                   error="" if code == 0 else f"执行退出码 {code}")
         if code != 0:
             event(f"第 {round_no} 轮执行未正常结束", "dispatch", "bad", "codex", tid)
-        code, _ = run_step(["verify", "-t", tid], timeout=600, label=f"第 {round_no} 轮验收")
+        with thinking("tester"):
+            code, _ = run_step(["verify", "-t", tid], timeout=600,
+                               label=f"第 {round_no} 轮验收")
+        post_agent("tester", tid, code == 0,
+                   f"第 {round_no} 轮验收{'通过' if code == 0 else '未通过'}")
         if code == 0:
             break
         if round_no == 1:
@@ -862,16 +922,21 @@ def pipeline(tid: str, card: dict, request: str) -> None:
             event(f"{tid} 验收未通过，自动返工一轮", "verify", "bad", "deepseek", tid)
         else:
             event(f"{tid} 两轮都没过，停下等人", "verify", "bad", "deepseek", tid)
-            say(f"任务 {tid} 两轮验收都没通过，已停下等你拍板。看 tasks/{tid}/verify-*.txt")
+            say(f"任务 {tid} 两轮验收都没通过，已停下等你拍板。看 tasks/{tid}/verify-*.txt",
+                task_id=tid, status="failed")
             do_report(tid)
             mark_finished(tid)
             append_progress(tid)
             return
 
     for attempt in range(1, 3):
-        code, _ = run_step(["review", "-t", tid], timeout=900, label=f"第 {attempt} 次复核")
+        with thinking("reviewer"):
+            code, _ = run_step(["review", "-t", tid], timeout=900,
+                               label=f"第 {attempt} 次复核")
         if code == 0:
+            post_agent("reviewer", tid, True, "复核通过")
             break
+        post_agent("reviewer", tid, False, "复核要求修改")
         if attempt == 2:
             event(f"{tid} 复核两次都未通过，停下等人", "review", "bad", "reviewer", tid)
             break
@@ -883,8 +948,14 @@ def pipeline(tid: str, card: dict, request: str) -> None:
         (TASKS / tid / "task.json").write_text(
             json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         event(f"{tid} 复核挑出问题，自动返工第 {next_round} 轮", "review", "bad", "reviewer", tid)
-        run_step(["dispatch", "-t", tid], timeout=1200, label=f"第 {next_round} 轮返工")
-        vcode, _ = run_step(["verify", "-t", tid], timeout=600, label=f"第 {next_round} 轮验收")
+        with thinking("executor"):
+            run_step(["dispatch", "-t", tid], timeout=1200,
+                     label=f"第 {next_round} 轮返工")
+        with thinking("tester"):
+            vcode, _ = run_step(["verify", "-t", tid], timeout=600,
+                                label=f"第 {next_round} 轮验收")
+        post_agent("executor", tid, vcode == 0, f"按复核意见返工第 {next_round} 轮")
+        post_agent("tester", tid, vcode == 0, f"返工后验收{'通过' if vcode == 0 else '未通过'}")
         if vcode != 0:
             event(f"{tid} 返工后验收仍未通过，停下等人", "verify", "bad", "deepseek", tid)
             break

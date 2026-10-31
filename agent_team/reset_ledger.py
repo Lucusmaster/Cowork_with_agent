@@ -61,9 +61,12 @@ def main() -> int:
     TASKS.mkdir(parents=True, exist_ok=True)
 
     if ROOM.is_dir():
-        for name in ("messages.jsonl", "state.json", "worker.lock", "worker.log", "web.out"):
+        for name in ("messages.jsonl", "state.json", "worker.lock", "worker.log", "web.out",
+                     "nudge", "typing.json"):
             (ROOM / name).unlink(missing_ok=True)
-        for name in ("planner", "logs"):
+        # 会话文件：新账本按会话分文件，漏删会留着聊天历史
+        shutil.rmtree(ROOM / "sessions", ignore_errors=True)
+        for name in ("planner", "logs", "projects"):
             shutil.rmtree(ROOM / name, ignore_errors=True)
 
     (ROOM / "messages.jsonl").write_text("", encoding="utf-8")

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""群聊消息总线：所有成员（人、DeepSeek、Codex、人工接手）都往同一个房间发消息。
+"""群聊消息总线（过渡期兼容层）。
 
-用法：
-  python bin/room.py post --as user --text "帮我做 X"        # 发消息
-  python bin/room.py post --as codex --text "..." --kind result
-  python bin/room.py tail -n 20                              # 看最近消息
-  python bin/room.py since --after 12 [--json]               # 看 12 之后的新消息
-  python bin/room.py pending                                 # 看还没被大脑认领的用户任务
-  python bin/room.py ack --id 12                             # 标记已认领
-  python bin/room.py wait --after 12 --timeout 60            # 阻塞等新消息
+新代码请直接用 ``agent_team.session`` 写新消息结构（id/session_id/role/agent/
+content/artifacts/status/created_at）。这个模块保留旧接口，让 ``worker.py``、
+``room_web.py`` 这些还没改完的调用点继续能跑：
+
+  python -m agent_team.room post --as user --text "帮我做 X"     # 发消息
+  python -m agent_team.room post --as codex --text "..." --kind result
+  python -m agent_team.room tail -n 20                           # 看最近消息
+  python -m agent_team.room since --after 12 [--json]            # 看 12 之后的新消息
+  python -m agent_team.room pending                              # 看还没被大脑认领的用户任务
+  python -m agent_team.room ack --id 12                          # 标记已认领
+  python -m agent_team.room wait --after 12 --timeout 60         # 阻塞等新消息
+
+``post()`` 写的是新消息结构（内部调 ``session.append``），``read_all()`` 则把
+各会话消息映射回旧格式（整数 id、from/kind/text），所以旧调用点不用改也能跑。
+``room/messages.jsonl`` 不再追加，只作为旧账本由 ``session.py`` 迁移读取。
 """
 from __future__ import annotations
 
@@ -16,12 +23,13 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
+
+from . import session
 
 ROOT = Path(__file__).resolve().parent.parent
 ROOM = ROOT / "room"
-MESSAGES = ROOM / "messages.jsonl"
+MESSAGES = ROOM / "messages.jsonl"      # 旧账本：只读（内容已迁移到 sessions/legacy.jsonl）
 STATE = ROOM / "state.json"
 
 # Windows 控制台默认 GBK，表情符号会炸；统一按 UTF-8 输出（不可编码字符降级处理）
@@ -31,13 +39,30 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+# 成员显示名：新角色名 + 旧成员名（兼容别名）
 MEMBERS = {
     "user": "我",
-    "deepseek": "DeepSeek（大脑）",
-    "codex": "Codex（执行者）",
-    "relay": "人工转发",
+    "coordinator": "协调",
+    "planner": "规划",
+    "executor": "执行",
+    "tester": "验收",
+    "reviewer": "复核",
     "system": "调度",
+    # 旧成员名保留，映射到新角色（deepseek → coordinator）
+    "deepseek": "协调",
+    "codex": "执行",
+    "relay": "人工转发",
 }
+
+# 旧成员名 → 新 agent 角色；没列出的（新角色名本身）原样使用
+ALIASES = {
+    "deepseek": "coordinator",
+    "codex": "executor",
+    "relay": "coordinator",
+}
+
+# 这些键是我们的内部记账字段，映射回旧格式时不往 meta 里塞
+_INTERNAL_META = ("from", "kind", "name", "legacy_id")
 
 
 def _ensure() -> None:
@@ -61,57 +86,148 @@ def _write_state(state: dict) -> None:
     STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
-def read_all() -> list[dict]:
-    _ensure()
-    out = []
-    for line in MESSAGES.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+def agent_for(author: str) -> str:
+    """旧成员名 → 新 agent 角色（deepseek→coordinator、codex→executor…）。"""
+    name = str(author or "").strip() or "user"
+    return ALIASES.get(name, session.AGENT_ALIASES.get(name, name))
 
 
-def post(author: str, text: str, kind: str = "msg", meta: dict | None = None) -> dict:
+def role_for(author: str) -> str:
+    """旧成员名 → 消息 role。"""
+    name = str(author or "").strip()
+    if name == "system":
+        return "system"
+    if name == "user":
+        return "user"
+    return "assistant"
+
+
+def post(author: str, text: str, kind: str = "msg",
+         meta: dict | None = None, session_id: str | None = None) -> dict:
+    """发一条消息：落到新结构，返回值保留旧格式字段并附带新字段。
+
+    meta 里这几个键会被提升到新消息结构：
+    - ``artifacts`` → 消息的 artifacts；
+    - ``status`` → 消息的 status（缺省 complete）；
+    - ``task`` / ``task_id`` → 消息的 task_id。
+    """
     _ensure()
-    msgs = read_all()
-    msg = {
-        "id": (msgs[-1]["id"] + 1) if msgs else 1,
-        "at": datetime.now().isoformat(timespec="seconds"),
+    name = str(author or "").strip() or "user"
+    payload = dict(meta or {}) if isinstance(meta, dict) else {}
+    artifacts = payload.get("artifacts") or []
+    if isinstance(artifacts, str):
+        artifacts = [artifacts]
+    task_id = payload.get("task") or payload.get("task_id") or None
+    sid = str(session_id or "").strip() or session.active_session()["id"]
+
+    message = session.append(
+        sid,
+        role=role_for(name),
+        agent=agent_for(name),
+        content=str(text or ""),
+        task_id=str(task_id) if task_id else None,
+        artifacts=[str(item) for item in artifacts],
+        status=str(payload.get("status") or "complete"),
+        meta={"from": name, "kind": str(kind or "msg"), **payload},
+    )
+    view = _legacy_view(message, _legacy_id_of(message))
+    view.update({
+        "message_id": message.get("id"),
+        "session_id": message.get("session_id"),
+        "role": message.get("role"),
+        "agent": message.get("agent"),
+        "task_id": message.get("task_id"),
+        "content": message.get("content"),
+        "artifacts": list(message.get("artifacts") or []),
+        "status": message.get("status"),
+        "created_at": message.get("created_at"),
+    })
+    return view
+
+
+def _all_messages() -> list[dict]:
+    """所有会话的消息按时间拼成一条流水（旧账本最早，自然排在最前）。"""
+    collected = []
+    for entry in session.sessions():
+        sid = str(entry.get("id") or "")
+        if not sid:
+            continue
+        for position, message in enumerate(session.messages(sid, limit=0)):
+            collected.append((str(message.get("created_at") or ""), sid, position, message))
+    collected.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in collected]
+
+
+def _infer_kind(message: dict) -> str:
+    meta = message.get("meta")
+    if isinstance(meta, dict) and meta.get("kind"):
+        return str(meta["kind"])
+    role = str(message.get("role") or "")
+    if role == "user":
+        return "task"          # 旧 worker 只认 from=user 且 kind in (task, msg)
+    if role == "system" or str(message.get("agent") or "") == "system":
+        return "event"
+    return "result"
+
+
+def _legacy_view(message: dict, legacy_id: int) -> dict:
+    """新消息 → 旧格式（整数 id、from/name/kind/text/meta）。"""
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    author = str(meta.get("from") or message.get("agent") or "")
+    view = {
+        "id": int(legacy_id),
+        "at": str(message.get("created_at") or ""),
         "from": author,
         "name": MEMBERS.get(author, author),
-        "kind": kind,
-        "text": text,
+        "kind": _infer_kind(message),
+        "text": str(message.get("content") or ""),
     }
-    if meta:
-        msg["meta"] = meta
-    with MESSAGES.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        fh.flush()
-    return msg
+    public = {key: value for key, value in meta.items() if key not in _INTERNAL_META}
+    if public:
+        view["meta"] = public
+    return view
 
 
-def after(last_id: int) -> list[dict]:
-    return [m for m in read_all() if m["id"] > last_id]
+def _legacy_id_of(message: dict) -> int:
+    """这条消息在旧格式流水里的整数 id（和 read_all() 的编号保持一致）。"""
+    sid, mid = message.get("session_id"), message.get("id")
+    for position, item in enumerate(_all_messages(), start=1):
+        if item.get("session_id") == sid and item.get("id") == mid:
+            return position
+    return 0
+
+
+def read_all() -> list[dict]:
+    """旧接口：把各会话消息映射回旧格式，id 为递增整数。"""
+    _ensure()
+    return [_legacy_view(message, position)
+            for position, message in enumerate(_all_messages(), start=1)]
+
+
+def after(last_id) -> list[dict]:
+    try:
+        threshold = int(last_id)
+    except (TypeError, ValueError):
+        threshold = 0
+    return [message for message in read_all() if message["id"] > threshold]
 
 
 def pending() -> list[dict]:
+    """旧接口：还没被大脑认领的用户任务（id 大于已处理位置）。"""
     state = _read_state()
     last = int(state.get("last_handled_id") or 0)
     return [
-        m for m in read_all()
-        if m["id"] > last and m["from"] == "user" and m.get("kind") in ("task", "msg")
+        message for message in read_all()
+        if message["id"] > last and message["from"] == "user"
+        and message.get("kind") in ("task", "msg")
     ]
 
 
-def _fmt(m: dict) -> str:
-    who = m.get("name") or m.get("from")
-    kind = m.get("kind", "msg")
+def _fmt(message: dict) -> str:
+    who = message.get("name") or message.get("from")
+    kind = message.get("kind", "msg")
     tag = "" if kind == "msg" else f" [{kind}]"
-    return f"#{m['id']:>3} {m['at'][11:19]} {who}{tag}: {m['text']}"
+    return f"#{message['id']:>3} {message['at'][11:19]} {who}{tag}: {message['text']}"
 
 
 def main() -> int:
@@ -151,8 +267,8 @@ def main() -> int:
 
     if args.cmd == "tail":
         msgs = read_all()
-        for m in msgs[-args.n:]:
-            print(_fmt(m))
+        for message in msgs[-args.n:]:
+            print(_fmt(message))
         return 0
 
     if args.cmd == "since":
@@ -160,8 +276,8 @@ def main() -> int:
         if args.json:
             print(json.dumps(msgs, ensure_ascii=False))
         else:
-            for m in msgs:
-                print(_fmt(m))
+            for message in msgs:
+                print(_fmt(message))
         return 0
 
     if args.cmd == "pending":
@@ -171,8 +287,8 @@ def main() -> int:
         else:
             if not msgs:
                 print("（没有待处理的用户消息）")
-            for m in msgs:
-                print(_fmt(m))
+            for message in msgs:
+                print(_fmt(message))
         return 0
 
     if args.cmd == "ack":
@@ -184,12 +300,12 @@ def main() -> int:
 
     if args.cmd == "wait":
         deadline = time.time() + args.timeout
-        curs = args.after
+        cursor = args.after
         while time.time() < deadline:
-            new = after(curs)
+            new = after(cursor)
             if new:
-                for m in new:
-                    print(_fmt(m))
+                for message in new:
+                    print(_fmt(message))
                 return 0
             time.sleep(1)
         return 1

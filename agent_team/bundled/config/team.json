@@ -11,5 +11,47 @@
     "timeout": 600,
     "sandbox": "read-only",
     "fallback_models": ["gpt-6.1-terra", "gpt-6.1-sol"]
-  }
+  },
+  "agents": [
+    {
+      "role": "coordinator",
+      "name": "协调",
+      "model": "gpt-6.1-terra",
+      "effort": "low",
+      "sandbox": "read-only",
+      "enabled": true
+    },
+    {
+      "role": "planner",
+      "name": "规划",
+      "model": "gpt-6.1-terra",
+      "effort": "low",
+      "sandbox": "read-only",
+      "enabled": true
+    },
+    {
+      "role": "executor",
+      "name": "执行",
+      "model": "gpt-6.1-terra",
+      "effort": "low",
+      "sandbox": "workspace-write",
+      "enabled": true
+    },
+    {
+      "role": "tester",
+      "name": "验收",
+      "model": "gpt-6.1-terra",
+      "effort": "low",
+      "sandbox": "workspace-write",
+      "enabled": true
+    },
+    {
+      "role": "reviewer",
+      "name": "复核",
+      "model": "gpt-6-luna",
+      "effort": "low",
+      "sandbox": "read-only",
+      "enabled": true
+    }
+  ]
 }

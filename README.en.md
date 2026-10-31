@@ -38,6 +38,21 @@ every agent's output lands in the same message log, so each one sees what the ot
 - **Honest lifecycle.** Closing the chat page stops the engine — after any in-flight task reaches a
   terminal state.
 
+## The chat workbench
+
+The UI is a conversation, not a form: workspaces and past sessions on the left, the message stream in the middle, agent status / current task / test output / diff on the right. You type plain language; you never touch task IDs or paste results between agents.
+
+Five roles post into the same session: **coordinator** (understands the request and summarises), **planner** (turns it into an acceptance-checked task card), **executor** (edits code and runs tests), **tester** (runs the acceptance commands outside the sandbox), **reviewer** (a different model reads the diff, read-only).
+
+Messages carry **references, not logs**:
+
+```json
+{"agent": "executor", "task_id": "T-001", "content": "Implemented, tests pass",
+ "artifacts": ["tasks/T-001/exec-01.last.md", "workspace:src/login.py"],
+ "status": "complete"}
+```
+
+Failures are failures: a non-zero acceptance command, an out-of-scope edit, or a `NEEDS_FIX` review marks the message red with the reason and records `outcome=failure` — the flow finishing never fakes success.
 ## Quick start
 
 Requires Python ≥ 3.10, git, and a logged-in Codex CLI (`codex login`).

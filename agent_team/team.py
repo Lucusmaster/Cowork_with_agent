@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -388,6 +389,94 @@ def collab_stray_changes(baseline: dict[str, str] | None = None) -> list[str]:
     return stray
 
 
+def parse_verify_argv(command: "str | list") -> list[str]:
+    """把验收命令变成 argv 列表，绝不交给 shell。
+
+    支持三种写法：
+      - 已有列表（结构化）：直接逐项传参；
+      - JSON 数组字符串：`'["python", "-m", "unittest"]'`；
+      - 普通命令行：用 shlex 切分，但**拒绝**任何 shell 元字符，防止注入。
+    """
+    if isinstance(command, (list, tuple)):
+        argv = [str(part) for part in command]
+        if not argv:
+            raise SystemExit("验收命令为空")
+        return argv
+    text = str(command or "").strip()
+    if not text:
+        raise SystemExit("验收命令为空")
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"验收命令是 JSON 数组格式但解析失败：{exc}") from exc
+        if not isinstance(data, list) or not data:
+            raise SystemExit("验收命令的 JSON 必须是非空数组，例如 [\"python\",\"-m\",\"unittest\"]")
+        return [str(part) for part in data]
+    forbidden = sorted({ch for ch in text if ch in "|&;<>$`\n"})
+    if forbidden:
+        raise SystemExit(
+            "验收命令里出现了 shell 元字符 " + " ".join(forbidden)
+            + "，本工具不通过 shell 执行。请改成结构化写法，例如：\n"
+            '  --verify-json \'["python", "-m", "unittest", "discover", "-s", "tests", "-t", "."]\'\n'
+            "或者用不带管道/重定向的普通命令。")
+    return shlex.split(text, posix=(os.name != "nt"))
+
+
+# 构建/缓存产物不算越界改动：它们不是人写的代码，也不该拖累验收
+NOISE_DIRS = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache",
+              "node_modules", ".venv", "venv", ".tox", ".idea", ".vscode")
+NOISE_SUFFIX = (".pyc", ".pyo", ".pyd", ".swp", ".log", ".tmp")
+NOISE_FILES = (".DS_Store", "Thumbs.db", "desktop.ini")
+
+
+def is_noise_path(name: str) -> bool:
+    """缓存、编译产物、编辑器临时文件——不算 scope 越界。"""
+    parts = name.replace("\\", "/").split("/")
+    if any(part in NOISE_DIRS for part in parts[:-1]):
+        return True
+    if parts[-1] in NOISE_FILES or parts[-1].endswith(NOISE_SUFFIX):
+        return True
+    return ".egg-info/" in name or name.endswith(".egg-info")
+
+
+def changed_files(ws: Path) -> list[str]:
+    """工作区相对 git 根的改动文件（含未跟踪，已剔除缓存产物），用于 scope 核对。"""
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"], cwd=str(ws),
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+            creationflags=quiet_flags())
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        name = line[3:].strip().strip('"')
+        if " -> " in name:
+            name = name.split(" -> ", 1)[1]
+        name = name.replace("\\", "/")
+        if is_noise_path(name):
+            continue
+        out.append(name)
+    return out
+
+
+def scope_violations(task: dict, ws: Path) -> list[str]:
+    """用真实 diff 核对 scope：没写 scope 就不限制，写了就必须落进去。"""
+    scope = [str(item).strip().replace("\\", "/").rstrip("/") for item in (task.get("scope") or [])]
+    scope = [item for item in scope if item]
+    if not scope:
+        return []
+    bad: list[str] = []
+    for name in changed_files(ws):
+        if any(name == item or name.startswith(item + "/") for item in scope):
+            continue
+        bad.append(name)
+    return bad
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     tid = resolve_task_id(args.task)
     task = load_task(tid)
@@ -400,15 +489,25 @@ def cmd_verify(args: argparse.Namespace) -> int:
         started = time.time()
         room_event(f"跑验收命令：{cmd}", tid, "verify", "run", "deepseek")
         print(f"运行验收命令: {cmd}")
+        argv = parse_verify_argv(cmd)
         proc = subprocess.run(
-            cmd, shell=True, cwd=str(task_workspace(task)),
+            argv, shell=False, cwd=str(task_workspace(task)),
             capture_output=True, encoding="utf-8", errors="replace", creationflags=quiet_flags())
         code = proc.returncode
         elapsed = int(time.time() - started)
         all_ok = all_ok and code == 0
-        lines += [f"## `{cmd}`", f"- 退出码: {code}  耗时: {elapsed}s", "```",
+        lines += [f"## `{cmd}`", f"- argv: `{argv}`", f"- 退出码: {code}  耗时: {elapsed}s", "```",
                   (proc.stdout or "") + (proc.stderr or ""), "```", ""]
         print(f"  退出码 {code}，耗时 {elapsed}s")
+
+    out_of_scope = scope_violations(task, task_workspace(task))
+    if out_of_scope:
+        all_ok = False
+        lines += ["## 越界改动（阻塞）",
+                  "以下文件的改动不在任务卡声明的 scope 内：",
+                  *[f"- `{name}`" for name in out_of_scope],
+                  "", "要么把这些改动移出本轮，要么先扩 scope 再重跑。", ""]
+        print(f"  ⚠ {len(out_of_scope)} 个文件越界，判 FAIL")
 
     stray = collab_stray_changes(task.get("ledger_baseline")) if task_workspace(task) != ROOT else []
     if stray:
@@ -455,7 +554,9 @@ def _git_diff(limit: int = 60000, cwd: Path | None = None, skip_untracked: set[s
     skip = {n.replace("\\", "/") for n in (skip_untracked or set())}
     untracked = [p for p in git("ls-files", "--others", "--exclude-standard").splitlines()
                  if p.strip() and p.replace("\\", "/") not in skip
-                 and not p.replace("\\", "/").startswith(("room/", "tasks/", ".codex-home/", ".tmp/"))]
+                 and not p.replace("\\", "/").startswith(("room/", "tasks/", ".codex-home/", ".tmp/"))
+                 # 缓存/编译产物不进复核材料，否则复核者会为一堆 .pyc 要求返工
+                 and not is_noise_path(p)]
     new_file_diffs = []
     for name in untracked[:40]:
         # 未跟踪文件不在 git diff 里，单独生成一份，否则复核者看不到新增文件
@@ -510,6 +611,8 @@ def build_review_prompt(task: dict, round_no: int, diff: str) -> str:
 - 工作目录：{ws}
 - 账本目录 `room/`、`tasks/`、`.codex-home/`、`.tmp/` 是协作流水账，已从上面的 diff 里排除；
   它们变来变去是正常的，**不要**把它们当成越界改动来报。
+- 构建产物（`__pycache__/`、`*.pyc`、`.pytest_cache/`、`node_modules/` 等）不是人写的代码，
+  已从 diff 里排除；即便在 `git status` 里看到，也**不要**据此要求返工。
 - 你只能读，不能改任何文件。
 - 需要更多上下文就自己打开相关文件看，别猜。
 - 严格按 reviewer 契约的格式输出结论（PASS 或 NEEDS_FIX）。"""
@@ -561,6 +664,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     needs_fix = "NEEDS_FIX" in text.upper()
     passed = "PASS" in text.upper() and not needs_fix
     model = used_model
+    # 复核没通过时，任务不能停在"通过"状态
+    if not passed and task.get("status") in ("passed", "executed"):
+        task["status"] = "failed"
 
     task.setdefault("reviews", []).append({
         "n": round_no,

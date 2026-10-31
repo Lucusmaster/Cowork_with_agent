@@ -19,6 +19,55 @@
 - 说人话就行，需求模糊也能接
 - 关掉网页即收工（有任务在跑时会等它跑完）
 
+## 现在长这样：聊天式工作台
+
+界面重做成了对话产品：左边是工作区和历史会话，中间是消息流，右边是 Agent 状态、当前任务、测试结果和代码改动。**你只输入自然语言**，不碰任务号、不碰命令、不用把结果复制给下一个 Agent。
+
+```text
+┌──────────────┬────────────────────────────┬──────────────────┐
+│ 工作区        │ 顶部：工作区路径（可验证）   │ Agent 状态        │
+│ 历史会话      │ ──────────────────────────  │ 当前任务卡        │
+│              │ 你：给登录页加记住我          │ 测试结果          │
+│              │ 协调：我理解成…这就是计划      │ 代码改动          │
+│              │ 规划：拆成 3 步，验收是…      │                  │
+│              │ 执行：改了 src/login.py     │                  │
+│              │ 验收：5 个测试全过           │                  │
+│              │ 复核：PASS（另一个模型看的）  │                  │
+│              │ ──────────────────────────  │                  │
+│              │ 输入框（Enter 发送）          │                  │
+└──────────────┴────────────────────────────┴──────────────────┘
+```
+
+五个角色各发各的消息，都落在同一个会话里：
+
+| 角色 | 干什么 | 不干什么 |
+| --- | --- | --- |
+| 协调（coordinator） | 理解需求、决定要不要动手、最后汇总 | 不直接改代码 |
+| 规划（planner） | 拆成可验收的任务卡，写清验收命令 | 不碰代码 |
+| 执行（executor） | 在工作区里改文件、跑测试 | 不改验收标准 |
+| 验收（tester） | 在沙箱外跑验收命令，只认退出码 | 不听执行者自述 |
+| 复核（reviewer） | 换个模型只读审 diff，专挑假通过 | 不能改文件 |
+
+消息协议（每个会话一个 JSONL，`room/sessions/<id>.jsonl`）：
+
+```json
+{
+  "id": "msg-021",
+  "session_id": "chat-001",
+  "role": "assistant",
+  "agent": "executor",
+  "task_id": "T-261031-155003",
+  "content": "改动完成：textstats.py 加了 count_vowels，补了对应测试",
+  "artifacts": ["tasks/T-261031-155003/exec-01.last.md", "workspace:textstats.py"],
+  "status": "complete",
+  "created_at": "2026-10-31T15:50:31"
+}
+```
+
+Agent 之间**只传文件引用**，不把几万字日志互相灌：正文留在 `tasks/<ID>/`，消息里只放 `artifacts`。点开网页上的 📄 就能看原文。
+
+失败就是失败：验收退出码非 0、改动越界、复核判 `NEEDS_FIX`，消息标红并写明原因，任务终态记为 `outcome=failure`，不会因为流程走完就显示成功。
+
 ## 快速开始
 
 依赖：Python ≥ 3.10、git、Codex CLI 且已 `codex login`（跑 JS/TS 项目再装 node）。
@@ -43,16 +92,19 @@ agent-team start
 
 ```text
 agent_team/           运行时包（引擎、协议、网页、桥）
-  worker.py           消息认领、群聊大脑、流水线、阶段推进
-  team.py             任务卡协议：建卡/派发/验收/复核/报告
-  room.py             消息总账
-  room_web.py         网页工作台
+  worker.py           协调器：认领消息、驱动五个 Agent、推进阶段
+  team.py             任务卡内核：建卡/派发/验收/复核/报告
+  session.py          会话与消息模型（room/sessions/*.jsonl）
+  agents.py           统一 Agent 适配层（run(role, context, workspace, task)）
+  workspace.py        工作区校验与路径边界
+  room.py             消息总线（旧接口兼容层）
+  room_web.py         聊天式工作台（三栏、工作区选择器、artifact 预览）
   codex_bridge.py     调 Codex CLI 的唯一出口
   cli.py              统一命令入口
 bin/                  兼容壳 + 系统启动脚本（ps1/sh）
 config/team.json      模型、超时、重试
 agents/               大脑与执行者的契约提示词
-tests/                回归测试（29 项）
+tests/                回归测试（110 项）
 docs/                 架构与路线图
 room/ tasks/          运行时账本与任务卡（不进产物仓库）
 ```
@@ -63,7 +115,7 @@ room/ tasks/          运行时账本与任务卡（不进产物仓库）
 - [路线图](docs/ROADMAP.md)：已完成与下一步
 - [更新日志](CHANGELOG.md)
 - [参与开发](CONTRIBUTING.md)：红线与开发循环
-- [工作区绑定规则](docs/workspace-binding.md)
+- [改造路线](docs/REFACTOR-PLAN.md)：从任务流水线到对话式工作台
 
 ## 常用命令
 
