@@ -18,8 +18,9 @@ import sys
 import time
 from .winproc import quiet_flags
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOM = ROOT / "room"
 LOCK = ROOM / "worker.lock"
 WORKER = ["-m", "agent_team.worker"]

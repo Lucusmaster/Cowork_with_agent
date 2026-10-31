@@ -23,11 +23,11 @@ import argparse
 import json
 import sys
 import time
-from pathlib import Path
 
 from . import session
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOM = ROOT / "room"
 MESSAGES = ROOM / "messages.jsonl"      # 旧账本：只读（内容已迁移到 sessions/legacy.jsonl）
 STATE = ROOM / "state.json"

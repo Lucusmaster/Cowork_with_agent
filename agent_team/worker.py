@@ -19,13 +19,15 @@ import json
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 TASKS = ROOT / "tasks"
 ROOM = ROOT / "room"
 LOCK = ROOM / "worker.lock"
@@ -34,6 +36,7 @@ TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在�
 LOG = ROOM / "worker.log"
 
 from . import agents  # noqa: E402
+from . import analysis  # noqa: E402
 from . import control  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
@@ -278,6 +281,7 @@ def sanitize_plan(plan: dict) -> dict:
         "acceptance": acceptance,
         "verify": safe,
         "scope": scope,
+        "depends_on": [int(n) for n in (plan.get("depends_on") or []) if str(n).isdigit()][:4],
     }
 
 
@@ -302,6 +306,99 @@ def plan_with_codex(request: str, workspace: Path) -> dict | None:
     except json.JSONDecodeError as exc:
         log(f"规划 JSON 解析失败：{exc}")
         return None
+
+
+# ---------------- 多任务拆分 + 并行分析 ----------------
+def split_cards(plan: dict) -> list[dict]:
+    """大脑的 task / tasks 规范成任务卡列表（tasks 优先，坏条目直接丢）。"""
+    raw = plan.get("tasks")
+    items: list = []
+    if isinstance(raw, list) and raw:
+        items = [item for item in raw if isinstance(item, dict)]
+    elif isinstance(plan.get("task"), dict):
+        items = [plan["task"]]
+    cards = []
+    for item in items:
+        card = sanitize_plan(item)
+        if not card["title"] or card["title"] == "自动任务" and not item.get("goal"):
+            continue
+        cards.append(card)
+    return cards
+
+
+def order_cards(cards: list[dict]) -> list[dict]:
+    """按 depends_on 做拓扑排序；有环或依赖不存在就退回声明顺序。"""
+    if len(cards) < 2:
+        return list(cards)
+    index = {i + 1: card for i, card in enumerate(cards)}
+    done: list[dict] = []
+    seen: set[int] = set()
+
+    def visit(n: int, stack: set[int]) -> bool:
+        if n in seen:
+            return True
+        if n in stack or n not in index:
+            return False
+        stack.add(n)
+        for dep in index[n].get("depends_on") or []:
+            if not visit(int(dep), stack):
+                return False
+        stack.discard(n)
+        seen.add(n)
+        done.append(index[n])
+        return True
+
+    ok = all(visit(n, set()) for n in index)
+    return done if ok and len(done) == len(cards) else list(cards)
+
+
+def _parallel_enabled() -> bool:
+    try:
+        cfg = json.loads((ROOT / "config" / "team.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return bool((cfg.get("policy") or {}).get("parallel_analysis", True))
+
+
+def _looks_imperative(text: str) -> bool:
+    words = ("帮我", "给我", "改", "加", "修", "实现", "补上", "删", "重构", "优化", "写个", "写一个")
+    return any(word in text for word in words)
+
+
+def start_analysis(request: str, workspace: Path | None):
+    """和大脑同时开跑的只读预审（风险 + 验收口径）。返回 (executor, future)。"""
+    if workspace is None or not _parallel_enabled() or not _looks_imperative(request):
+        return None
+    try:
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="preanalyse")
+        fut = pool.submit(analysis.analyze, request, workspace, ROOM / "analysis")
+        event("预审与规划并行启动（两个只读分析同时跑）", "plan", "run", "reviewer")
+        return pool, fut
+    except Exception as exc:  # noqa: BLE001
+        log(f"并行分析没起来（不影响主流程）：{type(exc).__name__}: {exc}")
+        return None
+
+
+def collect_analysis(handle) -> dict | None:
+    """等预审结果；超时或出错都当没有，绝不让规划卡死。"""
+    if not handle:
+        return None
+    pool, fut = handle
+    try:
+        result = fut.result(timeout=300)
+    except Exception as exc:  # noqa: BLE001
+        log(f"预审失败（忽略）：{type(exc).__name__}: {exc}")
+        result = None
+    finally:
+        pool.shutdown(wait=False)
+    if not result:
+        return None
+    good = [res for res in (result.get("risk"), result.get("verify")) if res and res.get("ok")]
+    if not good:
+        return None
+    event(f"预审完成：{result.get('wall')}s（串行要 {result.get('serial')}s）",
+          "plan", "ok", "reviewer")
+    return result
 
 
 # ---------------- 流水线 ----------------
@@ -636,11 +733,11 @@ def handle_continue(request: str) -> None:
     if code != 0:
         event("建卡失败", "plan", "bad", "deepseek")
         say("建卡失败，原始输出：" + output[-400:])
-        return
+        return False
     match = re.search(r"(T-\d{6}-\d{6})", output)
     if not match:
         say("建卡命令没返回任务号，原始输出：" + output[-400:])
-        return
+        return False
     tid = match.group(1)
 
     # 把阶段关系与交接材料落到卡上，后面的人工阅读/下一轮"继续"都靠它
@@ -730,8 +827,11 @@ BRAIN_PROMPT = """你是这个协作群的"大脑"，名字叫 DeepSeek。群里
 回话/提问时：
 {{"say": "你在群里说的话（中文，像人一样，别长篇大论）", "action": "chat", "workspace": "", "project_name": "", "task": null}}
 
-让 Codex 动手时（task 必须是**对象**，绝不能是一段话）：
-{{"say": "说明我的理解和接下来做什么", "action": "run", "workspace": "E:\\\\某个仓库", "project_name": "", "task": {{"title": "不超过30字", "goal": "做到什么程度", "acceptance": ["可判真假的标准"], "verify": ["可直接执行的命令"], "scope": ["相对路径"]}}}}
+只做一件事时（task 必须是**对象**，绝不能是一段话）：
+{{"say": "说明我的理解和接下来做什么", "action": "run", "workspace": "E:\\\\某个仓库", "project_name": "", "task": {{"title": "不超过30字", "goal": "做到什么程度", "acceptance": ["可判真假的标准"], "verify": ["可直接执行的命令"], "scope": ["相对路径"], "depends_on": []}}, "tasks": null}}
+
+一次要做两件或以上互不相干的改动时（用 tasks 数组，task 必须为 null）：
+{{"say": "这件事我拆成 2 步", "action": "run", "workspace": "E:\\\\某个仓库", "project_name": "", "task": null, "tasks": [{{"title": "第一件事", "goal": "...", "acceptance": ["..."], "verify": ["..."], "scope": ["a.py"], "depends_on": []}}, {{"title": "第二件事", "goal": "...", "acceptance": ["..."], "verify": ["..."], "scope": ["b.py"], "depends_on": []}}]}}
 
 ## 规则
 - say 永远是必填的：用户看得到这句话。要具体，不要"好的我明白了"这种空话。
@@ -739,6 +839,9 @@ BRAIN_PROMPT = """你是这个协作群的"大脑"，名字叫 DeepSeek。群里
 - 连项目都还没定：action="chat"，直接问一句"工作区是哪个目录"。
 - action="run" 时 task 必须有可判真假的 acceptance 和能直接执行的 verify（优先 `python -m unittest discover -s tests -t . -v`）。
 - 别把一整周的工作塞进一次 task；一次做能扎实做完的一小块。
+- 用户一句话里说了两件或以上的独立改动（出现"另外/再加/顺便/两件事/分开做/分别/都加上"等），**必须**用 tasks 数组，一件事一张卡，绝不合并成一张卡；只做一件事时用 task 单对象。
+- tasks 里每个任务各自写清 acceptance / verify / scope，不要共用一套。
+- tasks 里每个任务的 depends_on 写它依赖的任务序号（从 1 开始，没有依赖就留空数组）。
 - 只输出 JSON。"""
 
 
@@ -828,6 +931,8 @@ def handle_chat(request: str) -> None:
         except OSError:
             workspace = None
 
+    # 预审（风险 + 验收口径）和"大脑"同时开跑：两者互不依赖，墙钟取最大值
+    analysis_handle = start_analysis(request, workspace)
     event("大脑正在看群里的对话…", "plan", "run", "deepseek")
     plan = brain_decide(request, workspace)
     if plan is None:
@@ -839,7 +944,8 @@ def handle_chat(request: str) -> None:
         room.post("deepseek", speech, "msg")
 
     action = (plan.get("action") or "chat").strip()
-    if action == "run" and not isinstance(plan.get("task"), dict):
+    if action == "run" and not isinstance(plan.get("task"), dict) \
+            and not isinstance(plan.get("tasks"), list):
         # 模型偶尔把 task 写成一段话：不要硬跑，改成追问一句
         room.post("deepseek",
                   "我大致明白你要什么，但拆不出可执行的任务卡。你说清「改哪个文件、做到什么程度、怎么算成功」，我就动手。",
@@ -874,8 +980,12 @@ def handle_chat(request: str) -> None:
         if asked and not imperative:
             room.post("deepseek", "要我现在就让 Codex 动手吗？回一句「动手」或「继续」我就开工。", "msg")
             return
-        task = plan.get("task") or {}
-        card = sanitize_plan(task)
+        cards = split_cards(plan)
+        if not cards:
+            room.post("deepseek",
+                      "我大致明白你要什么，但拆不出可执行的任务卡。你说清「改哪个文件、做到什么程度、怎么算成功」，我就动手。",
+                      "msg")
+            return
         target = workspace
         if plan.get("workspace"):
             resolved, why = detect_workspace(str(plan["workspace"]))
@@ -886,7 +996,11 @@ def handle_chat(request: str) -> None:
         if target is None:
             room.post("deepseek", "要动手得先知道改哪个目录，给我一个仓库的绝对路径。", "msg")
             return
-        run_card(card, target, request)
+        prescan = collect_analysis(analysis_handle)
+        if len(cards) == 1:
+            run_card(cards[0], target, request, prescan)
+        else:
+            run_plan(cards, target, request, prescan)
         return
     # action == chat：话已经说了，不动手
 
@@ -900,7 +1014,8 @@ def _require_approval() -> bool:
     return bool((cfg.get("policy") or {}).get("require_approval"))
 
 
-def run_card(card: dict, workspace: Path, request: str) -> None:
+def run_card(card: dict, workspace: Path, request: str,
+             prescan: dict | None = None, step_label: str = "") -> bool:
     args = ["new", "--title", card["title"], "--goal", card["goal"]]
     for item in card["acceptance"]:
         args += ["--acceptance", item]
@@ -926,10 +1041,20 @@ def run_card(card: dict, workspace: Path, request: str) -> None:
         + "\n\n## 验收命令\n" + "\n".join(f"- `{v}`" for v in card["verify"])
         + "\n\n## 允许改动的路径\n" + "、".join(card["scope"])
         + f"\n\n## 工作区\n{workspace}\n", encoding="utf-8")
+    notes = ""
+    if prescan:
+        notes, risk_full = analysis.plan_notes(prescan)
+        if notes:
+            (TASKS / tid / "prescan.md").write_text(
+                f"# 规划期预审（只读，两个分析并行产出）\n\n{notes}\n\n## 风险原文\n{risk_full}\n",
+                encoding="utf-8")
     event(f"建了任务卡 {tid}：{card['title']}", "plan", "ok", "deepseek", tid)
+    label = f"（第 {step_label} 步）" if step_label else ""
     post_agent("planner", tid, True,
-               f"需求已拆好：{len(card['acceptance'])} 条验收标准，"
-               f"{len(card['scope'])} 个允许改动的路径，计划写进了 plan.md。")
+               f"{label}需求已拆好：{len(card['acceptance'])} 条验收标准，"
+               f"{len(card['scope'])} 个允许改动的路径，计划写进了 plan.md。"
+               + (f"\n\n{notes}" if notes else ""),
+               artifacts=["tasks/" + tid + "/prescan.md"] if notes else [])
     if _require_approval():
         try:
             control.wait_approval(tid, on_event=lambda ev, st: control_note(ev, tid, st),
@@ -937,8 +1062,31 @@ def run_card(card: dict, workspace: Path, request: str) -> None:
         except control.TaskStopped:
             control_note("stopped", tid)
             post_agent("coordinator", tid, False, "已按你的要求停下，这一轮还没开始执行。")
-            return
+            return False
     pipeline(tid, card, request)
+    try:
+        outcome = json.loads((TASKS / tid / "task.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return outcome.get("outcome") == "success"
+
+
+def run_plan(cards: list[dict], workspace: Path, request: str,
+             prescan: dict | None = None) -> None:
+    """一次需求拆成多步：按依赖排序，一步一步跑，某步没过就停。"""
+    ordered = order_cards(cards)
+    plan_text = "\n".join(
+        f"{i}. {card['title']}" + (f"（依赖第 {'、'.join(str(d) for d in card['depends_on'])} 步）"
+                                   if card.get("depends_on") else "")
+        for i, card in enumerate(ordered, 1))
+    say(f"这件事我拆成 {len(ordered)} 步，按顺序做，每步都过验收和复核：\n{plan_text}")
+    for i, card in enumerate(ordered, 1):
+        ok = run_card(card, workspace, request, prescan, step_label=f"{i}/{len(ordered)}")
+        if not ok:
+            say(f"第 {i} 步（{card['title']}）没过，后面的步骤先不做。"
+                f"要我先修这一处，还是换个思路？", status="failed")
+            return
+    say(f"{len(ordered)} 步全部做完了。")
 
 
 def pipeline(tid: str, card: dict, request: str) -> None:

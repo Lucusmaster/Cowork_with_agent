@@ -16,8 +16,9 @@ import json
 import sys
 import time
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 TASKS = ROOT / "tasks"
 
 for _stream in (sys.stdout, sys.stderr):

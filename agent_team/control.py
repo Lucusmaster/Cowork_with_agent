@@ -17,8 +17,9 @@ import json
 import os
 import time
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOM = ROOT / "room"
 CONTROL = ROOM / "control.json"     # 指令（一次一条，消费即删）
 PAUSE = ROOM / "pause.json"         # 暂停中标记（含原因与任务号）

@@ -14,9 +14,10 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
 # 包的定位：room/、tasks/ 都在仓库根下
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 
 # 运行目录。测试里会整体替换 ROOM，其余路径一律在调用时从 ROOM 派生（别在导入时固化）
 ROOM = ROOT / "room"

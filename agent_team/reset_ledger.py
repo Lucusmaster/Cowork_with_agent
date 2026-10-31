@@ -10,10 +10,10 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOM = ROOT / "room"
 TASKS = ROOT / "tasks"
 

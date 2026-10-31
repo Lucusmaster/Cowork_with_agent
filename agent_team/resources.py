@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+
+ROOT = workbench_root()
 BUNDLED = Path(__file__).resolve().parent / "bundled"
 
 

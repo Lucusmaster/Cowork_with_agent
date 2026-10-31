@@ -1,3 +1,23 @@
+## 0.7.0 — 会拆活了
+
+### 新增
+- **多任务拆分**：一句话里有几件互不相干的改动，就拆成几张卡，按 `depends_on` 拓扑排序依次执行；
+  某一步没过就停下问你，不会带病往下跑。
+- **并行分析**：规划阶段的风险预审（复核者）和验收口径（验收者）同时跑。
+  实测 37.3s vs 串行 69.2s；结果写进任务卡 `prescan.md`，复核阶段可追溯。
+  配置 `policy.parallel_analysis: false` 可关闭。
+- 每个任务卡多一个 `depends_on` 字段（任务卡协议向后兼容，旧卡不受影响）。
+
+### 修复
+- **pip 安装后账本写进 site-packages**：新增 `agent_team/paths.py`，仓库里跑用仓库根，
+  装成包后用 `AGENT_TEAM_HOME`（默认 `~/.agent-team`）。真机验证：干净 venv 装 wheel 后建卡，
+  落在 `AGENT_TEAM_HOME` 下，`site-packages/tasks` 不存在。
+- 大脑给了 `tasks` 数组时被旧守卫当成"拆不出来"直接拒掉（真实跑任务时抓到）。
+
+### 验证
+- 177 项测试全绿，`ruff check .` 干净。
+- 真实跑通拆分：一次需求 → 2 张卡（spaces / punct）→ 各自验收 + 复核 PASS → "2 步全部做完了"。
+
 ## 0.6.1 — 收工兜底
 
 - 引擎启动时补记终态：状态已经是 passed/failed 但缺 `finished_at` 的任务（比如引擎在写终态前被关掉），

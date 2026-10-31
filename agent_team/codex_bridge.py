@@ -17,11 +17,12 @@ import time
 from datetime import datetime
 from .winproc import quiet_flags
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 
 # Codex 的会话日志、临时文件很大（本机实测 session 已超 1GB），
 # 默认落到 C:\Users\<user>\.codex。这里把「本次工作区」的 CODEX_HOME

@@ -181,20 +181,21 @@ coordinator 任务走完了：passed
 
 任务卡终态：`status=passed`、`outcome=success`、`reviews=[NEEDS_FIX, PASS]`、`finished_at` 有值。
 
-### 第二阶段：部分完成
+### 第二阶段：已完成 ✅
 
 - ✅ `agents.run(role, session_context, workspace, task) -> AgentResult` 已落地，网页与协调器都不直接认识 Codex。
 - ✅ `config/team.json` 有 `agents` 段（五角色、模型、档位、沙箱）。
-- ⏳ 规划拆解仍是「一次一张卡」，还没做多任务拆分与依赖排序。
-- ⏳ `session_context` 已注入大脑（`context()`），但规划器还没独立成一次调用。
+- ✅ 多任务拆分与依赖排序（`split_cards` / `order_cards`）。
+- ✅ `session_context` 注入大脑；规划仍是大脑一次调用，但已能一次给出多张卡。
 
 ### 第三阶段：进行中（控制已完成）
 
 - ✅ 暂停 / 继续 / 停止 / 重新执行：`control.py` 状态机 + 引擎逐步闸门 + 右栏按钮。
 - ✅ 批准闸门：`policy.require_approval`。
 - ✅ 执行中新增需求：进队列并明确回执。
-- ⏳ 并行分析（多个 Agent 同时拆同一需求）。
-- ⏳ 多任务依赖排序。
+- ✅ 并行分析：风险预审 + 验收口径两份只读分析同时跑（实测 37.3s / 串行 69.2s）。
+- ✅ 多任务拆分与依赖排序：`split_cards()` + `order_cards()`，某步失败即停。
+- ✅ scope 隔离：每张卡自带 scope，越界改动判 FAIL。
 
 并行分析、scope 隔离下的共享工作区、执行中追加需求入队、暂停/继续/批准/重跑按钮。
 
@@ -208,5 +209,5 @@ coordinator 任务走完了：passed
 | 复核失败不进成功终态 | ✅ `cmd_review` 降级状态 |
 | 消息写入加锁 / 原子写 | ✅ `session.py` 用文件锁 + 原子替换 |
 | 任务 ID、工作区路径边界校验 | ✅ `workspace.py` |
-| 网页访问令牌、默认本机 | ⏳ 已只绑 `127.0.0.1`，令牌未做 |
-| wheel 安装后路径失效 | ✅ `agent_team/bundled/` + `resources.resource()` + 漂移守卫 |
+| 网页访问令牌、默认本机 | ✅ 只绑 `127.0.0.1` + `room/web-token`（头或 `?token=`） |
+| wheel 安装后路径失效 | ✅ `paths.workbench_root()` + `AGENT_TEAM_HOME`；干净 venv 实测账本不落 site-packages |

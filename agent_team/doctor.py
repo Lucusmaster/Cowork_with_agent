@@ -15,8 +15,9 @@ from pathlib import Path
 
 from .resources import resource
 from .winproc import quiet_flags
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 
 for _stream in (sys.stdout, sys.stderr):
     try:

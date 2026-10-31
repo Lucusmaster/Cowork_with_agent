@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .winproc import quiet_flags
+from .paths import workbench_root  # noqa: E402
 
 try:
     from . import room
@@ -46,7 +47,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOT_RESOLVED = ROOT.resolve()
 TASKS = ROOT / "tasks"
 ROOM = ROOT / "room"

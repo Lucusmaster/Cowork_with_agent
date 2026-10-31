@@ -56,13 +56,34 @@ class ChatFlowTests(unittest.TestCase):
     def test_run_creates_card_and_publishes_voices(self):
         calls: list = []
         worker.detect_workspace = lambda text: (self.proj, "")
-        worker.run_card = lambda card, ws, req: calls.append((card["title"], str(ws)))
+        worker.start_analysis = lambda req, ws: None
+        worker.run_card = lambda card, ws, req, prescan=None, step_label="": calls.append((card["title"], str(ws)))
         worker.brain_decide = lambda req, ws=None: {
             "say": "我按「加导出」理解，先做最小可用的。", "action": "run",
             "task": {"title": "加导出", "goal": "导出 csv", "acceptance": ["能导出"],
                      "verify": ["python -m pytest -q"], "scope": ["export.py"]}}
         worker.handle("把数据导出")
         self.assertEqual(calls, [("加导出", str(self.proj))])
+
+    def test_run_with_tasks_array_goes_to_run_plan(self):
+        """大脑一次给多个任务时，不能当成"拆不出来"拒掉，要按多步执行。"""
+        planned: list = []
+        posts: list = []
+        worker.detect_workspace = lambda text: (self.proj, "")
+        worker.start_analysis = lambda req, ws: None
+        worker.run_plan = lambda cards, ws, req, prescan=None: planned.append(
+            [card["title"] for card in cards])
+        worker.brain_decide = lambda req, ws=None: {
+            "say": "拆成两步。", "action": "run", "workspace": str(self.proj), "task": None,
+            "tasks": [
+                {"title": "甲", "goal": "a", "acceptance": ["x"],
+                 "verify": ["python -m pytest -q"], "scope": ["a.py"], "depends_on": []},
+                {"title": "乙", "goal": "b", "acceptance": ["y"],
+                 "verify": ["python -m pytest -q"], "scope": ["b.py"], "depends_on": [1]},
+            ]}
+        worker.handle("两件事一起做")
+        self.assertEqual(planned, [["甲", "乙"]])
+        self.assertFalse(any("拆不出" in text for _, text in posts))
 
 
 class ThreadContextTests(unittest.TestCase):

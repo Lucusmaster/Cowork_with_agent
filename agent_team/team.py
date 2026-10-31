@@ -24,11 +24,12 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 TASKS = ROOT / "tasks"
 
 from .resources import resource  # noqa: E402

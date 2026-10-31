@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
 # 协作台仓库根（room/、tasks/ 都在它下面）
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 
 # 任务卡 ID 的唯一样式：T-<六位日期>-<六位时间>，例如 T-261031-120000
 TASK_ID_PATTERN = r"T-\d{6}-\d{6}"

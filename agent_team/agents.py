@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .winproc import quiet_flags
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 CONFIG = ROOT / "config" / "team.json"
 
 ROLE_LABELS = {

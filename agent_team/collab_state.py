@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
+from .paths import workbench_root  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = workbench_root()
 ROOM = ROOT / "room"
 STATE = ROOM / "session_state.json"
 NOTIFIED = ROOM / "session_state.notified"
