@@ -1382,6 +1382,8 @@ PAGE = r"""<!DOCTYPE html>
   --dur:140ms; --ease:cubic-bezier(.2,.7,.3,1);
   /* 键盘焦点环 */
   --ring:#58a6ff;
+  /* 高科技 HUD：双霓虹（信号场画在内容之上，叠加光，不动面板底色）*/
+  --neon-a:#22e0ff; --neon-b:#ff3ea5;
   /* 细线 / 滚动条 */
   --hair:1px; --scroll:#232c38; --scroll-hover:#2f3a49;
   color-scheme:dark;
@@ -1396,6 +1398,65 @@ button{font:inherit;color:inherit;cursor:pointer}
 .mono{font-family:"Cascadia Mono",Consolas,"SF Mono",monospace}
 .app{display:none;grid-template-columns:264px minmax(0,1fr) 344px;height:100vh}
 body.ready .app{display:grid}
+
+/* ---------- 高科技 HUD：装饰层盒子与开关（画什么由 fx.css 管，这里只给位置和开关） ----------
+   信号场画在内容「之上」（z 60，模态在 75+ 所以弹窗是干净的），走叠加光，
+   所以面板不用改成半透明——正文对比度维持原样，这点很重要。 */
+.fx-layer{position:fixed;inset:0;width:100%;height:100%;display:none;pointer-events:none}
+/* fx.css 的 conic 描边是 ::after + inset:0，宿主这边得是定位元素，不然会跑到视口上 */
+.composer-box{position:relative}
+body.fx-on #fx-field{display:block;z-index:60}
+body.fx-on #fx-spark{display:block;z-index:62}
+/* 亮的部分只放「没有文字的地方」：视口顶部的扫描线 + 四角括角 + 输入框外圈辉光。
+   正文区只留极淡的点阵纹理，这样最暗的辅助文字（--dim2）也还在 4.5:1 以上。 */
+.hud-frame{position:fixed;inset:0;z-index:70;pointer-events:none;display:none}
+body.fx-on .hud-frame{display:block}
+.hud-frame .tl{position:absolute;top:0;left:0;right:0;height:2px;overflow:hidden;
+  background:linear-gradient(90deg,transparent,var(--neon-a) 26%,var(--neon-b) 74%,transparent);
+  opacity:.55}
+.hud-frame .tl i{position:absolute;top:0;left:0;height:2px;width:20%;
+  background:linear-gradient(90deg,transparent,#ffffffb8 50%,transparent);
+  animation:hud-sweep 7s cubic-bezier(.45,.05,.55,.95) infinite}
+@keyframes hud-sweep{0%{transform:translateX(-140%)}60%,100%{transform:translateX(620%)}}
+body.fx-max .hud-frame .tl{opacity:.85}
+.hud-frame .c{position:absolute;width:20px;height:20px;opacity:.4}
+.hud-frame .c::before,.hud-frame .c::after{content:"";position:absolute;background:var(--neon-a)}
+.hud-frame .c::before{left:0;top:0;width:20px;height:1px}
+.hud-frame .c::after{left:0;top:0;width:1px;height:20px}
+.hud-frame .c.tr,.hud-frame .c.br{opacity:.5}
+.hud-frame .c.tr::before,.hud-frame .c.tr::after,
+.hud-frame .c.br::before,.hud-frame .c.br::after{background:var(--neon-b)}
+.hud-frame .c.tr::before,.hud-frame .c.tr::after{left:auto;right:0}
+.hud-frame .c.br::before,.hud-frame .c.br::after{left:auto;right:0;top:auto;bottom:0}
+.hud-frame .c.bl::before,.hud-frame .c.bl::after{top:auto;bottom:0}
+.hud-frame .c.tl{top:5px;left:5px}
+.hud-frame .c.tr{top:5px;right:5px}
+.hud-frame .c.bl{bottom:5px;left:5px}
+.hud-frame .c.br{bottom:5px;right:5px}
+/* 输入框外圈：常态一条淡青底光，聚焦时亮一档（都在框外面，不压文字） */
+body.fx-on .composer-box::before{content:"";position:absolute;left:12px;right:12px;bottom:-7px;height:1px;
+  background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--neon-a) 45%,transparent),transparent);
+  opacity:.65;pointer-events:none;transition:opacity var(--dur) var(--ease)}
+body.fx-on .composer-box:focus-within::before{
+  opacity:1;height:2px;bottom:-8px;
+  background:linear-gradient(90deg,transparent,var(--neon-a),var(--neon-b),transparent)}
+@media (prefers-reduced-motion:reduce){.hud-frame .tl i{animation:none;display:none}}
+/* 面板缝里走一道光：这两条 1px 边线上方没有文字，可以亮 */
+body.fx-on .side{border-right-color:color-mix(in srgb,var(--neon-a) 34%,var(--line))}
+body.fx-on .inspector{border-left-color:color-mix(in srgb,var(--neon-b) 28%,var(--line))}
+body.fx-std .side,body.fx-std .inspector{transition:border-color var(--dur) var(--ease)}
+.fx-btn{height:26px;padding:0 var(--sp-2) 0 7px;border-radius:var(--r-pill);
+  border:var(--hair) solid var(--line2);background:var(--panel2);color:var(--dim);
+  font-size:var(--fs-xs);display:inline-flex;align-items:center;gap:6px;flex:none}
+.fx-btn:hover{color:var(--fg);border-color:#3d4a5c}
+.fx-btn .fx-led{width:6px;height:6px;border-radius:var(--r-pill);background:var(--dim2);
+  transition:background-color var(--dur) var(--ease),box-shadow var(--dur) var(--ease)}
+/* 图标（sprite）：一套描边，颜色跟 currentColor 走 */
+.ico{width:14px;height:14px;flex:none;fill:none;stroke:currentColor;stroke-width:1.5;
+  stroke-linecap:round;stroke-linejoin:round;vertical-align:-2px;overflow:visible}
+body.fx-std .fx-btn .fx-led{background:var(--neon-a);box-shadow:0 0 6px var(--neon-a)}
+body.fx-max .fx-btn .fx-led{background:var(--neon-b);box-shadow:0 0 7px var(--neon-b)}
+@media (prefers-reduced-motion:reduce){.fx-btn .fx-led{transition:none}}
 
 /* ---------- 交互四态（统一：hover / active / focus-visible / disabled） ---------- */
 button,.sess,.art,.pick-row,.pick-btn,.use,.cta-btn,.ws-pick,.newchat,.earlier,
@@ -1523,7 +1584,8 @@ input,textarea{caret-color:var(--user)}
   background:none;border:0;border-top:var(--hair) solid var(--line);
   padding:var(--sp-2) var(--sp-4);color:var(--dim2);font-size:var(--fs-sm);
   text-align:left;flex:0 0 auto}
-.side-trash .ic{font-size:var(--fs-sm);opacity:.75;line-height:1}
+.side-trash .ic{display:flex;align-items:center;opacity:.8;line-height:1}
+.side-trash .ic .ico{width:13px;height:13px}
 .side-trash .lbl{flex:1;min-width:0}
 .side-trash .count{flex:0 0 auto;min-width:20px;text-align:center;font-size:var(--fs-xs);
   color:var(--dim2);border:var(--hair) solid var(--line2);border-radius:var(--r-pill);
@@ -1977,8 +2039,220 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
   .typing .dots i{animation:none;opacity:.6;transform:none}
   .live.busy .dot,.agent-row.busy .dot{animation:none;box-shadow:none}
   .toast{transition:none}
-}</style></head>
+}/* __FX_CSS_BEGIN__ */
+/* ======== HUD 特效层（源文件 .tmp/fx/fx.css，改完用 .tmp/fx/splice.py 重新拼） ======== */
+/* ============================================================================
+   fx.css — 战术 HUD 特效层（零依赖：纯 CSS + 两个 canvas，由 fx.js 驱动）
+   ----------------------------------------------------------------------------
+   契约
+   - 全部特效挂在 body.fx-on 下；档位 body.fx-std（默认）/ body.fx-max；
+     body.fx-off 或不带 fx-on 时：装饰层不生成、动画全停。
+   - 装饰层一律 pointer-events:none；z-index 由宿主参数决定：
+     #fx-field 用 --fx-z（默认 0），#fx-spark 用 --fx-z-spark（默认 90）。
+   - 颜色只走宿主 token；新增色只有 --neon-a / --neon-b 两个，别处全用 var()。
+   - prefers-reduced-motion:reduce → 所有循环动画（ping / conic 旋转）停掉，
+     静态描边和静态点阵保留；点击反馈退化成纯 opacity。
+   ========================================================================== */
+
+/* 只在这里新增两个颜色，命名固定 */
+:root{
+  --neon-a:#22e0ff;   /* 青 */
+  --neon-b:#ff3ea5;   /* 品红 */
+
+  /* 装饰层 z-index（宿主可覆盖；fx.js 的 init 还会写内联 style 覆盖这里） */
+  --fx-z:60;
+  --fx-z-spark:62;
+}
+
+/* 可动画的 conic 角度（Chromium 支持 @property，注册后才能补间） */
+@property --fx-spin { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+
+
+/* ============================ 1. 画布层 ================================== */
+
+#fx-field,
+#fx-spark{
+  position:fixed;
+  inset:0;
+  display:block;
+  width:100%;
+  height:100%;
+  pointer-events:none;
+  border:0;
+  margin:0;
+  padding:0;
+  background:transparent;
+  /* 双缓冲外的合成提示：固定层，避免宿主滚动时重排 */
+  contain:strict;
+}
+#fx-field{ z-index:var(--fx-z); }
+#fx-spark{ z-index:var(--fx-z-spark); }
+
+/* 不带 fx-on / 显式 off：画布彻底不参与渲染（fx.js 也会 display:none） */
+body:not(.fx-on) #fx-field,
+body:not(.fx-on) #fx-spark,
+body.fx-off #fx-field,
+body.fx-off #fx-spark{
+  display:none !important;
+}
+
+
+/* ============================ 2. 状态心跳 ping ============================ */
+/* 只对 .is-hot 生效：.live .dot / #engine .dot 都走这条。1.8s 一圈。 */
+
+body.fx-on .is-hot .dot{ position:relative; }
+
+body.fx-on .is-hot .dot::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  border:1px solid color-mix(in srgb, var(--neon-a) 62%, transparent);
+  pointer-events:none;
+  transform-origin:center;
+  animation:fx-ping 1.8s cubic-bezier(.2,.7,.3,1) infinite;
+  will-change:transform,opacity;
+}
+
+@keyframes fx-ping{
+  0%  { transform:scale(1);   opacity:.85; }
+  68% { transform:scale(2.8); opacity:0; }
+  100%{ transform:scale(2.8); opacity:0; }
+}
+
+
+/* ====================== 3. 状态边框：旋转 conic 描边 ====================== */
+/* 1px 内描边，青↔品红顺时针 4s 一圈。用 padding+mask 抠出环，不用 filter。 */
+
+body.fx-on :is(.sess.sel, .composer-box:focus-within, .toast.show,
+                .trash-card, .picker-card, .confirm-card)::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  z-index:2;
+  padding:1px;
+  border-radius:inherit;
+  pointer-events:none;
+  background:conic-gradient(from var(--fx-spin),
+      transparent 0deg 296deg,
+      color-mix(in srgb, var(--neon-a) 78%, transparent) 326deg,
+      color-mix(in srgb, var(--neon-b) 84%, transparent) 350deg,
+      transparent 360deg);
+  -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;
+          mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask-composite:exclude;
+  animation:fx-ring 4s linear infinite;
+}
+
+@keyframes fx-ring{
+  to{ --fx-spin:360deg; }
+}
+
+/* max 档：环更亮一点（不加模糊，避免掉帧） */
+body.fx-max :is(.sess.sel, .composer-box:focus-within, .toast.show,
+                .trash-card, .picker-card, .confirm-card)::after{
+  background:conic-gradient(from var(--fx-spin),
+      transparent 0deg 288deg,
+      color-mix(in srgb, var(--neon-a) 92%, transparent) 322deg,
+      color-mix(in srgb, var(--neon-b) 96%, transparent) 350deg,
+      transparent 360deg);
+}
+
+
+/* ========================= 4. 四角 HUD 括角 =============================== */
+/* 12px 折线：左上 + 右下 青；右上 + 左下 品红。只给 .panel 和三种卡片。 */
+
+body.fx-on :is(.panel, .trash-card, .picker-card, .confirm-card){
+  position:relative;
+}
+
+/* conic 描边要贴着自身盒子画，所以这行必须有（宿主原本没给 composer-box 设 position） */
+body.fx-on .composer-box{
+  position:relative;
+}
+
+body.fx-on :is(.panel, .trash-card, .picker-card, .confirm-card)::before{
+  content:"";
+  position:absolute;
+  inset:0;
+  z-index:3;
+  border-radius:inherit;
+  pointer-events:none;
+  opacity:.30;
+  background:
+    linear-gradient(var(--neon-a), var(--neon-a)) 0 0 / 12px 1px no-repeat,
+    linear-gradient(var(--neon-a), var(--neon-a)) 0 0 / 1px 12px no-repeat,
+    linear-gradient(var(--neon-b), var(--neon-b)) 100% 100% / 12px 1px no-repeat,
+    linear-gradient(var(--neon-b), var(--neon-b)) 100% 100% / 1px 12px no-repeat,
+    linear-gradient(var(--neon-b), var(--neon-b)) 100% 0 / 12px 1px no-repeat,
+    linear-gradient(var(--neon-b), var(--neon-b)) 100% 0 / 1px 12px no-repeat,
+    linear-gradient(var(--neon-a), var(--neon-a)) 0 100% / 12px 1px no-repeat,
+    linear-gradient(var(--neon-a), var(--neon-a)) 0 100% / 1px 12px no-repeat;
+}
+
+body.fx-max :is(.panel, .trash-card, .picker-card, .confirm-card)::before{
+  opacity:.42;
+}
+
+
+/* ==================== 5. 点击反馈（reduced-motion 用） ==================== */
+/* 常规档走 canvas 迸溅（fx.js）；reduced-motion 下 fx.js 只加这个类。 */
+
+body.fx-on .fx-tap{
+  opacity:.66;
+  transition:opacity 110ms linear;
+}
+
+
+/* ============================ 6. 静止 / 降级 ============================= */
+
+/* reduced-motion：循环动画全停，留下不动的静态描边 */
+@media (prefers-reduced-motion: reduce){
+  body.fx-on .is-hot .dot::after{
+    animation:none;
+    transform:scale(1.35);
+    opacity:.45;
+  }
+  body.fx-on :is(.sess.sel, .composer-box:focus-within, .toast.show,
+                  .trash-card, .picker-card, .confirm-card)::after{
+    animation:none;
+  }
+  body.fx-on .fx-tap{
+    opacity:.66;
+    transition:opacity 110ms linear;
+  }
+}
+
+/* 用户要求减少透明度/对比度等极端环境：不额外加戏，保持静止即可 */
+@media (forced-colors: active){
+  body.fx-on .is-hot .dot::after,
+  body.fx-on :is(.sess.sel, .composer-box:focus-within, .toast.show,
+                  .trash-card, .picker-card, .confirm-card)::after,
+  body.fx-on :is(.panel, .trash-card, .picker-card, .confirm-card)::before{
+    content:none;
+  }
+}
+/* __FX_CSS_END__ */
+</style></head>
 <body>
+<canvas class="fx-layer" id="fx-field" aria-hidden="true"></canvas>
+<canvas class="fx-layer" id="fx-spark" aria-hidden="true"></canvas>
+<!-- 图标：自绘 1.5px 描边一套，别再用 emoji 当图标 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5.5M14 11v5.5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3.5h7l4 4v13H7z"/><path d="M14 3.5v4h4"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h3.6l2 2h7.4a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-pkg" viewBox="0 0 24 24"><path d="M12 3.2l8 4.4v8.8l-8 4.4-8-4.4V7.6z"/><path d="M4 7.6l8 4.4 8-4.4M12 12v8.8"/></symbol>
+</defs></svg>
+<!-- HUD 边框层：顶部扫描线 + 四角括角（只走 CSS，不压任何文字） -->
+<div class="hud-frame" aria-hidden="true">
+  <div class="tl"><i></i></div>
+  <span class="c tl"></span><span class="c tr"></span>
+  <span class="c bl"></span><span class="c br"></span>
+</div>
 <div class="app">
   <aside class="side">
     <div class="brand">
@@ -1991,7 +2265,7 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
     <div class="side-label">历史会话<span class="count" id="session-count">0</span></div>
     <div class="sessions" id="sessions"></div>
     <button class="side-trash" id="trash-entry" aria-haspopup="dialog" title="看看删掉的会话">
-      <span class="ic">🗑</span><span class="lbl">回收站</span>
+      <span class="ic"><svg class="ico" aria-hidden="true"><use href="#i-trash"/></svg></span><span class="lbl">回收站</span>
       <span class="count" id="trash-count">0</span>
     </button>
     <div class="side-foot" id="store-note"></div>
@@ -2004,6 +2278,10 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
         <div class="live" id="live"><span class="dot"></span><span id="live-txt">空闲</span></div>
         <div class="live engine-dead" id="engine" title="">
           <span class="dot"></span><span id="engine-txt">引擎没在跑</span></div>
+        <button class="fx-btn" id="fx-toggle" type="button" aria-pressed="true"
+                title="高科技特效：关 / 标准 / 加强（点一下换一档）">
+          <span class="fx-led"></span><span class="fx-lbl">特效·标准</span>
+        </button>
       </div>
       <div class="topbar-row">
         <input class="ws-input" id="ws-input" spellcheck="false"
@@ -2122,6 +2400,911 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
     <div class="unlock-err" id="unlock-err"></div>
   </div>
 </div>
+
+<script>
+// __FX_JS_BEGIN__
+/* ======== HUD 特效层（源文件 .tmp/fx/fx.js） ======== */
+﻿/* ============================================================================
+   fx.js — 战术 HUD 特效层（零依赖 vanilla，只有 canvas 2D + CSS）
+   ----------------------------------------------------------------------------
+   机制来源（react-bits 原组件都是 React/WebGL，这里只复刻观感，不搬代码）：
+     环境场       ← Backgrounds/Particles + Backgrounds/DotGrid + Backgrounds/Scanner
+     点击迸溅     ← Animations/ClickSpark
+     文字解码     ← TextAnimations/DecryptedText + ScrambledText
+     底部透视网格 ← Backgrounds/GridScan
+   详见同目录 README.md。
+
+   API（签名固定，别改）：
+     FX.init({ level:'std'|'max'|'off', zField:0, zSpark:90, getState:()=>state })
+     FX.setLevel('off'|'std'|'max')
+     FX.scramble(el, text)
+     FX.spark(x, y, opts)
+     FX.destroy()
+   附加的只读/辅助出口（自测用，宿主可以不用）：
+     FX.status() / FX.setState({busy,engineAlive})
+
+   性能约束（自查过）：单 rAF 循环画两个 canvas；30fps 上限；dpr≤2；
+   document.hidden 停；粒子上限 std 28 / max 64；单帧全部绘制 <2ms 量级。
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  if (window.FX && window.FX.__fx) return;
+
+  /* ------------------------------- 常量 ---------------------------------- */
+  var TAU = Math.PI * 2;
+  var FRAME_MS = 1000 / 30;      // canvas 帧间隔（30fps 上限）
+  var DPR_CAP = 2;
+  var SCAN_W = 140;              // 扫描带宽（CSS px）
+  var SCAN_STD_MS = 12000;       // std：12s 一轮
+  var SCAN_BUSY_MS = 4000;       // busy：4s 一轮
+  var POLL_MS = 600;             // getState 轮询
+  var SPARK_LIFE = 300;          // 迸溅 300ms 淡出
+  var SPARK_CAP = 160;
+  var MAX_LINK_ALPHA = 0.10;     // 粒子/连线 alpha 上限
+
+  var LEVELS = {
+    off: null,
+    std: { gap: 32, particles: 28, link: 104, spark: 8,  perspective: false, dispersion: false },
+    max: { gap: 24, particles: 64, link: 116, spark: 14, perspective: true,  dispersion: true  }
+  };
+
+  /* ------------------------------- 状态 ---------------------------------- */
+  var inited = false;
+  var level = 'std';
+  var cfg = LEVELS.std;
+  var opts = { getState: null, zField: 0, zSpark: 90 };
+  var st = { busy: false, engineAlive: true };
+  var reduced = false;
+
+  var dom = { field: null, spark: null, fctx: null, sctx: null, made: false };
+  var view = { w: 0, h: 0, dpr: 1 };
+  var colors = { a: [34, 224, 255], b: [255, 62, 165], dim: [130, 142, 157] };
+  var patCache = {};             // 'gap|alive|dpr' -> CanvasPattern
+  var particles = [];
+  var sparks = [];
+  var parallax = { x: 0, y: 0, tx: 0, ty: 0 };
+  var clock = { phase: 0.2 };
+  var loop = { on: false, raf: 0, prev: 0, frames: 0, drawn: 0 };
+  var sparkDirty = false;
+  var pollId = 0;
+  var resizeId = 0;
+  var listeners = [];
+  var scrambleTimers = [];
+
+  /* ------------------------------- 小工具 -------------------------------- */
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function rgba(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (Math.round(a * 1000) / 1000) + ')';
+  }
+
+  function mixRgb(p, q, t) {
+    return [
+      Math.round(p[0] + (q[0] - p[0]) * t),
+      Math.round(p[1] + (q[1] - p[1]) * t),
+      Math.round(p[2] + (q[2] - p[2]) * t)
+    ];
+  }
+
+  function readCss(name, fallback) {
+    try {
+      var v = getComputedStyle(document.documentElement).getPropertyValue(name);
+      v = (v || '').trim();
+      return v || fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function toRgb(str) {
+    var s = String(str || '').trim();
+    var m = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(s);
+    if (m) {
+      var h = m[1];
+      if (h.length === 3) h = h.replace(/./g, function (c) { return c + c; });
+      var n = parseInt(h.slice(0, 6), 16);
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    var r = /rgba?\(([^)]+)\)/i.exec(s);
+    if (r) {
+      var p = r[1].split(',');
+      return [parseInt(p[0], 10) || 0, parseInt(p[1], 10) || 0, parseInt(p[2], 10) || 0];
+    }
+    return [120, 132, 148];
+  }
+
+  /* 三次贝塞尔缓动：只用来算解码进度（450ms, cubic-bezier(.16,1,.3,1)） */
+  function cubicBezier(x1, y1, x2, y2) {
+    var cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+    var cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+    function sx(t) { return ((ax * t + bx) * t + cx) * t; }
+    function sy(t) { return ((ay * t + by) * t + cy) * t; }
+    return function (x) {
+      if (x <= 0) return 0;
+      if (x >= 1) return 1;
+      var t = x, i, e, d;
+      for (i = 0; i < 8; i++) {
+        e = sx(t) - x;
+        if (Math.abs(e) < 1e-4) return sy(t);
+        d = (3 * ax * t + 2 * bx) * t + cx;
+        if (Math.abs(d) < 1e-6) break;
+        t -= e / d;
+        if (t < 0 || t > 1) break;
+      }
+      var lo = 0, hi = 1;
+      t = x;
+      for (i = 0; i < 14; i++) {
+        var v = sx(t);
+        if (Math.abs(v - x) < 1e-4) break;
+        if (v > x) hi = t; else lo = t;
+        t = (lo + hi) / 2;
+      }
+      return sy(t);
+    };
+  }
+
+  var easeScramble = cubicBezier(0.16, 1, 0.3, 1);
+
+  /* --------------------------- DOM / 画布装配 ---------------------------- */
+  function mkCanvas(id, cssVar) {
+    var el = document.createElement('canvas');
+    el.id = id;
+    el.setAttribute('aria-hidden', 'true');
+    el.className = 'fx-canvas';
+    if (cssVar) el.style.zIndex = cssVar;
+    document.body.appendChild(el);
+    dom.made = true;
+    return el;
+  }
+
+  function ensureDom() {
+    if (!document.body) return false;
+    dom.field = document.getElementById('fx-field');
+    if (!dom.field) dom.field = mkCanvas('fx-field');
+    dom.spark = document.getElementById('fx-spark');
+    if (!dom.spark) dom.spark = mkCanvas('fx-spark');
+
+    dom.field.style.pointerEvents = 'none';
+    dom.spark.style.pointerEvents = 'none';
+
+    dom.fctx = dom.field.getContext('2d');
+    dom.sctx = dom.spark.getContext('2d');
+    return !!(dom.fctx && dom.sctx);
+  }
+
+  function applyZ() {
+    if (dom.field) dom.field.style.zIndex = String(opts.zField);
+    if (dom.spark) dom.spark.style.zIndex = String(opts.zSpark);
+  }
+
+  function readColors() {
+    colors.a = toRgb(readCss('--neon-a', '#22e0ff'));
+    colors.b = toRgb(readCss('--neon-b', '#ff3ea5'));
+    colors.dim = toRgb(readCss('--dim2', '#828e9d'));
+  }
+
+  /* ------------------------------ 图案缓存 ------------------------------- */
+  /* 点阵和 scanline 各做一张 gap×gap（device px）小图 + CanvasPattern：
+     每帧只是 2 次 pattern 填充，不逐点画，避免 1400+ 次 fillRect。 */
+  function dotPattern(gap, alive) {
+    var key = 'dot|' + gap + '|' + (alive ? 1 : 0) + '|' + view.dpr;
+    if (patCache[key]) return patCache[key];
+    var d = view.dpr;
+    var size = Math.max(2, Math.round(gap * d));
+    var cv = document.createElement('canvas');
+    cv.width = size;
+    cv.height = size;
+    var g = cv.getContext('2d');
+    var dot = Math.max(2, Math.round(2 * d));   // 2 CSS px 的点（同样的 alpha 下靠面积显眼，不用提亮）
+    var c = alive ? colors.a : colors.dim;
+    g.fillStyle = rgba(c, alive ? 1 : 0.75);
+    g.fillRect(Math.round((size - dot) / 2), Math.round((size - dot) / 2), dot, dot);
+    var pat = dom.fctx.createPattern(cv, 'repeat');
+    if (pat && typeof pat.setTransform === 'function') {
+      try {
+        var k = 1 / d;
+        pat.setTransform(new DOMMatrix([k, 0, 0, k, 0, 0]));
+      } catch (e) { /* 老引擎：退化成 gap*dpr 的稀疏点阵，仍可看 */ }
+    }
+    patCache[key] = pat;
+    return pat;
+  }
+
+  function linePattern() {
+    var key = 'scan|' + view.dpr;
+    if (patCache[key]) return patCache[key];
+    var d = view.dpr;
+    var cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(2 * d));    // 2px 周期
+    cv.height = Math.max(1, Math.round(2 * d));
+    var g = cv.getContext('2d');
+    g.fillStyle = 'rgba(255,255,255,0.012)';      // 极淡 scanline
+    g.fillRect(0, 0, cv.width, Math.max(1, Math.round(d * 0.5)));
+    var pat = dom.fctx.createPattern(cv, 'repeat');
+    if (pat && typeof pat.setTransform === 'function') {
+      try {
+        var k = 1 / d;
+        pat.setTransform(new DOMMatrix([k, 0, 0, k, 0, 0]));
+      } catch (e) { /* ignore */ }
+    }
+    patCache[key] = pat;
+    return pat;
+  }
+
+  /* -------------------------------- 粒子 --------------------------------- */
+  function particleCount() {
+    return Math.min(cfg.particles, level === 'max' ? 64 : 28);
+  }
+
+  function resetParticles() {
+    var n = particleCount();
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      out.push({
+        x: Math.random() * view.w,
+        y: Math.random() * view.h,
+        a: Math.random() * TAU,
+        s: 7 + Math.random() * 9,          // px/s，很慢
+        r: 1.1 + Math.random() * 1.1,
+        al: 0.55 + Math.random() * 0.45
+      });
+    }
+    particles = out;
+  }
+
+  function fitParticles() {
+    var n = particleCount();
+    if (!particles.length) { resetParticles(); return; }
+    if (particles.length > n) particles.length = n;
+    while (particles.length < n) {
+      particles.push({
+        x: Math.random() * view.w, y: Math.random() * view.h,
+        a: Math.random() * TAU, s: 7 + Math.random() * 9,
+        r: 1.1 + Math.random() * 1.1, al: 0.55 + Math.random() * 0.45
+      });
+    }
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      if (p.x > view.w) p.x = Math.random() * view.w;
+      if (p.y > view.h) p.y = Math.random() * view.h;
+    }
+  }
+
+  /* -------------------------------- 尺寸 --------------------------------- */
+  function resize() {
+    if (!dom.fctx) return;
+    var dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    var w = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    var h = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    var changed = dpr !== view.dpr || w !== view.w || h !== view.h;
+    if (!changed) return;
+
+    view.w = w; view.h = h; view.dpr = dpr;
+    var bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+    dom.field.width = bw; dom.field.height = bh;
+    dom.spark.width = bw; dom.spark.height = bh;
+    patCache = {};
+    fitParticles();
+
+    if (reduced) paintStatic();
+    else if (level !== 'off') syncLoop();
+  }
+
+  /* ------------------------------ 环境场绘制 ----------------------------- */
+  function drawScan(ctx, w, h, phase) {
+    var alive = st.engineAlive !== false;
+    var busy = alive && st.busy === true;
+    var peak = alive ? (busy ? 0.12 : 0.09) : 0.045;
+    var ang = -24 * Math.PI / 180;
+    var span = Math.max(w, h) * 1.8;
+    var x = -span * 0.5 + span * phase;
+    var half = SCAN_W * 0.5;
+
+    ctx.save();
+    ctx.translate(w * 0.5, h * 0.5);
+    ctx.rotate(ang);
+
+    var g = ctx.createLinearGradient(x - half * 1.9, 0, x + half, 0);
+    g.addColorStop(0, rgba(colors.a, 0));
+    g.addColorStop(0.42, rgba(colors.a, peak * 0.14));
+    g.addColorStop(0.78, rgba(colors.a, peak * 0.5));
+    g.addColorStop(0.96, rgba(colors.a, peak));
+    g.addColorStop(1, rgba(colors.a, peak * 0.9));
+    ctx.fillStyle = g;
+    ctx.fillRect(x - half * 1.9, -span, half * 2.9, span * 2);
+
+    /* max 档：扫描带边缘轻微色散（两条错位的窄带，不加 filter） */
+    if (cfg.dispersion && alive) {
+      var d1 = ctx.createLinearGradient(x + half - 6, 0, x + half + 2, 0);
+      d1.addColorStop(0, rgba(colors.b, 0));
+      d1.addColorStop(1, rgba(colors.b, peak * 0.28));
+      ctx.fillStyle = d1;
+      ctx.fillRect(x + half - 6, -span, 8, span * 2);
+
+      var d2 = ctx.createLinearGradient(x - half * 1.9, 0, x - half * 1.9 + 10, 0);
+      d2.addColorStop(0, rgba(colors.a, peak * 0.2));
+      d2.addColorStop(1, rgba(colors.a, 0));
+      ctx.fillStyle = d2;
+      ctx.fillRect(x - half * 1.9, -span, 10, span * 2);
+    }
+    ctx.restore();
+  }
+
+  function drawFloor(ctx, w, h, px, py) {
+    var alive = st.engineAlive !== false;
+    var c = alive ? colors.a : colors.dim;
+    var horizon = h * 0.58 + py * 0.5;
+    var vx = w * 0.5 + px * 1.6;
+    var depth = Math.max(1, h - horizon);
+    var i, t;
+
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = rgba(c, alive ? 0.05 : 0.04);
+    ctx.beginPath();
+    for (i = 1; i <= 7; i++) {
+      t = i / 7;
+      var y = horizon + depth * Math.pow(t, 2.2);
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+    }
+    for (i = 0; i <= 12; i++) {
+      var xb = -w * 0.4 + (w * 1.8) * (i / 12);
+      ctx.moveTo(vx, horizon);
+      ctx.lineTo(xb, h);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawParticles(ctx, dt, px, py) {
+    var alive = st.engineAlive !== false;
+    var busy = alive && st.busy === true;
+    var mul = busy ? 2 : (alive ? 1 : 0.35);
+    var c = alive ? colors.a : colors.dim;
+    var L = cfg.link;
+    var i, j, p, q;
+
+    ctx.save();
+    ctx.translate(px, py);
+
+    for (i = 0; i < particles.length; i++) {
+      p = particles[i];
+      p.x += Math.cos(p.a) * p.s * mul * dt;
+      p.y += Math.sin(p.a) * p.s * mul * dt;
+      if (p.x < -12) p.x = view.w + 12;
+      else if (p.x > view.w + 12) p.x = -12;
+      if (p.y < -12) p.y = view.h + 12;
+      else if (p.y > view.h + 12) p.y = -12;
+    }
+
+    /* 连线：按 alpha 分 4 档批量 stroke（每帧最多 4 次 stroke 调用） */
+    var b0 = [], b1 = [], b2 = [], b3 = [];
+    var cap = level === 'max' ? 320 : 140;
+    var used = 0;
+    for (i = 0; i < particles.length && used < cap; i++) {
+      p = particles[i];
+      for (j = i + 1; j < particles.length; j++) {
+        q = particles[j];
+        var dx = p.x - q.x, dy = p.y - q.y;
+        var d2 = dx * dx + dy * dy;
+        if (d2 > L * L) continue;
+        var k = 1 - Math.sqrt(d2) / L;
+        var arr = k > 0.72 ? b3 : (k > 0.48 ? b2 : (k > 0.24 ? b1 : b0));
+        arr.push(p.x, p.y, q.x, q.y);
+        if (++used >= cap) break;
+      }
+    }
+    var buckets = [b0, b1, b2, b3];
+    ctx.lineWidth = 0.6;
+    for (i = 0; i < buckets.length; i++) {
+      var b = buckets[i];
+      if (!b.length) continue;
+      ctx.beginPath();
+      for (j = 0; j < b.length; j += 4) {
+        ctx.moveTo(b[j], b[j + 1]);
+        ctx.lineTo(b[j + 2], b[j + 3]);
+      }
+      ctx.strokeStyle = rgba(c, MAX_LINK_ALPHA * (0.22 + i * 0.24));
+      ctx.stroke();
+    }
+
+    /* 粒子本体：一次 path + 一次 fill */
+    ctx.beginPath();
+    for (i = 0; i < particles.length; i++) {
+      p = particles[i];
+      ctx.moveTo(p.x + p.r, p.y);
+      ctx.arc(p.x, p.y, p.r, 0, TAU);
+    }
+    ctx.fillStyle = rgba(c, MAX_LINK_ALPHA);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawField(ts) {
+    var ctx = dom.fctx;
+    var w = view.w, h = view.h;
+    if (!ctx || !w || !h) return;
+
+    var alive = st.engineAlive !== false;
+    var busy = alive && st.busy === true;
+    var px = parallax.x, py = parallax.y;
+
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, w, h);
+
+    /* 1) 极淡 scanline（整页背景质感，只在面板缝隙里可见） */
+    var lp = linePattern();
+    if (lp) {
+      ctx.fillStyle = lp;
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    /* 2) 点阵网格（1px 点；busy 时 alpha ×1.4；离线转冷灰） */
+    var dp = dotPattern(cfg.gap, alive);
+    if (dp) {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.globalAlpha = alive ? (busy ? 0.12 : 0.09) : 0.055;
+      ctx.fillStyle = dp;
+      ctx.fillRect(-24, -24, w + 48, h + 48);
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    /* 3) 斜向扫描带（std 12s / busy 4s 一轮；离线冻结成静态） */
+    drawScan(ctx, w, h, clock.phase);
+
+    /* 4) max 档：底部透视网格 */
+    if (cfg.perspective) drawFloor(ctx, w, h, px, py);
+
+    /* 5) 稀疏粒子 + 近距连线 */
+    drawParticles(ctx, loop.lastDt || 0, px, py);
+
+    /* 6) busy：顶部一层品红辉光 */
+    if (busy) {
+      var g = ctx.createLinearGradient(0, 0, 0, 96);
+      g.addColorStop(0, rgba(colors.b, 0.10));
+      g.addColorStop(1, rgba(colors.b, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, 96);
+    }
+  }
+
+  /* ------------------------------ 点击迸溅 ------------------------------- */
+  function drawSparks(ts) {
+    var ctx = dom.sctx;
+    if (!ctx) return;
+    var w = view.w, h = view.h;
+
+    if (!sparks.length) {
+      if (sparkDirty) {
+        ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+        sparkDirty = false;
+      }
+      return;
+    }
+
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    sparkDirty = true;
+
+    var keep = [];
+    for (var i = 0; i < sparks.length; i++) {
+      var s = sparks[i];
+      var p = (ts - s.t0) / SPARK_LIFE;
+      if (p >= 1) continue;
+      if (p < 0) p = 0;
+      keep.push(s);
+      var e = 1 - Math.pow(1 - p, 3);
+      var dist = s.travel * e;
+      var x = s.x + Math.cos(s.a) * dist;
+      var y = s.y + Math.sin(s.a) * dist;
+      var alpha = 1 - p;
+      ctx.beginPath();
+      ctx.arc(x, y, 1, 0, TAU);        /* 2px 直径 */
+      ctx.fillStyle = rgba(s.c, alpha);
+      ctx.fill();
+    }
+    sparks = keep;
+  }
+
+  function burst(x, y, count) {
+    var n = clamp(Math.round(count || cfg.spark), 1, 64);
+    var now = (window.performance && performance.now) ? performance.now() : Date.now();
+    for (var i = 0; i < n; i++) {
+      var t = n === 1 ? 0 : i / (n - 1);
+      sparks.push({
+        x: x, y: y,
+        a: (i / n) * TAU + (Math.random() - 0.5) * 0.55,
+        travel: 26 + Math.random() * 26,
+        c: mixRgb(colors.a, colors.b, t),
+        t0: now
+      });
+    }
+    if (sparks.length > SPARK_CAP) sparks.splice(0, sparks.length - SPARK_CAP);
+  }
+
+  /* -------------------------------- 循环 --------------------------------- */
+  function frame(ts) {
+    loop.raf = requestAnimationFrame(frame);
+    if (ts - loop.prev < FRAME_MS - 0.6) return;   /* 30fps 闸门 */
+    var dt = loop.prev ? Math.min(0.12, (ts - loop.prev) / 1000) : 1 / 30;
+    loop.prev = ts;
+    loop.lastDt = dt;
+    loop.frames++;
+    loop.drawn++;
+    step(dt, ts);
+  }
+
+  function step(dt, ts) {
+    if (!reduced && st.engineAlive !== false) {
+      var period = (st.busy ? SCAN_BUSY_MS : SCAN_STD_MS) / 1000;
+      clock.phase = (clock.phase + dt / period) % 1;
+      if (clock.phase < 0) clock.phase += 1;
+    }
+    var k = Math.min(1, dt * 6);
+    parallax.x += (parallax.tx - parallax.x) * k;
+    parallax.y += (parallax.ty - parallax.y) * k;
+
+    drawField(ts);
+    drawSparks(ts);
+  }
+
+  function syncLoop() {
+    var need = inited && level !== 'off' && !reduced && !document.hidden &&
+               view.w > 0 && !!dom.fctx;
+    if (need && !loop.on) {
+      loop.on = true;
+      loop.prev = 0;
+      loop.lastDt = 1 / 30;
+      loop.raf = requestAnimationFrame(frame);
+    } else if (!need && loop.on) {
+      loop.on = false;
+      if (loop.raf) cancelAnimationFrame(loop.raf);
+      loop.raf = 0;
+    }
+  }
+
+  /* reduced-motion / off：画一帧静态画面（不跑 rAF） */
+  function paintStatic() {
+    if (!dom.fctx) return;
+    parallax.x = 0; parallax.y = 0;
+    drawField(0);
+    drawSparks(0);
+  }
+
+  function clearCanvases() {
+    if (dom.fctx) {
+      dom.fctx.setTransform(1, 0, 0, 1, 0, 0);
+      dom.fctx.clearRect(0, 0, dom.field.width, dom.field.height);
+    }
+    if (dom.sctx) {
+      dom.sctx.setTransform(1, 0, 0, 1, 0, 0);
+      dom.sctx.clearRect(0, 0, dom.spark.width, dom.spark.height);
+    }
+    sparks = [];
+    sparkDirty = false;
+  }
+
+  function showCanvases(on) {
+    if (dom.field) dom.field.style.display = on ? '' : 'none';
+    if (dom.spark) dom.spark.style.display = on ? '' : 'none';
+  }
+
+  /* ------------------------------- 状态轮询 ------------------------------- */
+  function applyState(s) {
+    if (!s) return;
+    var busy = !!s.busy;
+    var alive = s.engineAlive !== false;
+    if (busy === st.busy && alive === st.engineAlive) return;
+    st.busy = busy;
+    st.engineAlive = alive;
+    if (reduced) paintStatic();
+  }
+
+  function poll() {
+    if (!opts.getState) return;
+    var s = null;
+    try { s = opts.getState(); } catch (e) { return; }
+    applyState(s);
+  }
+
+  function pollStart() {
+    pollStop();
+    if (!opts.getState) return;
+    pollId = window.setInterval(poll, POLL_MS);
+    poll();
+  }
+
+  function pollStop() {
+    if (pollId) { window.clearInterval(pollId); pollId = 0; }
+  }
+
+  /* -------------------------------- 档位 --------------------------------- */
+  function bodyClasses() {
+    if (!document.body) return;
+    var b = document.body.classList;
+    b.toggle('fx-on', level !== 'off');
+    b.toggle('fx-std', level === 'std');
+    b.toggle('fx-max', level === 'max');
+    b.toggle('fx-off', level === 'off');
+  }
+
+  function setLevelRaw(lv) {
+    if (lv !== 'off' && lv !== 'std' && lv !== 'max') lv = 'std';
+    level = lv;
+    cfg = LEVELS[lv] || LEVELS.std;
+    bodyClasses();
+    if (!inited) return;
+
+    if (level === 'off') {
+      syncLoop();
+      clearCanvases();
+      showCanvases(false);
+      return;
+    }
+    showCanvases(true);
+    if (dom.fctx) { patCache = {}; }   /* gap 变了，图案重建 */
+    fitParticles();
+    if (reduced) { syncLoop(); paintStatic(); return; }
+    syncLoop();
+    if (!loop.on) paintStatic();
+  }
+
+  /* ------------------------------- 事件绑定 ------------------------------ */
+  function bind(target, type, fn, opt) {
+    if (!target || !target.addEventListener) return;
+    target.addEventListener(type, fn, opt || false);
+    listeners.push([target, type, fn, opt || false]);
+  }
+
+  function unbindAll() {
+    for (var i = 0; i < listeners.length; i++) {
+      var l = listeners[i];
+      try { l[0].removeEventListener(l[1], l[2], l[3]); } catch (e) { /* ignore */ }
+    }
+    listeners = [];
+  }
+
+  function tapFx(el) {
+    if (!el || !el.classList) return;
+    el.classList.add('fx-tap');
+    window.setTimeout(function () { el.classList.remove('fx-tap'); }, 140);
+  }
+
+  function onClick(e) {
+    if (level === 'off' || !inited) return;
+    var t = e.target;
+    var hit = (t && t.closest) ? t.closest('.send,.btn-primary,.newchat,.danger') : null;
+    if (!hit) return;
+    var x = typeof e.clientX === 'number' ? e.clientX : 0;
+    var y = typeof e.clientY === 'number' ? e.clientY : 0;
+    if (reduced) { tapFx(hit); return; }     /* reduced：纯 opacity 反馈 */
+    burst(x, y, cfg.spark);
+    if (!loop.on) syncLoop();                /* 兜底：万一循环停着 */
+  }
+
+  function onMove(e) {
+    var w = view.w || 1, h = view.h || 1;
+    var nx = clamp((e.clientX / w) * 2 - 1, -1, 1);
+    var ny = clamp((e.clientY / h) * 2 - 1, -1, 1);
+    parallax.tx = -nx * 8;    /* 视差位移 ≤8px */
+    parallax.ty = -ny * 8;
+  }
+
+  function onLeave() {
+    parallax.tx = 0;
+    parallax.ty = 0;
+  }
+
+  function onResize() {
+    if (resizeId) window.clearTimeout(resizeId);
+    resizeId = window.setTimeout(function () { resizeId = 0; resize(); }, 120);
+  }
+
+  function onVisible() {
+    syncLoop();
+    if (!loop.on) paintStatic();
+  }
+
+  var mq = null;
+  function onMedia() {
+    reduced = !!(mq && mq.matches);
+    if (reduced) { syncLoop(); paintStatic(); }
+    else { syncLoop(); }
+  }
+
+  /* ------------------------------- 文字解码 ------------------------------ */
+  var CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*+-/<>[]{}=_';
+
+  function scramble(el, text) {
+    if (!el) return function () {};
+    var target = text == null ? (el.textContent || '') : String(text);
+    var chars = Array.from ? Array.from(target) : target.split('');
+    var n = chars.length;
+
+    /* off 档 / reduced-motion：不跑解码，直接定格 */
+    if (level === 'off' || reduced) {
+      el.textContent = target;
+      return function () {};
+    }
+
+    var plan = [];
+    var i;
+    for (i = 0; i < n; i++) {
+      var base = n > 1 ? i / (n - 1) : 0;
+      plan.push(0.06 + 0.86 * (0.72 * base + 0.28 * Math.random()));
+    }
+
+    var start = (window.performance && performance.now) ? performance.now() : Date.now();
+    var dur = 450;
+    var tid = 0;
+    var done = false;
+
+    function render(now) {
+      var x = clamp((now - start) / dur, 0, 1);
+      var p = easeScramble(x);
+      var out = '';
+      for (var k = 0; k < n; k++) {
+        var ch = chars[k];
+        if (ch === ' ' || ch === '\n' || p >= plan[k]) out += ch;
+        else out += CHARSET[(Math.random() * CHARSET.length) | 0];
+      }
+      el.textContent = out;
+      if (x >= 1) {
+        done = true;
+        el.textContent = target;
+        if (tid) window.clearInterval(tid);
+        tid = 0;
+      }
+    }
+
+    tid = window.setInterval(function () {
+      var now = (window.performance && performance.now) ? performance.now() : Date.now();
+      render(now);
+    }, 24);
+    scrambleTimers.push(tid);
+    render(start + 16);
+
+    return function cancel() {
+      if (tid) window.clearInterval(tid);
+      tid = 0;
+      if (!done) el.textContent = target;
+    };
+  }
+
+  /* --------------------------------- API --------------------------------- */
+  var FX = {
+    __fx: true,
+    version: '1.0.0',
+
+    init: function (o) {
+      o = o || {};
+      if (typeof o.getState === 'function') opts.getState = o.getState;
+      if (typeof o.zField === 'number') opts.zField = o.zField;
+      if (typeof o.zSpark === 'number') opts.zSpark = o.zSpark;
+
+      if (!document.body) {
+        document.addEventListener('DOMContentLoaded', function () { FX.init(o); });
+        return FX;
+      }
+
+      if (!ensureDom()) return FX;
+      applyZ();
+      readColors();
+      inited = true;
+
+      if (!mq && window.matchMedia) {
+        try {
+          mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+          reduced = mq.matches;
+          if (mq.addEventListener) mq.addEventListener('change', onMedia);
+          else if (mq.addListener) mq.addListener(onMedia);
+        } catch (e) { reduced = false; }
+      }
+
+      /* 只绑一次 */
+      if (!listeners.length) {
+        bind(window, 'resize', onResize);
+        bind(window, 'pointermove', onMove, { passive: true });
+        bind(document, 'pointerleave', onLeave, { passive: true });
+        bind(document, 'click', onClick, true);
+        bind(document, 'visibilitychange', onVisible);
+      }
+
+      resize();
+      setLevelRaw(o.level || (document.body.classList.contains('fx-max') ? 'max' : 'std'));
+      pollStart();
+      if (reduced) paintStatic();
+      return FX;
+    },
+
+    setLevel: function (lv) {
+      setLevelRaw(lv);
+      return FX;
+    },
+
+    setState: function (s) {
+      applyState(s);
+      return FX;
+    },
+
+    scramble: scramble,
+
+    spark: function (x, y, o) {
+      if (level === 'off' || reduced) return FX;
+      var n = (o && typeof o.count === 'number') ? o.count : cfg.spark;
+      burst(x || 0, y || 0, n);
+      if (!loop.on) syncLoop();
+      return FX;
+    },
+
+    /* 只给自测用：同步画一帧，返回这帧的绘制耗时(ms)。
+       正式接线不要调它（循环自己会画）。 */
+    __paintOnce: function () {
+      if (!dom.fctx) return -1;
+      var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+      step(1 / 30, (window.performance && performance.now) ? performance.now() : Date.now());
+      var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+      return t1 - t0;
+    },
+
+    status: function () {
+      return {
+        level: level,
+        running: loop.on,
+        frames: loop.frames,
+        drawn: loop.drawn,
+        particles: particles.length,
+        sparks: sparks.length,
+        busy: st.busy,
+        engineAlive: st.engineAlive,
+        reduced: reduced,
+        w: view.w,
+        h: view.h,
+        dpr: view.dpr,
+        scanPhase: clock.phase
+      };
+    },
+
+    destroy: function () {
+      syncLoop();
+      pollStop();
+      unbindAll();
+      for (var i = 0; i < scrambleTimers.length; i++) window.clearInterval(scrambleTimers[i]);
+      scrambleTimers = [];
+      if (mq) {
+        try {
+          if (mq.removeEventListener) mq.removeEventListener('change', onMedia);
+          else if (mq.removeListener) mq.removeListener(onMedia);
+        } catch (e) { /* ignore */ }
+        mq = null;
+      }
+      inited = false;
+      if (dom.made) {
+        if (dom.field && dom.field.parentNode) dom.field.parentNode.removeChild(dom.field);
+        if (dom.spark && dom.spark.parentNode) dom.spark.parentNode.removeChild(dom.spark);
+        dom.made = false;
+      }
+      dom.field = dom.spark = null;
+      dom.fctx = dom.sctx = null;
+      if (document.body) {
+        document.body.classList.remove('fx-on', 'fx-std', 'fx-max');
+      }
+      return FX;
+    }
+  };
+
+  window.FX = FX;
+})();
+// __FX_JS_END__
+</script>
 
 <script>
 const AGENTS = __AGENTS__;
@@ -2268,7 +3451,8 @@ function buildMsg(m){
       const btn = document.createElement('button');
       btn.className = 'art';
       btn.title = path;
-      btn.innerHTML = '<span>📄</span><span class="nm">' + esc(baseName(path)) + '</span>';
+      btn.innerHTML = '<span><svg class="ico" aria-hidden="true"><use href="#i-file"/></svg></span>'
+    + '<span class="nm">' + esc(baseName(path)) + '</span>';
       btn.onclick = () => openArtifact(path);
       host.appendChild(btn);
     });
@@ -2932,7 +4116,9 @@ function renderInspector(){
     const arts = Array.isArray(task.artifacts) ? task.artifacts : [];
     const artHtml = arts.length
       ? '<div class="artifacts">' + arts.map(a =>
-          '<button class="art" data-art="' + esc(a.path) + '">📄 ' + esc(baseName(a.path))
+          '<button class="art" data-art="' + esc(a.path) + '">'
+          + '<svg class="ico" aria-hidden="true"><use href="#i-file"/></svg> '
+          + esc(baseName(a.path))
           + '</button>').join('') + '</div>'
       : '';
     taskBlock = '<div class="task-card">'
@@ -3077,6 +4263,7 @@ function renderEngine(){
     }
   }
   pill.classList.add(cls);
+  pill.classList.toggle('is-hot', !!engine.alive && status !== 'stalled');
   txt.textContent = label;
   pill.title = 'pid ' + (engine.pid || '—')
     + ' · 心跳 ' + (Number(engine.age) >= 0 ? age + 's 前' : '未知')
@@ -3102,6 +4289,7 @@ function renderChrome(){
   } else {
     txt.textContent = '空闲';
   }
+  live.classList.toggle('is-hot', !paused && busy.length > 0);
   renderEngine();
   const note = $('store-note');
   const store = st.store || {};
@@ -3309,7 +4497,9 @@ function renderPicker(data){
     pickList.innerHTML = pick.entries.map((e, i) => {
       const noisy = e.noise ? ' noise' : '';
       const blocked = e.blocked ? ' blocked' : '';
-      const icon = e.is_git ? '📦' : '📁';
+      const icon = e.is_git
+      ? '<svg class="ico" aria-hidden="true"><use href="#i-pkg"/></svg>'
+      : '<svg class="ico" aria-hidden="true"><use href="#i-folder"/></svg>';
       // 协作台自己的目录：能进去看，但「选它」是灰的（后端也会拒，这里提前挡住）
       const hint = e.blocked ? (e.block_reason || '不能当工作区') : (e.hint || '');
       const use = e.blocked
@@ -3634,6 +4824,55 @@ document.addEventListener('keydown', ev => {
   if(ev.key === 'Escape' && trashEl && !trashEl.hidden) closeTrash(true);
 });
 
+/* ---------- 高科技 HUD：档位（关 / 标准 / 加强）+ 状态接线 ---------- */
+const FX_KEY = 'team-fx-level';
+const FX_LEVELS = [{id:'off', label:'特效·关'}, {id:'std', label:'特效·标准'}, {id:'max', label:'特效·加强'}];
+function fxStored(){
+  // URL 上带了 #fx=max / #fx=off 就以它为准（截图和排障时不用手点）
+  const forced = /(?:^|[#&])fx=(off|std|max)\b/.exec(String(location.hash || ''));
+  if(forced) return forced[1];
+  try{ const v = localStorage.getItem(FX_KEY); if(FX_LEVELS.some(l => l.id === v)) return v; }catch(e){}
+  return 'std';
+}
+/* 环境场要读的「仪器状态」：引擎死没死、有没有人在干活 */
+function fxState(){
+  const engine = st.engine || {}, agents = st.agents || {};
+  const busy = !!st.paused || ROLES.some(r => agents[r] === 'working');
+  return {busy, engineAlive: !!engine.alive};
+}
+function fxApply(level, announce){
+  const hit = FX_LEVELS.find(l => l.id === level) || FX_LEVELS[1];
+  const root = document.body;
+  root.classList.toggle('fx-on', hit.id !== 'off');
+  root.classList.toggle('fx-std', hit.id === 'std');
+  root.classList.toggle('fx-max', hit.id === 'max');
+  const btn = $('fx-toggle');
+  if(btn){
+    const lbl = btn.querySelector('.fx-lbl');
+    if(lbl) lbl.textContent = hit.label;
+    btn.setAttribute('aria-pressed', String(hit.id !== 'off'));
+  }
+  try{ localStorage.setItem(FX_KEY, hit.id); }catch(e){}
+  // fx.js 万一没加载/报错，整页照常能用，只是没有特效
+  if(window.FX && typeof FX.setLevel === 'function'){
+    try{ FX.setLevel(hit.id); }catch(e){}
+  }
+  if(announce) toast(hit.id === 'off' ? '特效已经关掉了' : '特效档位：' + hit.label.slice(3));
+}
+function fxBoot(){
+  fxApply(fxStored(), false);
+  const btn = $('fx-toggle');
+  if(btn){
+    btn.onclick = () => {
+      const i = FX_LEVELS.findIndex(l => l.id === fxStored());
+      fxApply(FX_LEVELS[(i + 1) % FX_LEVELS.length].id, true);
+    };
+  }
+  if(window.FX && typeof FX.init === 'function'){
+    try{ FX.init({level: fxStored(), zField: 60, zSpark: 62, getState: fxState}); }catch(e){}
+  }
+}
+
 let lastClock = 0;
 function tick(){
   load();
@@ -3659,6 +4898,13 @@ async function startWorkbench(){
   if(!data){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return; }
   unlockEl.hidden = true;
   document.body.classList.add('ready');
+  fxBoot();
+  // 空会话才看得到欢迎语：解码入场只在这时候演一次（有历史消息时 #welcome 已经被换掉了）
+  const h1 = document.querySelector('#welcome h1');
+  if(h1 && !h1.dataset.fxDone && window.FX && typeof FX.scramble === 'function'){
+    h1.dataset.fxDone = '1';
+    try{ FX.scramble(h1); }catch(e){}
+  }
   autosize();
   if(!startWorkbench.timer){
     startWorkbench.timer = setInterval(tick, 1000);

@@ -1549,6 +1549,34 @@ class PageContractTests(unittest.TestCase):
         self.assertIn(".pick-row.blocked", page)
         self.assertIn("block_reason", page)
 
+    # ---- 高科技 HUD（0.9.7）：被删掉的话整页会悄悄退回「没有特效」 ----
+    def test_hud_layers_are_wired(self) -> None:
+        page = room_web.PAGE
+        for hook in ('class="hud-frame"', 'class="tl"', 'id="fx-field"', 'id="fx-spark"',
+                     'id="fx-toggle"', '--neon-a:', '--neon-b:'):
+            self.assertIn(hook, page, f"页面里少了 HUD 钩子：{hook}")
+
+    def test_hud_effects_are_gated(self) -> None:
+        """特效必须挂在 body.fx-on 下：关掉时不许留下任何装饰层。"""
+        page = room_web.PAGE
+        self.assertIn("body.fx-on #fx-field{display:block", page)
+        self.assertIn("body.fx-on .hud-frame{display:block}", page)
+        self.assertNotIn("body #fx-field{display:block", page, "装饰层不许无条件显示")
+
+    def test_hud_levels_and_reduced_motion(self) -> None:
+        page = room_web.PAGE
+        self.assertIn("team-fx-level", page, "档位要落 localStorage")
+        self.assertIn("FX_LEVELS", page)
+        self.assertIn("prefers-reduced-motion", page, "减少动效的分支必须在")
+        self.assertIn("hud-sweep", page, "顶部扫描线的 keyframes 别丢")
+
+    def test_no_emoji_as_icons(self) -> None:
+        """图标要自绘 SVG，别拿 emoji 顶（这条以前踩过）。"""
+        page = room_web.PAGE
+        for glyph in ("🗑", "📄", "📁", "📦"):
+            self.assertNotIn(glyph, page, f"页面里还有 emoji 当图标：{glyph}")
+        self.assertIn('id="i-trash"', page)
+
 
 if __name__ == "__main__":
     unittest.main()
