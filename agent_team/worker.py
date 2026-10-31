@@ -1047,6 +1047,32 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
           "done", "ok" if task.get("status") == "passed" else "bad", "deepseek", tid)
 
 
+def reconcile_unfinished() -> list[str]:
+    """引擎重启/被杀后，可能有任务跑完却没写 outcome。
+
+    只在启动时跑一次，把状态已经是终态但缺 finished_at 的补上，
+    免得等结果的一方永远等下去。
+    """
+    fixed: list[str] = []
+    if not TASKS.is_dir():
+        return fixed
+    for card in sorted(TASKS.glob("T-*/task.json")):
+        try:
+            task = json.loads(card.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if task.get("finished_at"):
+            continue
+        status = task.get("status")
+        if status not in ("passed", "failed", "exec-failed", "stopped"):
+            continue        # 还在跑的（planned/executed）交给正常流程
+        tid = str(task.get("id") or card.parent.name)
+        mark_finished(tid)
+        fixed.append(tid)
+        log(f"补记终态：{tid}（{status}）")
+    return fixed
+
+
 def handle(request: str) -> None:
     """一条用户消息进来：先判断是不是"继续"，其余全交给群聊大脑。"""
     if is_continue_intent(request):
@@ -1065,6 +1091,12 @@ def main() -> int:
         print("已有另一个 worker 在跑，退出。")
         return 0
     log(f"worker 启动 pid={os.getpid()} interval={args.interval}s")
+    try:
+        repaired = reconcile_unfinished()
+        if repaired:
+            log(f"补记了 {len(repaired)} 个任务的终态：{'、'.join(repaired)}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"终态补记失败（不影响主流程）：{type(exc).__name__}: {exc}")
     event("工作流引擎已上线：发任务后 3 秒内自动开工", "worker", "ok", "deepseek")
 
     while True:

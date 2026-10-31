@@ -164,5 +164,52 @@ class FinishedOutcomeTests(unittest.TestCase):
         self.assertEqual(self._read()["outcome"], "failure")
 
 
+
+class ReconcileTests(unittest.TestCase):
+    """引擎重启后，跑完但没标终态的任务要补上，否则等结果的一方永远等下去。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.original = worker.TASKS
+        worker.TASKS = self.root / "tasks"
+        (worker.TASKS).mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        worker.TASKS = self.original
+        self.tmp.cleanup()
+
+    def _card(self, tid: str, **fields) -> Path:
+        d = worker.TASKS / tid
+        d.mkdir(parents=True)
+        data = {"id": tid, "status": "passed", "reviews": [{"verdict": "PASS"}]}
+        data.update(fields)
+        (d / "task.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return d
+
+    def test_finished_task_gets_outcome(self) -> None:
+        self._card("T-260101-000001")
+        self.assertEqual(worker.reconcile_unfinished(), ["T-260101-000001"])
+        data = json.loads((worker.TASKS / "T-260101-000001" / "task.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["outcome"], "success")
+        self.assertIn("finished_at", data)
+
+    def test_already_finished_is_skipped(self) -> None:
+        self._card("T-260101-000002", finished_at="2026-01-01T00:00:00", outcome="success")
+        self.assertEqual(worker.reconcile_unfinished(), [])
+
+    def test_running_task_is_left_alone(self) -> None:
+        self._card("T-260101-000003", status="executed")
+        self.assertEqual(worker.reconcile_unfinished(), [])
+        data = json.loads((worker.TASKS / "T-260101-000003" / "task.json").read_text(encoding="utf-8"))
+        self.assertNotIn("finished_at", data)
+
+    def test_failed_task_marked_failure(self) -> None:
+        self._card("T-260101-000004", status="failed", reviews=[])
+        worker.reconcile_unfinished()
+        data = json.loads((worker.TASKS / "T-260101-000004" / "task.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["outcome"], "failure")
+
+
 if __name__ == "__main__":
     unittest.main()
