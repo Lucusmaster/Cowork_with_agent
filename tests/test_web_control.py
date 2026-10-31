@@ -1076,5 +1076,201 @@ class BrowseTests(WebCase):
         self.assertIn("URL", data["error"])
 
 
+class SessionOpsTests(WebCase):
+    """归档 / 删除接口：用真的 session.py（ROOM 指到临时目录），不打桩。
+
+    这样测的是"路由 + 适配层 + 存储层"整条链，包括 active 切换和 trash 挪文件。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from agent_team import session as sess_mod
+        self.sess = sess_mod
+        self._saved_sess_room = sess_mod.ROOM
+        sess_mod.ROOM = self.tmp / "session_room"
+        (sess_mod.ROOM / "sessions").mkdir(parents=True, exist_ok=True)
+        room_web.STORE = room_web.ChatStore()          # 指向临时 ROOM 的真适配层
+        self.assertTrue(room_web.STORE.ready, "session.py 应该可用")
+
+    def tearDown(self) -> None:
+        self.sess.ROOM = self._saved_sess_room
+        super().tearDown()
+
+    # ---------- 工具 ----------
+    def make(self, title: str) -> str:
+        entry = self.sess.create_session(title=title)
+        self.sess.append(entry["id"], role="user", agent="user", content=f"{title} 的第一句")
+        return str(entry["id"])
+
+    def rows(self) -> list[dict]:
+        status, data = self.call("/api/session", token=self.token)
+        self.assertEqual(status, 200)
+        return data["sessions"]
+
+    def post(self, path: str, body: dict):
+        return self.call(path, method="POST", body=body, token=self.token)
+
+    # ---------- 归档 ----------
+    def test_archive_marks_session_and_listing_carries_it(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post("/api/session/archive", {"id": a, "archived": True})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["session"]["archived_at"], "返回体里要带 archived_at")
+        row = [r for r in self.rows() if r["id"] == a][0]
+        self.assertTrue(row["archived_at"], "GET /api/session 的每一条都要有 archived_at")
+        unarchived = [r for r in self.rows() if not r["archived_at"]]
+        self.assertNotIn(a, [r["id"] for r in unarchived])
+
+    def test_archive_defaults_to_true_and_can_restore(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post("/api/session/archive", {"id": a})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["session"]["archived_at"], "archived 缺省就是 True")
+        status, data = self.post("/api/session/archive", {"id": a, "archived": False})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["session"]["archived_at"], "", "传 false 就是恢复")
+        self.assertEqual([r for r in self.rows() if r["id"] == a][0]["archived_at"], "")
+
+    def test_archive_current_switches_active(self) -> None:
+        a = self.make("会话 A")
+        b = self.make("会话 B")                      # b 是当前会话
+        self.sess.set_active(a)
+        status, data = self.post("/api/session/archive", {"id": a, "archived": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["active"], b, "归档当前会话后 active 要切到另一个")
+
+    def test_archive_missing_session_is_404(self) -> None:
+        status, data = self.post("/api/session/archive", {"id": "chat-999"})
+        self.assertEqual(status, 404)
+        self.assertIn("会话不存在", data["error"])
+
+    def test_archive_without_id_is_400(self) -> None:
+        status, data = self.post("/api/session/archive", {})
+        self.assertEqual(status, 400)
+        self.assertIn("id", data["error"])
+
+    # ---------- 删除 ----------
+    def test_delete_removes_from_index_and_moves_file(self) -> None:
+        a = self.make("会话 A")
+        src = self.sess.ROOM / "sessions" / f"{a}.jsonl"
+        self.assertTrue(src.is_file(), "会话要真的落在 sessions/")
+        status, data = self.post("/api/session/delete", {"id": a, "confirm": True})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["deleted"]["id"], a)
+        self.assertNotIn(a, [r["id"] for r in self.rows()], "索引里不能再有它")
+        self.assertFalse(src.is_file(), "消息文件要挪走")
+        trash = list((self.sess.ROOM / "sessions" / "trash").glob(f"{a}-*.jsonl"))
+        self.assertEqual(len(trash), 1, "文件要留在 sessions/trash/ 里")
+        self.assertIn("trash", data["deleted"])
+
+    def test_delete_requires_confirm_true(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post("/api/session/delete", {"id": a})
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", data["error"])
+        self.assertIn(a, [r["id"] for r in self.rows()], "没确认就不能删")
+        status, data = self.post("/api/session/delete", {"id": a, "confirm": False})
+        self.assertEqual(status, 400, "confirm:false 也不行")
+
+    def test_delete_missing_session_is_404(self) -> None:
+        status, data = self.post("/api/session/delete", {"id": "chat-999", "confirm": True})
+        self.assertEqual(status, 404)
+        self.assertIn("会话不存在", data["error"])
+
+    def test_delete_archived_session_allowed(self) -> None:
+        a = self.make("会话 A")
+        self.post("/api/session/archive", {"id": a, "archived": True})
+        status, data = self.post("/api/session/delete", {"id": a, "confirm": True})
+        self.assertEqual(status, 200, "已归档的会话也要能删掉")
+        self.assertNotIn(a, [r["id"] for r in self.rows()])
+
+    def test_delete_current_switches_active(self) -> None:
+        a = self.make("会话 A")
+        b = self.make("会话 B")
+        self.sess.set_active(b)
+        status, data = self.post("/api/session/delete", {"id": b, "confirm": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["active"], a)
+
+    def test_delete_other_keeps_active(self) -> None:
+        """删的不是当前会话：active 一动不动（同一秒建出来的会话也不能被「顺手切走」）。"""
+        a = self.make("会话 A")
+        b = self.make("会话 B")
+        self.sess.set_active(a)
+        status, data = self.post("/api/session/delete", {"id": b, "confirm": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["active"], a, "删别人不能改当前会话")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["session"]["id"], a)
+        self.assertEqual([s["id"] for s in state["sessions"]], [a])
+
+    def test_archive_other_keeps_active(self) -> None:
+        a = self.make("会话 A")
+        b = self.make("会话 B")
+        self.sess.set_active(a)
+        status, data = self.post("/api/session/archive", {"id": b, "archived": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["active"], a, "归档别人不能改当前会话")
+
+    def test_delete_last_session_leaves_empty_state(self) -> None:
+        a = self.make("会话 A")
+        self.sess.set_active(a)
+        status, data = self.post("/api/session/delete", {"id": a, "confirm": True})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["active"], "", "全删空就没有 active")
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(state["sessions"], [], "轮询不能偷偷把 chat-001 建回来")
+        self.assertEqual(state["messages"], [])
+        self.assertEqual(state["session"], {})
+
+    def test_send_from_empty_state_opens_new_session(self) -> None:
+        """空状态下说一句话就会开一个新的（列表里那句承诺得真成立）。"""
+        a = self.make("会话 A")
+        self.post("/api/session/delete", {"id": a, "confirm": True})
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual(state["sessions"], [])
+        status, data = self.post("/api/post", {"content": "空状态里说一句话"})
+        self.assertEqual(status, 200, data)
+        new_id = data["session_id"]
+        status, state = self.call("/api/state", token=self.token)
+        self.assertEqual([s["id"] for s in state["sessions"]], [new_id])
+        self.assertEqual(state["session"]["id"], new_id)
+        self.assertEqual(len(state["messages"]), 1)
+
+    # ---------- 鉴权 / 方法 ----------
+    def test_ops_require_token(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.call("/api/session/archive", method="POST", body={"id": a})
+        self.assertEqual(status, 401)
+        self.assertFalse(data["ok"])
+        status, data = self.call("/api/session/delete", method="POST",
+                                 body={"id": a, "confirm": True})
+        self.assertEqual(status, 401)
+
+    def test_ops_reject_url_token(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post(f"/api/session/delete?token={self.token}",
+                                 {"id": a, "confirm": True})
+        self.assertEqual(status, 401)
+        self.assertIn("URL", data["error"])
+        self.assertIn(a, [r["id"] for r in self.rows()], "被拒的请求不能改状态")
+
+    def test_get_cannot_write(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.call("/api/session/delete", token=self.token)
+        self.assertEqual(status, 404, "读方法打写接口就是没有这个接口")
+        self.assertIn(a, [r["id"] for r in self.rows()])
+
+    def test_archived_session_cannot_be_opened(self) -> None:
+        a = self.make("会话 A")
+        self.post("/api/session/archive", {"id": a, "archived": True})
+        status, data = self.post("/api/session/select", {"session_id": a})
+        self.assertEqual(status, 400, data)
+        self.assertIn("归档", data["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

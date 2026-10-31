@@ -76,6 +76,11 @@ def _session_file(session_id: str) -> Path:
     return _sessions_dir() / f"{session_id}.jsonl"
 
 
+def _trash_dir() -> Path:
+    """删除的会话挪到这里，不直接销毁：误删还能手动捡回来。"""
+    return _sessions_dir() / "trash"
+
+
 def _legacy_file() -> Path:
     return _sessions_dir() / "legacy.jsonl"
 
@@ -360,11 +365,16 @@ def migrate_legacy() -> int:
 
 # ---------------- 对外接口（契约第 3 节） ----------------
 def sessions() -> list[dict]:
-    """索引里的会话，按 updated_at 倒序（最近聊过的在最上面）。"""
+    """索引里的会话（含已归档），按 updated_at 倒序（最近聊过的在最上面）。
+
+    每条都带 `archived_at`（未归档是空串），界面靠它分组；归档不删消息。
+    """
     with _LOCK:
         _ensure()
         _migrate_legacy_locked()
         items = [dict(entry) for entry in _read_index().get("sessions") or []]
+    for item in items:
+        item.setdefault("archived_at", "")
     items.sort(key=lambda item: (str(item.get("updated_at") or ""),
                                 str(item.get("created_at") or "")), reverse=True)
     return items
@@ -402,7 +412,8 @@ def active_session() -> dict:
         entry = _find_entry(index, index.get("active"))
         if entry is not None and not entry.get("legacy"):
             return dict(entry)
-        candidates = [item for item in index.get("sessions") or [] if not item.get("legacy")]
+        candidates = [item for item in index.get("sessions") or []
+                      if not item.get("legacy") and not item.get("archived_at")]
         if candidates:
             latest = max(candidates, key=lambda item: str(item.get("updated_at") or ""))
             index["active"] = str(latest.get("id"))
@@ -420,9 +431,80 @@ def set_active(session_id: str) -> dict:
         entry = _find_entry(index, session_id)
         if entry is None:
             raise ValueError(f"会话不存在：{session_id}")
+        if entry.get("archived_at"):
+            raise ValueError("会话已归档，先恢复再打开")
         index["active"] = str(entry.get("id"))
         _write_index(index)
         return dict(entry)
+
+
+def _pick_active(index: dict, exclude: str = "") -> str:
+    """归档/删除后接手的活动会话：取最近的非归档会话；一个都没有就空着（读的时候会新建）。"""
+    candidates = [item for item in index.get("sessions") or []
+                  if not item.get("legacy") and not item.get("archived_at")
+                  and str(item.get("id")) != exclude]
+    if not candidates:
+        return ""
+    latest = max(candidates, key=lambda item: str(item.get("updated_at") or ""))
+    return str(latest.get("id"))
+
+
+def archive(session_id: str, archived: bool = True) -> dict:
+    """归档 / 恢复会话。归档不删消息，只是从列表里收起来。
+
+    归档的如果正是当前会话，活动会话会切到最近一个未归档的。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        index = _read_index()
+        entry = _find_entry(index, session_id)
+        if entry is None:
+            raise ValueError(f"会话不存在：{session_id}")
+        if archived:
+            entry["archived_at"] = _now()
+        else:
+            entry["archived_at"] = ""
+        if archived and str(index.get("active") or "") == str(entry.get("id")):
+            index["active"] = _pick_active(index) or None
+        _write_index(index)
+        return dict(entry)
+
+
+def delete(session_id: str) -> dict:
+    """删除会话：消息文件挪进 `sessions/trash/`，索引里移除。返回被删的那条。
+
+    旧账本（legacy）会话不允许删：它和多条历史记录绑在一起。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        index = _read_index()
+        entry = _find_entry(index, session_id)
+        if entry is None:
+            raise ValueError(f"会话不存在：{session_id}")
+        sid = str(entry.get("id"))
+        if sid == "legacy" or entry.get("legacy"):
+            raise ValueError("迁移出来的旧会话不能删，可以在归档里收起来")
+        path = _session_file(sid)
+        moved = ""
+        if path.exists():
+            _trash_dir().mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = _trash_dir() / f"{sid}-{stamp}.jsonl"
+            try:
+                path.replace(target)
+                moved = str(target)
+            except OSError:
+                moved = ""
+        index["sessions"] = [item for item in index.get("sessions") or []
+                             if str(item.get("id")) != sid]
+        if str(index.get("active") or "") == sid:
+            index["active"] = _pick_active(index) or None
+        _write_index(index)
+        result = dict(entry)
+        result["trash"] = moved
+        return result
 
 
 def append(session_id: str, *, role: str, agent: str, content: str,

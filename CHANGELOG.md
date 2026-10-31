@@ -1,3 +1,31 @@
+## 0.9.3 — 会话能归档、能删了
+
+用户：「删除会话，归档等功能呢」。之前左栏只能切换会话，删不掉也收不起来，会话会一直堆着。
+
+### 存储层（`agent_team/session.py`）
+- `archive(session_id, archived=True)`：置/清 `archived_at`，消息保留；归档当前会话时活动会话切到最近一个未归档的；
+- `delete(session_id)`：消息文件挪进 `room/sessions/trash/<id>-<时间>.jsonl`（**不真删**），索引移除、`active` 修正；
+  迁移出来的旧账本会话不允许删（只能在归档里收起）；
+- `sessions()` 每条都带 `archived_at`；`active_session()` 跳过归档；`set_active()` 拒绝打开已归档会话（`会话已归档，先恢复再打开`）。
+
+### 接口与界面
+- `POST /api/session/archive {id, archived}` → `{ok, session, active}`；
+- `POST /api/session/delete {id, confirm:true}` → `{ok, deleted, active}`，缺 `confirm` 或为 false 一律 400；
+- 错误按 `会话不存在` → 404、其余（已归档/旧账本） → 400，原因原样透出；自动继承 Cookie 鉴权 + CSRF + JSON 校验；
+- 左栏会话行 hover/聚焦出「⋯」菜单（归档 / 删除），键盘 `Enter` 开、`↑/↓` 选、`Esc` 关并还焦点；
+- 已归档分组可折叠、归档后自动展开；归档行点开只提示「先恢复」，行尾「恢复」按钮；
+- 删除确认框显示标题与消息条数、写明文件留在 `sessions/trash/`，初始焦点在「取消」，`Esc` 取消，Tab 在两键间循环；
+- 全删空时显示「还没有会话 · 在下面说一句话就会开一个新的」，发第一条消息才建 chat-001。
+
+### 顺带修掉
+- 早先 `active` 由前端重算，在同一秒创建的两个会话上会误判，导致删掉**非当前**会话时界面被切走；改为以索引里的 `active` 为准；
+- `/api/session/select` 的 `ValueError` 从 500 改成 400（已归档会话点开会得到人话提示）。
+
+### 验证
+- 新增 31 项测试（`tests/test_session_ops.py` 13 + `tests/test_web_control.py` 18），全项目 **290 项全绿**、`ruff` 干净；
+- Lead 独立脚本 18 项断言全过（归档/恢复/列出透出/切已归档被拒/删除需 confirm/文件进 trash/重复删 404/已归档也能删/未鉴权 401/跨站 Origin 403/GET 打写接口 404/URL 令牌 401）；
+- headless 8 个场景 DOM 证据（菜单键盘链、归档分组、恢复、删除确认框、删非当前不切、删当前切走、全空空状态），页面无 JS 报错。
+
 ## 0.9.2 — 界面底座收敛
 
 按 Impeccable 的 polish 规程做的一轮精修：**只重写 `<style>`**，markup / id / class / 文案 / JS 一格没动

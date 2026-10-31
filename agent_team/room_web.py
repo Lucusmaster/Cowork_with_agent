@@ -491,6 +491,8 @@ def _normalize_session(raw: dict) -> dict:
         "created_at": str(raw.get("created_at") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
         "message_count": _as_int(raw.get("message_count")),
+        "archived_at": str(raw.get("archived_at") or ""),
+        "legacy": bool(raw.get("legacy")),
     }
 
 
@@ -594,6 +596,49 @@ class ChatStore:
             raise RuntimeError("session.py 未就绪")
         current = self.mod.set_active(session_id)
         return _normalize_session(current if isinstance(current, dict) else {})
+
+    def archive(self, session_id: str, archived: bool = True) -> dict:
+        """归档 / 恢复（session.py 负责改 archived_at、必要时切 active）。"""
+        if self.mod is None:
+            raise RuntimeError("会话模块（session.py）还没就绪")
+        fn = getattr(self.mod, "archive", None)
+        if not callable(fn):
+            raise RuntimeError("session.py 版本太旧，没有 archive()，先升级再归档")
+        entry = fn(session_id, archived=archived)
+        return _normalize_session(entry if isinstance(entry, dict) else {})
+
+    def delete(self, session_id: str) -> dict:
+        """删除（消息文件由 session.py 挪进 sessions/trash/）。"""
+        if self.mod is None:
+            raise RuntimeError("会话模块（session.py）还没就绪")
+        fn = getattr(self.mod, "delete", None)
+        if not callable(fn):
+            raise RuntimeError("session.py 版本太旧，没有 delete()，先升级再删除")
+        entry = fn(session_id)
+        out = _normalize_session(entry if isinstance(entry, dict) else {})
+        if isinstance(entry, dict) and entry.get("trash"):
+            out["trash"] = str(entry["trash"])
+        return out
+
+    def active_id(self) -> str:
+        """归档/删除之后该打开哪个会话：以索引里的 active 为准（不猜、不建会话）。
+
+        一个未归档的都不剩就返回空串 —— 那是「空状态」，别偷偷建 chat-001。
+        """
+        rows = [r for r in self._raw_sessions()
+                if not r.get("archived_at") and not r.get("legacy")]
+        if not rows:
+            return ""
+        fn = getattr(self.mod, "active_session", None)
+        if callable(fn):
+            try:
+                current = fn()          # 有候选就不会新建，只是把索引里的 active 读出来
+            except Exception:  # noqa: BLE001
+                current = None
+            if isinstance(current, dict) and current.get("id"):
+                return str(current["id"])
+        latest = max(rows, key=lambda r: str(r.get("updated_at") or ""))
+        return str(latest.get("id") or "")
 
     def messages(self, session_id: str, after_id: str = "", limit: int = 200) -> list[dict]:
         if self.mod is not None and session_id:
@@ -1120,14 +1165,19 @@ def _agents_state(task: dict | None, typing: dict, messages: list[dict]) -> dict
 
 def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "",
                    limit=None) -> dict:
-    active = STORE.active(session_id)
-    sid = str(active.get("id") or "")
+    # 一个会话都没有时别在轮询里偷偷建 chat-001：界面要能看到空状态，
+    # 真正建会话的时机是用户发出第一条消息（/api/post 会调 STORE.active()）。
     sessions = STORE.sessions()
-    if not any(s.get("id") == sid for s in sessions):
+    if sessions:
+        active = STORE.active(session_id)
+    else:
+        active = {}
+    sid = str(active.get("id") or "")
+    if sid and not any(s.get("id") == sid for s in sessions):
         sessions = [active, *sessions]
     sessions.sort(key=lambda s: str(s.get("updated_at") or ""), reverse=True)
     page_limit = _page_limit(limit)
-    messages = STORE.messages(sid, after_id, page_limit)
+    messages = STORE.messages(sid, after_id, page_limit) if sid else []
     typing = _typing_info()
     engine = _engine_info()
     task = _task_detail(task_id) if task_id else _current_task(active, messages)
@@ -1324,16 +1374,63 @@ input,textarea{caret-color:var(--user)}
   flex:0 0 auto}
 .dot.on{background:var(--ok);box-shadow:0 0 0 var(--sp-1) #3fb95022}
 .sessions{flex:1;min-height:0;overflow-y:auto;padding:0 var(--sp-2) var(--sp-3)}
-.sess{width:100%;text-align:left;background:transparent;border:var(--hair) solid transparent;
-  border-radius:var(--r-2);padding:var(--sp-2) var(--sp-2);display:block;color:inherit}
+.sess{position:relative;width:100%;text-align:left;background:transparent;
+  border:var(--hair) solid transparent;border-radius:var(--r-2);
+  padding:var(--sp-2);display:block;color:inherit;cursor:pointer}
 .sess:hover{background:var(--panel2)}
 .sess.sel{background:var(--panel3);border-color:var(--line2)}
+.sess:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
 .sess-top{display:flex;gap:var(--sp-2);align-items:baseline}
+.sess:not(.archived) .sess-top{padding-right:var(--sp-6)}   /* 给「⋯」留位，标题和时间不挪 */
 .sess-title{font-size:var(--fs-md);font-weight:600;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;flex:1;min-width:0}
 .sess-time{font-size:var(--fs-xs);color:var(--dim2);flex:0 0 auto}
-.sess-sub{font-size:var(--fs-xs);color:var(--dim2);margin-top:var(--sp-1);white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis}
+.sess-sub{font-size:var(--fs-xs);color:var(--dim2);margin-top:var(--sp-1);
+  display:flex;align-items:center;gap:var(--sp-2)}
+.sess-meta{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 行尾「⋯」：hover / 键盘焦点 / 菜单打开时才出现 */
+.sess-more{position:absolute;top:var(--sp-1);right:var(--sp-1);width:22px;height:22px;
+  border-radius:var(--r-1);border:var(--hair) solid transparent;background:var(--panel2);
+  color:var(--dim);font-size:var(--fs-md);line-height:1;display:grid;place-items:center;
+  opacity:0;padding:0}
+.sess:hover .sess-more,.sess:focus-within .sess-more,.sess-more:focus-visible,
+.sess-more.on{opacity:1}
+.sess-more:hover{color:var(--fg);border-color:var(--line2);background:var(--panel3)}
+/* 已归档：不整行降透明度（那会把文字对比度一起拉低，实测 3.49:1），
+   只把标题/副行换成暗一档的文字色（6.60:1 / 5.59:1）+ 小标 */
+.sess.archived .sess-title{color:var(--dim)}
+.arch-tag{margin-left:var(--sp-1);font-size:var(--fs-xs);color:var(--dim2);
+  border:var(--hair) solid var(--line2);border-radius:var(--r-1);padding:0 var(--sp-1);
+  flex:0 0 auto}
+.sess-restore{flex:0 0 auto;margin-left:auto;height:20px;
+  border-radius:var(--r-1);border:var(--hair) solid var(--line2);background:var(--panel2);
+  color:var(--dim);font-size:var(--fs-xs);padding:0 var(--sp-2)}
+.sess-restore:hover{color:var(--fg);border-color:#3d4a5c}
+/* 已归档分组：可折叠 */
+.arch-group{margin-top:var(--sp-2);border-top:var(--hair) solid var(--line);
+  padding-top:var(--sp-2)}
+.arch-head{width:100%;display:flex;align-items:center;gap:var(--sp-1);background:none;
+  border:0;color:var(--dim2);font-size:var(--fs-xs);letter-spacing:.06em;
+  text-transform:uppercase;padding:var(--sp-1) var(--sp-2);border-radius:var(--r-1)}
+.arch-head:hover{background:var(--panel2);color:var(--dim)}
+.arch-head .chev{font-size:var(--fs-xs);transition:transform var(--dur) var(--ease)}
+.arch-group.open .arch-head .chev{transform:rotate(90deg)}
+.arch-list{display:none;margin-top:var(--sp-1)}
+.arch-group.open .arch-list{display:block}
+/* 会话菜单（跟着行出现的浮层） */
+.sess-menu{position:fixed;z-index:78;min-width:132px;background:var(--panel2);
+  border:var(--hair) solid var(--line2);border-radius:var(--r-2);
+  box-shadow:0 var(--sp-2) 24px #00000080;padding:var(--sp-1)}
+.sess-menu[hidden]{display:none}
+.sess-menu .mi{display:flex;align-items:center;gap:var(--sp-1);width:100%;
+  background:none;border:0;border-radius:var(--r-1);color:var(--fg);
+  font-size:var(--fs-sm);padding:var(--sp-1) var(--sp-2);text-align:left}
+.sess-menu .mi:hover,.sess-menu .mi.cur{background:var(--panel3)}
+.sess-menu .mi.danger{color:var(--bad)}
+.sess-menu .mi.danger:hover{background:#f8514914;color:#ffb4ad}
+.menu-sep{height:var(--hair);background:var(--line2);margin:var(--sp-1) 0}
+/* 空状态 */
+.sess-empty{padding:var(--sp-3) var(--sp-2);line-height:1.8}
 .side-foot{margin-top:auto;padding:var(--sp-2) var(--sp-3);
   border-top:var(--hair) solid var(--line);font-size:var(--fs-xs);color:var(--dim2);
   line-height:1.5}
@@ -1668,6 +1765,27 @@ ul.files li:before{content:"•";position:absolute;left:var(--sp-0);color:var(--
 .pick-go{height:34px;font-size:var(--fs-md);padding:0 var(--sp-3)}
 body.picking .main,body.picking .side,body.picking .inspector{pointer-events:none}
 
+/* ---------- 删除确认框 ---------- */
+.confirm{position:fixed;inset:0;z-index:80;display:flex;align-items:center;
+  justify-content:center;padding:var(--sp-4);background:#05070ac7}
+.confirm[hidden]{display:none}
+.confirm-card{width:min(440px,100%);background:var(--panel);border:var(--hair) solid var(--line2);
+  border-radius:var(--r-3);padding:var(--sp-4);box-shadow:0 var(--sp-5) 60px #00000080}
+.confirm-title{font-size:var(--fs-lg);font-weight:650;margin-bottom:var(--sp-2)}
+.confirm-line{font-size:var(--fs-sm);color:var(--dim);line-height:1.6;
+  word-break:break-word;margin-bottom:var(--sp-1)}
+.confirm-line b{color:var(--fg);font-weight:600}
+.confirm-warn{margin:var(--sp-2) 0 var(--sp-4);font-size:var(--fs-sm);color:#f3d08a;
+  background:#2a2213;border:var(--hair) solid #d2992255;border-radius:var(--r-2);
+  padding:var(--sp-2) var(--sp-3);line-height:1.6}
+.confirm-actions{display:flex;gap:var(--sp-2);justify-content:flex-end}
+.confirm-actions button{height:32px;border-radius:var(--r-2);font-size:var(--fs-md);
+  padding:0 var(--sp-4);border:var(--hair) solid var(--line2);background:var(--panel2);
+  color:var(--fg)}
+.confirm-actions button:hover{background:var(--panel3)}
+.btn-danger{border-color:#f8514966;background:#f8514922;color:#ffb4ad}
+.btn-danger:hover{background:#f8514933;border-color:#f8514999;color:#ffd7d3}
+
 /* ---------- 响应式 ---------- */
 /* 1180：三栏收窄，次要统计先让位（结构不动） */
 @media (max-width:1180px){
@@ -1706,6 +1824,9 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
   .pick-go{padding:0 var(--sp-2);font-size:var(--fs-sm)}
   .unlock{padding:var(--sp-4)}
   .modal{padding:var(--sp-2)}
+  .confirm{padding:var(--sp-3)}
+  .confirm-actions{flex-wrap:wrap}
+  .confirm-actions button{flex:1 1 100%}
 }
 
 /* ---------- 减少动效 ---------- */
@@ -1789,6 +1910,26 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
 </div>
 <div class="toast" id="toast"></div>
 
+<div class="sess-menu" id="sess-menu" role="menu" aria-label="会话操作" hidden>
+  <button class="mi" id="menu-archive" role="menuitem" tabindex="-1">归档</button>
+  <div class="menu-sep"></div>
+  <button class="mi danger" id="menu-delete" role="menuitem" tabindex="-1">删除</button>
+</div>
+
+<div class="confirm" id="confirm" hidden role="dialog" aria-modal="true"
+     aria-labelledby="confirm-title">
+  <div class="confirm-card">
+    <div class="confirm-title" id="confirm-title">删除会话</div>
+    <div class="confirm-line" id="confirm-target"></div>
+    <div class="confirm-warn">删除后这个会话的聊天记录不再出现在列表里（文件会留在
+      sessions/trash/，需要时去那里找）</div>
+    <div class="confirm-actions">
+      <button id="confirm-cancel">取消</button>
+      <button class="btn-danger" id="confirm-ok">删除</button>
+    </div>
+  </div>
+</div>
+
 <div class="picker" id="picker" hidden role="dialog" aria-modal="true" aria-labelledby="picker-title">
   <div class="picker-card">
     <div class="picker-head">
@@ -1842,6 +1983,8 @@ const wsInput = $('ws-input'), wsBtn = $('ws-btn'), wsStatus = $('ws-status');
 const input = $('input'), sendBtn = $('send');
 const modal = $('modal'), modalPath = $('modal-path'), modalBody = $('modal-body');
 const toastEl = $('toast');
+const sessMenu = $('sess-menu');
+const confirmEl = $('confirm');
 const unlockEl = $('unlock'), unlockInput = $('unlock-input');
 const unlockBtn = $('unlock-btn'), unlockErr = $('unlock-err');
 
@@ -2229,24 +2372,218 @@ function renderTyping(){
   streamEl.appendChild(typingEl);
 }
 
+/* ---------- 会话列表：主列表 + 已归档分组 + 行尾菜单 ---------- */
+let archOpen = false;          // 已归档分组是否展开（归档后自动展开，让用户看到它去哪了）
+let menuSessId = '';           // 菜单当前对应的会话
+let menuAnchor = null;         // 打开菜单的那一行/按钮（Esc 后焦点还回去）
+let menuIndex = 0;
+let confirmSessId = '';        // 删除确认框对应的会话
+let confirmBack = null;        // 关掉确认框后焦点还回去
+let lastSessHtml = '';         // 上一次渲染出来的列表 HTML（没变就不重建 DOM）
+
+function sessRow(s, archived){
+  const ws = baseName(s.workspace || '');
+  const id = esc(s.id);
+  const tag = archived ? '<span class="arch-tag">已归档</span>' : '';
+  const tail = archived
+    ? '<button class="sess-restore" data-restore="' + id + '" title="恢复到列表">恢复</button>'
+    : '<button class="sess-more" data-more="' + id + '" aria-haspopup="menu"'
+      + ' aria-expanded="false" aria-label="更多操作" title="更多操作（Enter 打开）">⋯</button>';
+  const sub = '<span class="sess-meta">' + esc(ws || '未绑定工作区') + ' · '
+    + esc(String(s.message_count || 0)) + ' 条消息</span>';
+  return '<div class="sess' + (archived ? ' archived' : (s.id === activeId ? ' sel' : '')) + '"'
+    + ' data-id="' + id + '" role="button" tabindex="0"'
+    + ' aria-current="' + (s.id === activeId && !archived ? 'true' : 'false') + '">'
+    + '<div class="sess-top"><span class="sess-title">' + esc(s.title || '新会话') + '</span>'
+    + tag + '<span class="sess-time">' + esc(timeLabel(s.updated_at)) + '</span></div>'
+    + '<div class="sess-sub">' + sub + (archived ? tail : '') + '</div>'
+    + (archived ? '' : tail) + '</div>';
+}
+
 function renderSessions(){
   const list = st.sessions || [];
-  $('session-count').textContent = list.length;
-  if(!list.length){
-    sessionsEl.innerHTML = '<div class="empty">还没有会话</div>';
+  const live = list.filter(s => !s.archived_at);
+  const arch = list.filter(s => s.archived_at);
+  $('session-count').textContent = live.length;
+  let html = '';
+  if(!live.length){
+    html += '<div class="empty sess-empty">还没有会话 · 在下面说一句话就会开一个新的</div>';
+  } else {
+    html += live.map(s => sessRow(s, false)).join('');
+  }
+  if(arch.length){
+    html += '<div class="arch-group' + (archOpen ? ' open' : '') + '">'
+      + '<button class="arch-head" id="arch-toggle" aria-expanded="' + (archOpen ? 'true' : 'false') + '">'
+      + '<span class="chev">›</span><span>已归档 · ' + arch.length + '</span></button>'
+      + '<div class="arch-list" id="arch-list">' + arch.map(s => sessRow(s, true)).join('')
+      + '</div></div>';
+  }
+  // 每秒轮询都会走到这里：内容没变就别重建 DOM，否则键盘焦点每秒被清一次
+  if(html === lastSessHtml) return;
+  lastSessHtml = html;
+  sessionsEl.innerHTML = html;
+  wireSessions();
+}
+
+function wireSessions(){
+  sessionsEl.querySelectorAll('.sess').forEach(el => {
+    const id = el.dataset.id;
+    const archived = el.classList.contains('archived');
+    el.onclick = ev => {
+      if(ev.target.closest('.sess-more') || ev.target.closest('.sess-restore')) return;
+      if(archived){ toast('已归档，先恢复再打开'); return; }
+      selectSession(id);
+    };
+    el.onkeydown = ev => {
+      if(ev.key === 'Enter'){ ev.preventDefault(); openSessMenu(id, el); }
+      else if(ev.key === ' '){ ev.preventDefault();
+        if(archived){ toast('已归档，先恢复再打开'); } else { selectSession(id); } }
+    };
+  });
+  sessionsEl.querySelectorAll('.sess-more').forEach(btn => {
+    btn.onclick = ev => { ev.stopPropagation(); openSessMenu(btn.dataset.more, btn); };
+  });
+  sessionsEl.querySelectorAll('.sess-restore').forEach(btn => {
+    btn.onclick = ev => { ev.stopPropagation(); sessArchive(btn.dataset.restore, false); };
+  });
+  const toggle = $('arch-toggle');
+  if(toggle) toggle.onclick = () => {
+    archOpen = !archOpen;
+    toggle.parentElement.classList.toggle('open', archOpen);
+    toggle.setAttribute('aria-expanded', archOpen ? 'true' : 'false');
+  };
+}
+
+function sessById(id){
+  return (st.sessions || []).find(s => s.id === id) || null;
+}
+
+/* ---------- 行尾菜单：Tab 到行 → Enter 打开 → ↑/↓ 选 → Esc 关 ---------- */
+function menuItems(){ return Array.from(sessMenu.querySelectorAll('.mi')); }
+
+function paintMenu(){
+  menuItems().forEach((btn, i) => btn.classList.toggle('cur', i === menuIndex));
+}
+
+function openSessMenu(id, anchor){
+  const s = sessById(id);
+  if(!s) return;
+  if(!sessMenu.hidden && menuSessId === id){ closeSessMenu(true); return; }   // 再点一次 = 收起
+  menuSessId = id;
+  menuAnchor = anchor || null;
+  sessMenu.hidden = false;
+  const r = (anchor && anchor.getBoundingClientRect)
+    ? anchor.getBoundingClientRect() : {left: 0, top: 0, right: 0, bottom: 0};
+  const w = sessMenu.offsetWidth || 140;
+  const h = sessMenu.offsetHeight || 80;
+  let left = r.right - w;
+  let top = r.bottom + 4;
+  if(top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 4);
+  sessMenu.style.left = Math.max(8, Math.min(left, window.innerWidth - w - 8)) + 'px';
+  sessMenu.style.top = Math.max(8, top) + 'px';
+  document.querySelectorAll('.sess-more.on').forEach(b => b.classList.remove('on'));
+  if(anchor && anchor.classList && anchor.classList.contains('sess-more')){
+    anchor.classList.add('on');
+    anchor.setAttribute('aria-expanded', 'true');
+  }
+  menuIndex = 0;
+  paintMenu();
+  const first = menuItems()[0];
+  if(first) first.focus();
+}
+
+function closeSessMenu(focusBack){
+  if(sessMenu.hidden) return;
+  sessMenu.hidden = true;
+  menuSessId = '';
+  document.querySelectorAll('.sess-more.on').forEach(b => {
+    b.classList.remove('on');
+    b.setAttribute('aria-expanded', 'false');
+  });
+  if(focusBack && menuAnchor && menuAnchor.focus){
+    try { menuAnchor.focus(); } catch(e){}
+  }
+  menuAnchor = null;
+}
+
+function sessKeys(ev){
+  if(confirmEl && !confirmEl.hidden){                 // 确认框开着：Esc 取消、Tab 只在两个按钮间转
+    if(ev.key === 'Escape'){ ev.preventDefault(); closeConfirm(true); return; }
+    if(ev.key === 'Tab'){
+      const ring = [$('confirm-cancel'), $('confirm-ok')];
+      const at = ring.indexOf(document.activeElement);
+      ev.preventDefault();
+      const step = ev.shiftKey ? -1 : 1;
+      const pos = (at + step + ring.length) % ring.length;
+      if(ring[pos]) ring[pos].focus();
+    }
     return;
   }
-  sessionsEl.innerHTML = list.map(s => {
-    const ws = baseName(s.workspace || '');
-    return '<button class="sess ' + (s.id === activeId ? 'sel' : '') + '" data-id="' + esc(s.id) + '">'
-      + '<div class="sess-top"><span class="sess-title">' + esc(s.title || '新会话') + '</span>'
-      + '<span class="sess-time">' + esc(timeLabel(s.updated_at)) + '</span></div>'
-      + '<div class="sess-sub">' + esc(ws || '未绑定工作区') + ' · '
-      + esc(String(s.message_count || 0)) + ' 条消息</div></button>';
-  }).join('');
-  sessionsEl.querySelectorAll('.sess').forEach(el => {
-    el.onclick = () => selectSession(el.dataset.id);
-  });
+  if(sessMenu.hidden) return;
+  const items = menuItems();
+  if(!items.length) return;
+  if(ev.key === 'Escape'){ ev.preventDefault(); closeSessMenu(true); return; }
+  if(ev.key === 'Tab'){ closeSessMenu(false); return; }
+  if(ev.key === 'ArrowDown' || ev.key === 'ArrowUp'){
+    ev.preventDefault();
+    menuIndex = (menuIndex + (ev.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    paintMenu();
+    items[menuIndex].focus();
+    return;
+  }
+  if(ev.key === 'Home' || ev.key === 'End'){
+    ev.preventDefault();
+    menuIndex = ev.key === 'Home' ? 0 : items.length - 1;
+    paintMenu();
+    items[menuIndex].focus();
+  }
+}
+
+/* ---------- 删除确认框 ---------- */
+function openConfirm(id){
+  const s = sessById(id);
+  if(!s) return;
+  closeSessMenu(false);
+  confirmBack = document.activeElement;
+  confirmSessId = id;
+  $('confirm-target').innerHTML = '<b>' + esc(s.title || '新会话') + '</b> · '
+    + esc(String(s.message_count || 0)) + ' 条消息';
+  confirmEl.hidden = false;
+  const cancel = $('confirm-cancel');
+  if(cancel){ try { cancel.focus(); } catch(e){} }      // 焦点默认在「取消」
+}
+
+function closeConfirm(focusBack){
+  if(confirmEl.hidden) return;
+  confirmEl.hidden = true;
+  confirmSessId = '';
+  if(focusBack && confirmBack && confirmBack.focus){
+    try { confirmBack.focus(); } catch(e){}
+  }
+  confirmBack = null;
+}
+
+async function doDelete(){
+  const id = confirmSessId;
+  closeConfirm(false);
+  if(!id) return;
+  const data = await apiPost('/api/session/delete', {id: id, confirm: true});
+  if(!data || !data.ok){ toast((data && data.error) || '删除失败'); return; }
+  toast('已删除');
+  const next = (data && data.active) || '';
+  if(next !== activeId){ activeId = next; localTyping = null; }
+  await load({fresh: true});
+}
+
+async function sessArchive(id, archived){
+  closeSessMenu(false);
+  const data = await apiPost('/api/session/archive', {id: id, archived: archived});
+  if(!data || !data.ok){ toast((data && data.error) || (archived ? '归档失败' : '恢复失败')); return; }
+  toast(archived ? '已归档' : '已恢复');
+  if(archived) archOpen = true;
+  const next = (data && data.active) || '';
+  if(next !== activeId){ activeId = next; localTyping = null; }
+  await load({fresh: true});
 }
 
 function renderWorkspace(){
@@ -2963,6 +3300,24 @@ modal.addEventListener('click', e => { if(e.target === modal) closeModal(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape' && !modal.hidden) closeModal(); });
 document.addEventListener('keydown', pickerKeys);
 
+/* ---------- 会话归档 / 删除的接线 ---------- */
+$('menu-archive').onclick = () => { const id = menuSessId; if(id) sessArchive(id, true); };
+$('menu-delete').onclick = () => { const id = menuSessId; if(id) openConfirm(id); };
+$('confirm-cancel').onclick = () => closeConfirm(true);
+$('confirm-ok').onclick = doDelete;
+if(confirmEl) confirmEl.addEventListener('click', ev => {
+  if(ev.target === confirmEl) closeConfirm(true);      // 点遮罩 = 取消
+});
+document.addEventListener('click', ev => {
+  if(sessMenu.hidden) return;
+  const t = ev.target;
+  if(t.closest && (t.closest('#sess-menu') || t.closest('.sess-more'))) return;
+  closeSessMenu(false);                                // 点别处收起菜单
+}, true);
+window.addEventListener('resize', () => closeSessMenu(false));
+sessionsEl.addEventListener('scroll', () => closeSessMenu(false), {passive: true});
+document.addEventListener('keydown', sessKeys);
+
 let lastClock = 0;
 function tick(){
   load();
@@ -3368,8 +3723,10 @@ class Handler(BaseHTTPRequestHandler):
                         "available": control is not None})
             return
         if parsed.path == "/api/session":
-            self._json({"ok": True, "session": STORE.active(one("session")),
-                        "sessions": STORE.sessions(),
+            # 读接口不建会话：一条都没有就空着（界面靠这个显示空状态）
+            sessions = STORE.sessions()
+            active = STORE.active(one("session")) if sessions else {}
+            self._json({"ok": True, "session": active, "sessions": sessions,
                         "store": {"ready": STORE.ready, "note": STORE.broken}})
             return
         if parsed.path == "/api/workspace":
@@ -3455,6 +3812,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/session/select":
             self._post_select(body)
+            return
+        if parsed.path == "/api/session/archive":
+            self._post_session_archive(body)
+            return
+        if parsed.path == "/api/session/delete":
+            self._post_session_delete(body)
             return
         self._json({"ok": False, "error": "接口不存在"}, 404)
 
@@ -3637,10 +4000,61 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             current = STORE.select(session_id)
+        except ValueError as exc:              # 已归档 / 找不到：原因原样给前端
+            self._json(*self._session_op_error(exc))
+            return
         except Exception as exc:    # noqa: BLE001
             self._json({"ok": False, "error": f"切换会话失败：{type(exc).__name__}: {exc}"}, 500)
             return
         self._json({"ok": True, "session": current})
+
+    # ---------- 归档 / 删除 ----------
+    @staticmethod
+    def _session_op_error(exc: Exception) -> tuple[dict, int]:
+        """session.py 的 ValueError 里带的是人话：不存在给 404，其余（已归档/旧会话）给 400。"""
+        reason = str(exc)
+        code = 404 if "不存在" in reason else 400
+        return {"ok": False, "error": reason}, code
+
+    def _post_session_archive(self, body: dict) -> None:
+        session_id = str(body.get("id") or body.get("session_id") or "").strip()
+        if not session_id:
+            self._json({"ok": False, "error": "缺少 id"}, 400)
+            return
+        want = body.get("archived", True)
+        if isinstance(want, str):
+            archived = want.strip().lower() not in ("", "0", "false", "no", "off")
+        else:
+            archived = bool(want)
+        try:
+            entry = STORE.archive(session_id, archived=archived)
+        except ValueError as exc:
+            self._json(*self._session_op_error(exc))
+            return
+        except Exception as exc:    # noqa: BLE001
+            self._json({"ok": False, "error": f"归档失败：{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"ok": True, "session": entry, "archived": archived,
+                    "active": STORE.active_id()})
+
+    def _post_session_delete(self, body: dict) -> None:
+        session_id = str(body.get("id") or body.get("session_id") or "").strip()
+        if not session_id:
+            self._json({"ok": False, "error": "缺少 id"}, 400)
+            return
+        confirm = body.get("confirm")
+        if confirm is not True and str(confirm).strip().lower() not in ("true", "1", "yes"):
+            self._json({"ok": False, "error": "删除会话需要 confirm: true"}, 400)
+            return
+        try:
+            entry = STORE.delete(session_id)
+        except ValueError as exc:
+            self._json(*self._session_op_error(exc))
+            return
+        except Exception as exc:    # noqa: BLE001
+            self._json({"ok": False, "error": f"删除失败：{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"ok": True, "deleted": entry, "active": STORE.active_id()})
 
 
 def main() -> int:
