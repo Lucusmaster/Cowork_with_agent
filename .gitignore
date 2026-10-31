@@ -1,0 +1,33 @@
+# 运行时产物
+.tmp/
+__pycache__/
+*.pyc
+tasks/*/exec-*.out.txt
+tasks/*/exec-*.err.txt
+# Codex 会话日志与凭据副本（落在工作区，不进 git）
+.codex-home/
+room/planner/
+room/worker.log
+room/worker.lock
+room/web.out
+.write-probe
+
+# 仓库根的临时产物（都不要进版本库）
+/tmp*/
+/testtmp/
+/tempverify/
+/.tmp-*/
+
+# 打包产物
+*.egg-info/
+build/
+dist/
+
+
+# 运行时账本（对话、任务卡、日志）：绝不进版本库
+/room/*
+!/room/.gitkeep
+/tasks/*
+!/tasks/.gitkeep
+/.local-notes/
+/tools/

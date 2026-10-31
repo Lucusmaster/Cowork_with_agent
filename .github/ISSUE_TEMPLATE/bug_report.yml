@@ -1,0 +1,40 @@
+name: Bug report
+description: 报一个可复现的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先看一眼 `docs/ARCHITECTURE.md` 的「已知限制」，以及 `room/worker.log`、`tasks/<ID>/` 里的证据。
+        报问题时请贴**证据**（退出码、日志片段、`git diff`），不要只说"不工作"。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望 vs 实际
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 你发的那条消息原文、绑定的工作区、以及用的命令
+      placeholder: |
+        1. agent-team start
+        2. 在网页里发："..."
+        3. 出现 ...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: room/worker.log 尾部、tasks/<ID>/verify-*.txt、review-*.last.md、退出码
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: 版本与环境
+      placeholder: agent-team 0.4.0 / Windows 11 / Python 3.12 / Codex CLI x.y
+    validations:
+      required: true

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-team-workbench"
+dynamic = ["version"]
+description = "协作台：DeepSeek 规划、Codex 执行、只读复核的群聊式多 Agent 协作系统"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lucusmaster" }]
+keywords = ["multi-agent", "codex", "automation", "agents", "workbench"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lucusmaster/Cowork_with_agent"
+Documentation = "https://github.com/Lucusmaster/Cowork_with_agent/blob/main/docs/ARCHITECTURE.md"
+Issues = "https://github.com/Lucusmaster/Cowork_with_agent/issues"
+
+[project.scripts]
+agent-team = "agent_team.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools]
+packages = ["agent_team"]
+
+[tool.setuptools.package-data]
+agent_team = ["bundled/**/*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_team.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

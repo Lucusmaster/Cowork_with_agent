@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先读文档
+    url: https://github.com/Lucusmaster/Cowork_with_agent/blob/main/docs/ARCHITECTURE.md
+    about: 架构、守卫、已知限制都在这里；很多问题读完就解决了。

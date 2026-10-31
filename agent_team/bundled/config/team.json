@@ -1,0 +1,15 @@
+{
+  "executor": {
+    "model": "gpt-6.1-terra",
+    "reasoning_effort": "low",
+    "timeout": 900,
+    "sandbox": "workspace-write"
+  },
+  "reviewer": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "low",
+    "timeout": 600,
+    "sandbox": "read-only",
+    "fallback_models": ["gpt-6.1-terra", "gpt-6.1-sol"]
+  }
+}

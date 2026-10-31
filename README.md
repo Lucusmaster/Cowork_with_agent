@@ -1,0 +1,308 @@
+# 协作台 · agent-team
+
+[English](README.en.md) · [架构](docs/ARCHITECTURE.md) · [路线图](docs/ROADMAP.md)
+
+[![CI](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
+
+一个跑在本机的多 Agent 协作系统：**DeepSeek 当大脑**（读群聊、拆任务、判验收），**Codex 当执行者**（改代码、跑测试），**只读的 Codex 当复核**。决策权和执行权分开，验收只看证据。
+
+你不用在两个 agent 之间复制粘贴——它们在一个群里，互相看得到对方说的话。
+
+```text
+你 ──▶ 群聊界面 ──▶ 大脑（读上下文、回话、拆卡）──▶ Codex 执行 ──▶ 只读复核 ──▶ 报告回到群里
+```
+
+- 网页群聊：`http://127.0.0.1:8899`
+- 说人话就行，需求模糊也能接
+- 关掉网页即收工（有任务在跑时会等它跑完）
+
+## 快速开始
+
+依赖：Python ≥ 3.10、git、Codex CLI 且已 `codex login`（跑 JS/TS 项目再装 node）。
+
+```powershell
+python -m agent_team.cli doctor        # 1) 体检：Python / git / Codex 登录态 / 端口
+python -m agent_team.cli start         # 2) 拉起协作台 + 引擎
+# 3) 打开 http://127.0.0.1:8899，第一句说：
+#    "工作区是 E:\我的项目，这个项目叫 XXX"
+```
+
+装成命令也行（可选，之后就能用 `agent-team`）：
+
+```powershell
+pip install -e .
+agent-team start
+```
+
+老写法仍然可用（`python bin\start_all.py`、`python bin\room.py ...`），`bin/` 里现在只是兼容壳。
+
+## 项目结构
+
+```text
+agent_team/           运行时包（引擎、协议、网页、桥）
+  worker.py           消息认领、群聊大脑、流水线、阶段推进
+  team.py             任务卡协议：建卡/派发/验收/复核/报告
+  room.py             消息总账
+  room_web.py         网页工作台
+  codex_bridge.py     调 Codex CLI 的唯一出口
+  cli.py              统一命令入口
+bin/                  兼容壳 + 系统启动脚本（ps1/sh）
+config/team.json      模型、超时、重试
+agents/               大脑与执行者的契约提示词
+tests/                回归测试（29 项）
+docs/                 架构与路线图
+room/ tasks/          运行时账本与任务卡（不进产物仓库）
+```
+
+## 文档
+
+- [架构](docs/ARCHITECTURE.md)：角色、消息总线、状态机、验收协议、守卫
+- [路线图](docs/ROADMAP.md)：已完成与下一步
+- [更新日志](CHANGELOG.md)
+- [参与开发](CONTRIBUTING.md)：红线与开发循环
+- [工作区绑定规则](docs/workspace-binding.md)
+
+## 常用命令
+
+```powershell
+agent-team start [--restart]   # 启动（--restart 改了代码后用）
+agent-team stop                # 停掉
+agent-team status              # 服务与进行中任务
+agent-team doctor              # 体检
+agent-team task --text "..."   # 命令行交任务（自动启停）
+agent-team say --text "..."    # 以大脑身份往群里说话
+agent-team tail -n 20          # 看群里最近消息
+agent-team wait -t T-xxxx      # 等某张卡到终态
+```
+
+## 发给别人
+
+```powershell
+python bin\reset_ledger.py --yes     # 清掉 room/ 历史与 tasks/ 任务卡（不动 bin/ tools/ config/ docs/）
+```
+
+然后把整份目录打包发走。对方解压到任意位置，`python bin\doctor.py` 按提示补齐即可。
+`room/worker.lock`、运行日志、`.codex-home/`、`.tmp/` 都不进版本库；锁文件带仓库标识，别人那份不会跟本机的实例打架。
+
+## 可视化协作台（先看这个）
+
+```powershell
+python bin\start_all.py              # 或 powershell -ExecutionPolicy Bypass -File bin\start_all.ps1
+# 浏览器打开 http://127.0.0.1:8899
+```
+
+一个命令拉起两个后台常驻进程（脱离终端，关掉窗口也继续跑）。
+**关掉这个网页就等于收工**：页面会尽力发一次告别，服务端等几秒（留给刷新）后
+停掉引擎并退出，状态写进 `room/session_state.json`；用本 skill 的会话会收到「协作已结束」。
+想让它脱离网页常驻（例如挂着跑长任务），用 `--no-autostop` 启动，或设环境变量 `AGENT_TEAM_AUTOSTOP=0`。
+
+两个后台进程：
+
+| 进程 | 作用 |
+| --- | --- |
+| `bin/room_web.py` | 协作台网页（三栏工作台） |
+| `bin/worker.py` | 工作流引擎：**3 秒轮询群聊，有新任务自动跑完整流水线** |
+
+三栏工作台：
+
+| 区域 | 内容 |
+| --- | --- |
+| 左 | 成员实时状态（大脑/执行/复核，谁在干活）+ 任务列表（状态、轮次） |
+| 中 | 协作流：你说的话、分工、执行事件、验收结果；底部随时输入下一条任务（执行中也能发，排队） |
+| 右 | 当前任务的流水线（计划 → 执行 → 验收 → 复核）、验收标准、最近一轮的退出码/耗时/tokens、验收输出、复核结论、改动统计 |
+
+数据全部来自 `room/messages.jsonl` 和 `tasks/<ID>/`，不额外存数据库。
+流水线事件由 `bin/team.py` 在 dispatch/verify/review 时自动写入（`kind=event`），所以面板是实时的，不是摆设。
+
+## 这是一个群聊，不是任务表单
+
+中间那个输入框就是聊天框，跟平常聊天一样用。几件事都能用大白话说：
+
+| 你说 | 群里发生什么 |
+| --- | --- |
+| 「工作区是 E:\my-project，这个项目叫 my-project」 | 记进 `room/project.json`，页面底栏显示当前项目 |
+| 「把登录页做出来」「帮我把导出加上」 | 大脑先回一句理解，再拆卡交给 Codex；验收和复核完，Codex 的汇报、复核者的结论都会贴进群里 |
+| 「继续」 | 接着上一阶段做（自动带报告/失败项/复核意见） |
+| 「测试挂了帮我修」 | 同上，失败用例原文会带进任务 |
+| 需求太模糊 | 大脑按最合理的理解动手，并在群里说明假设；连项目都没绑就先问一句 |
+
+群里每个角色说的话都进同一条消息流（`room/messages.jsonl`），所以谁都能看到谁说了什么：
+
+```powershell
+python bin\room.py post --as deepseek --text "我先按最小可用做，别改公共配置"
+python bin\room.py tail -n 20
+```
+
+## 分阶段做项目：说「继续」就接着上一阶段
+
+大项目不是一次跑完的。每阶段结束后引擎会留下交接材料，用户说「继续」（或点看板底部
+「继续上一阶段」）就自动接上：
+
+| 交接内容 | 位置 |
+| --- | --- |
+| 上阶段做了什么 / 没做什么 | `tasks/<ID>/report.md` |
+| 失败用例原文 | `tasks/<ID>/verify-*.txt` |
+| 复核意见 | `tasks/<ID>/review-*.last.md` |
+| 阶段交接材料（含上述全部 + 工作区状态） | `tasks/<ID>/handoff.md` |
+| 跨阶段进度台账 | `room/projects/<项目名>/PROGRESS.md` |
+
+新卡会记 `stage`、`continues`（上一阶段任务号）、`unfinished_after`（预计还剩什么），
+规划器按"优先修失败项、再逐个加新功能"的顺序产出下一阶段，一轮只做能扎实做完的量。
+
+## 工作流引擎：发完就不管了
+
+你在页面上发一句需求，`worker.py` 在 3 秒内认领并自动走完：
+
+```text
+规划（Codex 当参谋出任务卡：标题/目标/验收标准/验收命令/允许改动范围）
+  → 建卡（tasks/<ID>/task.json + plan.md）
+  → 派发（Codex 执行，改为改文件跑测试）
+  → 验收（本地跑验收命令，退出码说话）
+  → 复核（Codex 只读审 diff，专挑假通过和越界）
+  → 报告 → 回帖到群里
+```
+
+失败会自愈：
+
+| 情况 | 引擎怎么做 |
+| --- | --- |
+| 验收不过 | 写 `verdict-NN.md` 要求返工，自动再派一轮（最多 2 轮） |
+| 复核 `NEEDS_FIX` | 把复核意见原文变成返工判决书，再修一轮、再验收、再复核 |
+| 两轮仍不过 | 停下，在群里说清卡在哪，等你拍板 |
+| 需求太短（"继续""好"） | 不猜，反问你要改哪个文件、达到什么效果 |
+
+安全阀：验收命令走白名单（只允许 unittest/pytest/py_compile/node --test/npm test 这类），
+含 `rm`、`del`、`>`、`&&` 的一律丢弃；单实例锁防重复执行；全程写 `room/worker.log`。
+
+## 现在是谁在干
+
+| 角色 | 当前由谁担任 | 说明 |
+| --- | --- | --- |
+| 大脑（Brain） | DeepSeek Harness 本会话（`deepseek-v4.1-flash-1017`） | 写任务卡、写计划、审产物、下验收结论 |
+| 执行者（Executor） | Codex CLI（模型、推理档在 `config/team.json` 里配） | 按任务卡改文件、跑测试，做不到就如实报错 |
+| 复核者（Reviewer） | Codex CLI（另一个模型，`read-only` 沙箱） | 只读审 `git diff`，专挑"测试假通过"和越界改动 |
+| 人 | 你 | 发任务；需要拍板时回一句 |
+
+执行者是可替换的：`agent_team/codex_bridge.py` 是唯一的模型出口，换别的 CLI Agent 只需要改这一层。
+
+## 已经验证的成果
+
+一次真实任务（实现一个命令行小工具）跑完三轮闭环：
+
+| 轮次 | 谁做了什么 | 耗时 | 结果 |
+| --- | --- | --- | --- |
+| 1 | Codex 写下 `tools/wordstat.py` + 测试 | 85s | 测试断言自己写错 → 大脑判 `repair` |
+| 2 | Codex 按验收结论修断言、删掉 `SkipTest` 兜底 | 96s | 还剩 Windows 换行导致字节数错 → 大脑判 `repair` |
+| 3 | Codex 改成二进制写入固定字节 | 84s | 4 个测试全绿 → 大脑判 `pass` |
+
+三轮的提示词、Codex 原始输出、验收日志、判定结论全部落在 `tasks/<ID>/`，可复盘。
+
+## 工作区规则（重要）
+
+**一句话：协作的账留在这里，干活的产物留在项目里。**
+
+| 东西 | 放哪 |
+| --- | --- |
+| 群聊记录（`room/`）、任务卡、计划、验收证据、复核结论、报告（`tasks/<ID>/`） | **协作台自己的目录** —— 协作会话记录一律留在这里 |
+| Codex 会话日志、临时文件 | 本仓库 `.codex-home/`、工作区 `.tmp/`（通过 `CODEX_HOME`、`TEMP`/`TMP` 重定向，不写 C 盘用户目录） |
+| 被改的代码、新建的文件、测试 | **任务卡 `workspace` 指向的项目目录**（`new --workspace`，例如 `E:\my-project`） |
+
+也就是说，让它去改一个业务项目时：
+
+- 群里聊了什么、下了什么判断、验收怎么过的 → 全在协作台的 `tasks/`、`room/`
+- 业务代码怎么改的 → 全在那个项目的目录里，协作台一个字节都不动
+
+**这条有硬约束兜底**：`verify` 会检查协作仓库有没有出现 `tasks/` `room/` 之外的改动；
+一旦执行者把代码写进协作仓库，验收直接判 **FAIL**，不会悄悄混过去。
+
+`.codex-home/` 故意**不按项目各放一份**：Codex 会在 home 里塞插件缓存和 sandbox 二进制，
+实测一份约 450MB，每个项目复制一份是纯浪费。用 `AGENT_CODEX_HOME` 可以改位置。
+
+## 目录结构
+
+```
+agent_team/codex_bridge.py  执行者桥：定位 codex.exe、超时、产物落盘
+agent_team/team.py          协议 CLI：建卡 / 派发 / 验收 / 总览 / 报告
+agent_team/worker.py        引擎：认领消息、群聊大脑、流水线、阶段推进
+tasks/<任务ID>/             task.json、plan.md、prompt-NN.md、exec-NN.*、verify-NN.txt、
+                            verdict-NN.md、review-NN.last.md、handoff.md、report.md
+```
+
+## 一轮协作怎么走
+
+```powershell
+# 1. 大脑建任务卡（验收标准要能判真假，验收命令要能跑）
+python bin/team.py new --title "..." --goal "..." `
+  --acceptance "可验收判据" --verify "python -m unittest discover -s tests -t . -v" `
+  --scope tools/ --scope tests/
+
+# 2. 大脑把计划写进 tasks/<ID>/plan.md，然后派给 Codex
+python bin/team.py dispatch -t <ID>
+
+# 3. 大脑在沙箱外跑验收（Codex 自述不算数）
+python bin/team.py verify -t <ID>
+
+# 4. 复核者只读审查本轮 diff（换一个模型，换视角）
+python bin/team.py review -t <ID>
+
+# 5. 不通过就写 tasks/<ID>/verdict-NN.md（结论只能三选一），重复 2–3
+python bin/team.py report -t <ID>
+```
+
+- 状态机：`planned → executed → failed/passed`，超轮次自动 `stopped`（默认最多 3 轮）。
+- `verdict-NN.md` 的结论只有三种：`pass` / `repair`（给一条可执行的修复指令）/ `stop`（必须找人）。
+- `task.json` 里 `scope` 是执行者唯一允许改的路径；`acceptance` 是验收判据；`verify` 是验收命令。
+
+## 三个角色
+
+| 角色 | 谁 | 干什么 | 约束 |
+| --- | --- | --- | --- |
+| 大脑 | 我（DeepSeek，DSH 会话） | 拆任务、写计划、跑验收、判通过或返工 | 不写业务代码 |
+| 执行者 | Codex（默认 `gpt-6.1-terra` / `low`，可改） | 只在一个任务卡范围内改代码 | `workspace-write` 沙箱，只准动 `scope` |
+| 复核者 | Codex（默认 `gpt-6-luna` / `low`，可改） | 只读审查 `git diff`，专挑"测试假通过"和越界改动 | `read-only` 沙箱，不许改文件 |
+
+复核契约写在 `agents/reviewer.md`，输出只有 `PASS` 或 `NEEDS_FIX` 两种结论，必须给出具体位置。
+
+> 复核者的已知短板：它的只读沙箱跑不了 `tempfile`，所以测试永远由大脑在沙箱外跑，复核者只能靠读代码判断。这也是为什么"复核 PASS"不能替代"验收 PASS"。
+
+## 设计上的几条硬规矩
+
+1. **决策与执行分离**：大脑不替执行者写业务代码，执行者不改验收标准。
+2. **只看证据**：判定依据是验收命令退出码、真实输出、`git diff`，不采信执行者的"我改好了"。
+3. **一轮一个修复目标**：同时改多处无法归因。
+4. **执行者沙箱内自检受限就如实说**：Codex 的沙箱里 `tempfile` 会 `WinError 5`，所以验收一律由大脑在沙箱外跑；执行者不许用 `SkipTest`、放宽断言来"过"。
+5. **桥接把 `TEMP/TMP` 指到工作区 `.tmp`**，尽量让执行者的测试能跑（这台机器上 Codex 仍受沙箱限制，故以大脑验收为准）。
+
+## 执行者模型与实测开销
+
+默认配置在 `config/team.json`：
+
+| 项 | 值 |
+| --- | --- |
+| model | 默认 `gpt-6.1-terra`（示例值，换成你账号下可用的模型即可） |
+| reasoning_effort | `low`（小任务默认；大任务用 `new --effort medium` 写进任务卡，或 `dispatch --effort medium`） |
+| timeout | 900s |
+| sandbox | `workspace-write` |
+
+换模型或档位有三层，按优先级：`dispatch` 命令行参数 → 任务卡里的 `executor: {model, effort}`（`new --model/--effort` 写入）→ `config/team.json`；环境变量 `EXECUTOR_MODEL` / `EXECUTOR_EFFORT` 会覆盖配置文件里的默认值。
+每轮消耗的 tokens 会自动从 Codex 会话日志读回、写进 `task.json` 的 `rounds[].tokens`。
+
+三次任务实测（任务量级不同，只能当参考，不是严格 A/B）：
+
+| 任务 | 执行者 | 轮次 | 总耗时 | 总 tokens |
+| --- | --- | --- | --- | --- |
+| 示例 A：从零实现一个小工具 | 复核模型（medium） | 3 | 265s | ≈107 万 |
+| 示例 B：给工具加两个参数 | 执行模型（medium） | 3 | 547s | ≈100 万 |
+| 示例 C：小改动 | 执行模型（low） | 1 | **213s** | **45.7 万** |
+
+观察：小改动用 terra/low 一轮就通过（213s / 45.7 万 tokens），返工成本低于 terra/medium 的多轮；terra/medium 在这台机器上明显更慢（226s / 113s / 208s），token 量与 luna 接近。真正的"性价比"取决于订阅额度权重——本地看不到，只能对比桌面端 Settings → Usage 的剩余变化。
+
+## 已知限制
+
+- 单机、单工作区、串行执行；没有并发调度。
+- 单轮耗时取决于模型和推理档：不同模型的耗时差别很大，实测 85–230s 不等；超时默认 900s，长任务自己调 `--timeout`。
+- 执行者换模型：`config/team.json`、`dispatch --model <id>`、或 `EXECUTOR_MODEL` 环境变量。
+- 这套协作**不依赖**特定 Agent 框架：核心是"共享工作区 + 无头 CLI + 验收闸门"，任何能跑命令行的 Agent 都能接进来。
