@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_team import procs, start_all, worker
 
@@ -110,9 +111,9 @@ class HeartbeatThreadTests(unittest.TestCase):
         worker.start_heartbeat(interval=0.05)
         try:
             time.sleep(0.12)
-            first = json.loads(worker.LOCK.read_text(encoding="utf-8"))["beat"]
+            first = procs.read_lock(worker.LOCK)["beat"]
             time.sleep(0.4)          # 主循环在这段时间里什么都不做
-            second = json.loads(worker.LOCK.read_text(encoding="utf-8"))["beat"]
+            second = procs.read_lock(worker.LOCK)["beat"]
         finally:
             worker.stop_heartbeat()
         self.assertGreater(second, first, "心跳应该在后台上继续刷新")
@@ -174,3 +175,88 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReadLockRetryTests(unittest.TestCase):
+    """Windows 上 os.replace 的瞬间读文件会 PermissionError，必须重试而不是当成没引擎。"""
+
+    def test_missing_file_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(procs.read_lock(Path(tmp) / "nope.lock"), {})
+
+    def test_transient_permission_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "worker.lock"
+            lock.write_text(json.dumps({"pid": 1, "beat": 2.0}), encoding="utf-8")
+            calls = {"n": 0}
+            real = Path.read_text
+
+            def flaky(self, *args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] <= 3:
+                    raise PermissionError(13, "sharing violation")
+                return real(self, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", flaky):
+                data = procs.read_lock(lock)
+            self.assertEqual(data.get("pid"), 1, "重试后应该读到内容")
+            self.assertGreaterEqual(calls["n"], 4, "应该重试过")
+
+    def test_persistent_error_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "worker.lock"
+            lock.write_text("{}", encoding="utf-8")
+
+            def always(self, *args, **kwargs):
+                raise PermissionError(13, "sharing violation")
+
+            started = time.time()
+            with mock.patch.object(Path, "read_text", always):
+                data = procs.read_lock(lock)
+            self.assertEqual(data, {})
+            self.assertLess(time.time() - started, 1.0, "重试不能把调用方拖住")
+
+    def test_broken_json_returns_empty_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / "worker.lock"
+            lock.write_text("{not json", encoding="utf-8")
+            self.assertEqual(procs.read_lock(lock), {})
+
+class ConcurrentBeatTests(unittest.TestCase):
+    """心跳线程和主循环都会 beat：并发写不能把锁文件写坏。"""
+
+    def test_concurrent_beats_keep_file_parseable(self) -> None:
+        import threading as _threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = (worker.LOCK, worker.ROOM)
+            worker.LOCK = Path(tmp) / "worker.lock"
+            worker.ROOM = Path(tmp)
+            try:
+                errors = []
+                stop = _threading.Event()
+
+                def writer() -> None:
+                    for _ in range(60):
+                        if stop.is_set():
+                            return
+                        worker.beat()
+
+                def reader() -> None:
+                    for _ in range(120):
+                        data = procs.read_lock(worker.LOCK)
+                        # 允许读到空（替换瞬间），但不允许读到半截
+                        if data and data.get("pid") != os.getpid():
+                            errors.append(data)
+
+                threads = [_threading.Thread(target=writer) for _ in range(4)]
+                threads.append(_threading.Thread(target=reader))
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+                stop.set()
+                self.assertEqual(errors, [], "并发写不能写出别人的 pid")
+                final = procs.read_lock(worker.LOCK)
+                self.assertEqual(final.get("pid"), os.getpid())
+            finally:
+                worker.LOCK, worker.ROOM = saved

@@ -182,14 +182,21 @@ def take_lock() -> bool:
 
 
 def beat() -> None:
-    """原子写心跳：网页每 1.5 秒读一次，不能让它读到写了一半的文件。"""
-    tmp = LOCK.with_suffix(".lock.tmp")
+    """原子写心跳：网页每 1.5 秒读一次，不能让它读到写了一半的文件。
+
+    临时文件名带线程 id：心跳线程和主循环都会 beat，共用一个 tmp 会互相截断，
+    偶尔写出半截 JSON，网页就会有一次读到空、把引擎显示成"没在跑"。
+    """
+    tmp = LOCK.parent / f".{LOCK.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         tmp.write_text(json.dumps({"pid": os.getpid(), "beat": time.time(), "root": str(ROOT)}),
                        encoding="utf-8")
         os.replace(tmp, LOCK)
     except OSError:
-        pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 _heartbeat_stop = threading.Event()

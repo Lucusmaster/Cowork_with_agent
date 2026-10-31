@@ -52,14 +52,32 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
+_READ_RETRIES = 6
+
+
 def read_lock(path: Path) -> dict:
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+    """读锁文件；文件不存在就是没有引擎，返回空。
+
+    Windows 上 `os.replace` 的瞬间，目标文件会短暂处于 delete-pending 状态，
+    这时 `open()` 会拿到 `PermissionError`（sharing violation）。心跳每 10 秒重写一次，
+    网页每 1.5 秒读一次，撞上就把引擎误判成"没在跑"，所以这里对 OSError 重试几轮
+    （总计 ~150ms，失败就返回空，不影响正常路径）。
+    """
+    path = Path(path)
+    for attempt in range(_READ_RETRIES):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return {}
-        return data
-    except (OSError, json.JSONDecodeError):
-        return {}
+        except json.JSONDecodeError:
+            return {}
+        except OSError:
+            if attempt == _READ_RETRIES - 1:
+                return {}
+            time.sleep(0.005 * (attempt + 1))
+            continue
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 def lock_state(path: Path, heartbeat_timeout: float = HEARTBEAT_TIMEOUT) -> dict:

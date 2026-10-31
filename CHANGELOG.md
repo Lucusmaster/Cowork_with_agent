@@ -1,3 +1,27 @@
+## 0.9.4 — 修 CI 在 Windows/py3.12 上的偶发 PermissionError
+
+推送 0.9.3 后 CI 红了：windows-latest · py3.12 的 	est_heartbeat_keeps_beating_while_main_loop_is_blocked
+报 PermissionError: [Errno 13] worker.lock。另外三个 job 都过，是 Windows 特有的竞态，不是测试写错。
+
+### 根因
+Windows 上 os.replace 替换目标文件的瞬间，目标会短暂处于 **delete-pending** 状态；此时 open()
+拿到的是 sharing violation（PermissionError）。心跳线程每 10 秒重写一次 worker.lock，网页每 1.5 秒
+读一次，撞上就出错。
+
+这不是测试挑刺——**生产路径上它会让界面把在跑的引擎显示成没在跑**，控制按钮全灰一次轮询。
+
+### 修了两处
+1. procs.read_lock()：对 OSError 重试 6 次（累计 ~150ms），文件不存在或 JSON 坏行仍然立即返回空；
+2. worker.beat()：临时文件名带上 pid + 线程 id。心跳线程和主循环都会 eat()，共用一个
+   worker.lock.tmp 会互相截断，偶尔写出半截 JSON（读者看到空 → 又是一次误判）。
+
+### 测试
+- 新增 5 项：ReadLockRetryTests（不存在直接返回、瞬时 PermissionError 重试成功、持续失败 ~150ms 内返回空、
+  坏 JSON 不重试）、ConcurrentBeatTests（4 写 1 读并发 60 轮，锁文件始终可解析、pid 正确）；
+- 心跳用例改走公开的 procs.read_lock，顺带覆盖重试路径；
+- **295 项全绿**（3.14 本机 + 3.11 py），心跳/并发 5 个用例连跑 30 轮 0 失败；
+uff 干净。
+
 ## 0.9.3 — 会话能归档、能删了
 
 用户：「删除会话，归档等功能呢」。之前左栏只能切换会话，删不掉也收不起来，会话会一直堆着。
