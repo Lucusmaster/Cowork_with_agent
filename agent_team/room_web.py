@@ -3465,37 +3465,53 @@ def _shutdown(reason: str) -> None:
     os._exit(0)
 
 
+def _guardian_trigger(idle_limit: float, grace: float,
+                      now: float | None = None) -> str:
+    """该不该收工？返回原因文本，空串表示继续跑。
+
+    - 页面发了 bye（关标签/关窗口）且过了 grace：立刻走，给刷新留缓冲；
+    - 没有 bye 但心跳断太久（浏览器崩溃、断电、网络断）：靠 idle_limit 兜底；
+    - 从没人打开过页面：不擅自关（命令行起的服务不该自己死）。
+    """
+    if not PRESENCE["ever"]:
+        return ""
+    now = time.time() if now is None else now
+    idle = now - PRESENCE["last_seen"]
+    bye = PRESENCE["bye_at"]
+    if bye and (now - bye) >= grace and idle >= grace:
+        return "网页已关闭"
+    if idle >= idle_limit:
+        return "网页已关闭（长时间没有心跳）"
+    return ""
+
+
+def _guardian_tick(idle_limit: float, grace: float) -> str:
+    """跑一次判定：有任务在跑就再等等（只提示一次），返回要收工的原因。"""
+    trigger = _guardian_trigger(idle_limit, grace)
+    if not trigger:
+        return ""
+    pending = _active_tasks()
+    if pending:
+        if not PRESENCE.get("deferred"):
+            PRESENCE["deferred"] = True
+            try:
+                if room is not None:
+                    room.post("system",
+                              f"还有 {len(pending)} 个任务在跑，干完再收工（网页已经关了也不打断）",
+                              "event", {"phase": "collab", "state": "ok", "actor": "deepseek"})
+            except Exception:  # noqa: BLE001
+                pass
+        return ""              # 任务没结束，先不收工
+    return trigger
+
+
 def _guardian(idle_limit: float, grace: float) -> None:
     """没人看着就收工：关页面立刻走（有 grace 缓冲），崩溃/强杀靠超时兜底。"""
     while True:
         time.sleep(1.5)
-        if not PRESENCE["ever"]:
-            continue          # 从没人打开过页面，不擅自关
-        now = time.time()
-        idle = now - PRESENCE["last_seen"]
-        bye = PRESENCE["bye_at"]
-        trigger = ""
-        if bye and (now - bye) >= grace and idle >= grace:
-            trigger = "网页已关闭"
-        elif idle >= idle_limit:
-            trigger = "网页已关闭（长时间没有心跳）"
-        if not trigger:
-            continue
-
-        pending = _active_tasks()
-        if pending:
-            if not PRESENCE.get("deferred"):
-                PRESENCE["deferred"] = True
-                try:
-                    if room is not None:
-                        room.post("system",
-                                  f"还有 {len(pending)} 个任务在跑，干完再收工（网页已经关了也不打断）",
-                                  "event", {"phase": "collab", "state": "ok", "actor": "deepseek"})
-                except Exception:  # noqa: BLE001
-                    pass
-            continue          # 任务没结束，先不收工
-
-        _shutdown(trigger)
+        trigger = _guardian_tick(idle_limit, grace)
+        if trigger:
+            _shutdown(trigger)
 
 
 class Handler(BaseHTTPRequestHandler):
