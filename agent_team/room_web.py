@@ -25,7 +25,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
@@ -70,6 +70,20 @@ MAX_PAGE = 500
 
 # 访问令牌：启动时由 _ensure_token() 填。为空表示"没启用令牌"（安全兜底，不把人锁在外面）。
 TOKEN = ""
+
+# 凭证模型：Cookie 是主凭证（浏览器自动带），X-Team-Token 留给 CLI/测试/doctor。
+# ?token= 只在 GET / 引导时用一次，校验通过就 302 到干净地址并把令牌种进 Cookie。
+COOKIE_NAME = "team_token"
+COOKIE_MAX_AGE = 30 * 24 * 3600          # 30 天
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+SAFE_FETCH_SITES = frozenset({"same-origin", "none"})   # curl/CLI 没有这个头，走 Origin 那步
+UNLOCK_WINDOW = 60.0                     # /api/unlock 失败计数的滑动窗口（秒）
+UNLOCK_MAX_FAILS = 5                     # 窗口内失败到这个数就 429
+
+# /api/unlock 的失败计数：只放内存，进程重启就清空（别落盘，免得把令牌写进文件）。
+UNLOCK_FAILS: dict[str, list[float]] = {}
+UNLOCK_LOCK = threading.Lock()
 
 # 网页在线状态：页面每次轮询都会刷新 last_seen，关页面时尽力发一次 bye。
 PRESENCE = {"last_seen": 0.0, "bye_at": 0.0, "ever": False, "deferred": False}
@@ -1425,8 +1439,8 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
   <div class="unlock-card">
     <div class="unlock-mark">协</div>
     <h2>需要访问令牌</h2>
-    <p>协作台只给本机用。把启动时打印的链接里的 token 复制过来，或者直接粘贴
-      <span class="mono">room/web-token</span> 文件里的内容。</p>
+    <p>协作台只给本机用。把 <span class="mono">room/web-token</span> 里的内容粘贴进来，
+      或者用启动时打印的那个一次性链接打开一次（打开后浏览器会记住，链接本身不再需要）。</p>
     <input id="unlock-input" spellcheck="false" autocomplete="off" placeholder="粘贴访问令牌">
     <button id="unlock-btn">进入工作台</button>
     <div class="unlock-err" id="unlock-err"></div>
@@ -1436,19 +1450,12 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
 <script>
 const AGENTS = __AGENTS__;
 const STATUS_LABEL = __STATUS_LABEL__;
-const TOKEN = __TOKEN__;                       // 服务端只在带了有效令牌时才注入，否则是 ""
 const ROLES = ['coordinator','planner','executor','tester','reviewer'];
 const ALIAS = {deepseek:'coordinator', brain:'coordinator', codex:'executor', relay:'user'};
 const CTRL_LABEL = {pause:'暂停', resume:'继续', stop:'停止', approve:'批准', rerun:'重新执行'};
 const STAGE_LABEL = {plan:'规划', dispatch:'执行', execute:'执行', exec:'执行',
   verify:'验收', review:'复核', approve:'等你批准', report:'报告'};
-const TOKEN_KEY = 'team-token';
 
-/* 令牌三种来源：链接里带来的（服务端验证通过才会注入）、localStorage 里存的、URL 上的 ?token=。 */
-const injectedToken = String(TOKEN || '').trim();
-const storedToken = (() => { try { return String(localStorage.getItem(TOKEN_KEY) || '').trim(); } catch(e){ return ''; } })();
-const urlToken = (() => { try { return String(new URLSearchParams(location.search).get('token') || '').trim(); } catch(e){ return ''; } })();
-let ACTIVE_TOKEN = injectedToken || storedToken || urlToken;
 let controlCooldown = 0;
 
 const $ = id => document.getElementById(id);
@@ -1493,23 +1500,7 @@ function timeLabel(s){
   return String(s).slice(5, 10);
 }
 
-/* ---------- 令牌与请求封装 ---------- */
-function rememberToken(value){
-  if(!value) return;
-  try { localStorage.setItem(TOKEN_KEY, value); } catch(e){}
-}
-
-function withToken(url){
-  if(!ACTIVE_TOKEN) return url;
-  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(ACTIVE_TOKEN);
-}
-
-function tokenHeaders(extra){
-  const h = Object.assign({'Content-Type': 'application/json'}, extra || {});
-  if(ACTIVE_TOKEN) h['X-Team-Token'] = ACTIVE_TOKEN;
-  return h;
-}
-
+/* ---------- 请求封装：凭证走 Cookie（浏览器自动带），URL 里不出现令牌 ---------- */
 function showUnlock(message){
   document.body.classList.remove('ready');
   unlockEl.hidden = false;
@@ -1517,10 +1508,12 @@ function showUnlock(message){
   try { unlockInput.focus(); } catch(e){}
 }
 
+const API_HEADERS = {'Content-Type': 'application/json'};
+
 async function apiGet(url){
   try{
-    const res = await fetch(url, {cache: 'no-store', headers: tokenHeaders()});
-    if(res.status === 401){ showUnlock('访问令牌不对，重新粘贴一次'); return null; }
+    const res = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+    if(res.status === 401){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return null; }
     if(!res.ok) return null;
     return await res.json();
   }catch(e){ return null; }
@@ -1528,9 +1521,11 @@ async function apiGet(url){
 
 async function apiPost(url, body){
   try{
-    const res = await fetch(url, {method: 'POST', headers: tokenHeaders(),
-      body: JSON.stringify(body || {})});
-    if(res.status === 401){ showUnlock('访问令牌不对，重新粘贴一次'); return null; }
+    const res = await fetch(url, {method: 'POST', credentials: 'same-origin',
+      headers: API_HEADERS, body: JSON.stringify(body || {})});
+    if(res.status === 401){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return null; }
+    if(res.status === 403) return {ok: false, error: '这个页面来源不被信任，刷新一下再试'};
+    if(res.status === 415) return {ok: false, error: '请求格式不对（服务端只收 JSON）'};
     return await res.json().catch(() => ({ok: false, error: '服务端返回异常'}));
   }catch(e){ return {ok: false, error: '网络异常'}; }
 }
@@ -2287,23 +2282,29 @@ function tick(){
   lastClock += 1;
 }
 
-/* ---------- 启动：有令牌才进工作台，没有就先让用户粘贴 ---------- */
-function submitUnlock(){
+/* ---------- 启动：有 Cookie 就进工作台，没有就先让用户粘贴（POST /api/unlock 换 Cookie） ---------- */
+async function submitUnlock(){
   const value = String(unlockInput.value || '').trim();
   if(!value){ unlockErr.textContent = '先粘贴访问令牌'; return; }
-  rememberToken(value);
-  unlockInput.value = '';
+  unlockBtn.disabled = true;
   unlockErr.textContent = '';
-  location.reload();          // 刷新一次，让页面按新令牌重新拉状态
+  const data = await apiPost('/api/unlock', {token: value});
+  unlockBtn.disabled = false;
+  if(!data){ unlockErr.textContent = '服务没响应，稍后再试'; return; }
+  if(!data.ok){ unlockErr.textContent = data.error || '令牌不对'; return; }
+  unlockInput.value = '';
+  location.reload();          // Cookie 已经种下，刷新一次直接进工作台
 }
 
-function startWorkbench(){
-  rememberToken(ACTIVE_TOKEN);
+async function startWorkbench(){
+  const data = await load();
+  if(!data){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return; }
   unlockEl.hidden = true;
   document.body.classList.add('ready');
   autosize();
-  load();
-  setInterval(tick, 1000);
+  if(!startWorkbench.timer){
+    startWorkbench.timer = setInterval(tick, 1000);
+  }
   input.focus();
 }
 
@@ -2312,17 +2313,18 @@ unlockInput.addEventListener('keydown', e => {
   if(e.key === 'Enter'){ e.preventDefault(); submitUnlock(); }
 });
 
-if(ACTIVE_TOKEN) startWorkbench(); else showUnlock('');
+unlockErr.textContent = __UNLOCK_MSG__;
+startWorkbench();
 
 /* 页面开着就一直在（每秒打一次 /api/state，服务端据此判断在线）。
-   关页面/关标签页时尽力发一次告别；sendBeacon 不能带头，所以令牌放 URL 上。 */
+   关页面/关标签页时尽力发一次告别；凭证在 Cookie 里，beacon 同源会自动带上。 */
 function sayBye(){
   try{
     const body = JSON.stringify({reason: 'page-unloaded'});
     if(navigator.sendBeacon){
-      navigator.sendBeacon(withToken('/api/bye'), new Blob([body], {type: 'application/json'}));
+      navigator.sendBeacon('/api/bye', new Blob([body], {type: 'application/json'}));
     } else {
-      fetch(withToken('/api/bye'), {method:'POST', body, headers: tokenHeaders(), keepalive: true});
+      fetch('/api/bye', {method:'POST', body, headers: API_HEADERS, credentials:'same-origin', keepalive: true});
     }
   }catch(e){}
 }
@@ -2471,9 +2473,32 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, payload, code: int = 200) -> None:
+        self._drain_body()
         self._send(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
+    def _drain_body(self) -> None:
+        """拒绝写请求前先把请求体读掉。
+
+        Windows 上带着没读完的 body 关连接会 RST，客户端连 401/403 都收不到。
+        """
+        if getattr(self, "_body_done", False):
+            return
+        self._body_done = True
+        if self.command not in WRITE_METHODS:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 2_000_000:
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:
+            pass
+
     def _body(self) -> dict | None:
+        self._body_done = True
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -2497,18 +2522,27 @@ class Handler(BaseHTTPRequestHandler):
         PRESENCE["bye_at"] = 0.0        # 刷新页面会重新发请求，撤销关闭标记
         PRESENCE["deferred"] = False
 
-    # ---------- 访问令牌 ----------
-    def _supplied_token(self, qs: dict) -> str:
-        """令牌两种带法都认：请求头 X-Team-Token，或 URL 上的 ?token=。"""
-        header = (self.headers.get("X-Team-Token") or "").strip()
-        if header:
-            return header
-        return str((qs.get("token") or [""])[0]).strip()
+    # ---------- 凭证：Cookie 优先，其次请求头；URL 上的 token 在 /api/* 一律不认 ----------
+    def _cookies(self) -> dict[str, str]:
+        raw = self.headers.get("Cookie") or ""
+        jar: dict[str, str] = {}
+        for part in raw.split(";"):
+            name, _, value = part.partition("=")
+            name = name.strip()
+            if name:
+                jar[name] = value.strip()
+        return jar
 
-    def _authorized(self, qs: dict) -> bool:
+    def _cookie_token(self) -> str:
+        return self._cookies().get(COOKIE_NAME, "").strip()
+
+    def _header_token(self) -> str:
+        return (self.headers.get("X-Team-Token") or "").strip()
+
+    @staticmethod
+    def _token_matches(supplied: str) -> bool:
         if not TOKEN:
-            return True                     # 没启用令牌（比如令牌文件写不进去）就别拦人
-        supplied = self._supplied_token(qs)
+            return True                     # 没启用令牌（令牌文件写不进去）就别拦人
         if not supplied:
             return False
         try:
@@ -2516,14 +2550,86 @@ class Handler(BaseHTTPRequestHandler):
         except TypeError:                   # 极端情况下类型不一致
             return supplied == TOKEN
 
-    def _guard(self, parsed, qs: dict) -> bool:
-        """除 /api/alive 外的所有 /api/* 都要令牌；通过了返回 True。"""
-        if not parsed.path.startswith("/api/") or parsed.path == "/api/alive":
+    def _authorized(self) -> bool:
+        """Cookie 或请求头任一对就算过；URL 上的 ?token= 不参与。"""
+        if not TOKEN:
             return True
-        if self._authorized(qs):
+        return any(self._token_matches(t) for t in (self._cookie_token(), self._header_token()) if t)
+
+    def _cookie_header(self) -> str:
+        """Cookie 属性只在这里拼一次：HttpOnly + SameSite=Strict + Path=/。"""
+        return (f"{COOKIE_NAME}={TOKEN}; Path=/; HttpOnly; SameSite=Strict; "
+                f"Max-Age={COOKIE_MAX_AGE}")
+
+    def _set_cookie(self) -> None:
+        """下发凭证的唯一出口：302 引导和 /api/unlock 都走它，别处不许再 send_header。"""
+        if TOKEN:
+            self.send_header("Set-Cookie", self._cookie_header())
+
+    def _guard(self, parsed, qs: dict) -> bool:
+        """除 /api/alive 外所有 /api/* 都要凭证；URL 里带 token 的直接拒（挡历史书签/Referer）。"""
+        if not parsed.path.startswith("/api/"):
+            return True
+        if "token" in qs:
+            self._json({"ok": False,
+                        "error": "令牌不能放在 URL 里：只在首次打开时用 ?token= 引导，之后靠 Cookie"}, 401)
+            return False
+        if parsed.path == "/api/alive":
+            return True
+        if self._authorized():
             return True
         self._json({"ok": False, "error": "需要访问令牌"}, 401)
         return False
+
+    # ---------- 写操作：CSRF/Origin + 只收 JSON ----------
+    def _csrf_problem(self) -> str:
+        """Sec-Fetch-Site → Origin → 都没有就放行（非浏览器客户端）。"""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site:
+            return "" if site in SAFE_FETCH_SITES else "跨站请求被拒绝"
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return ""
+        try:
+            bits = urlparse(origin)
+        except ValueError:
+            return "跨站请求被拒绝"
+        if bits.scheme not in ("http", "https"):
+            return "跨站请求被拒绝"
+        if (bits.hostname or "").lower() not in LOOPBACK_HOSTS:
+            return "跨站请求被拒绝"
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host or bits.netloc.lower() != host:
+            return "跨站请求被拒绝"          # Origin 的端口必须和这次请求的 Host 一致
+        return ""
+
+    def _write_guard(self, path: str) -> bool:
+        if not path.startswith("/api/"):
+            return True
+        problem = self._csrf_problem()
+        if problem:
+            self._json({"ok": False, "error": problem}, 403)
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._json({"ok": False, "error": "只接受 JSON"}, 415)
+            return False
+        return True
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self._set_cookie()
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _page_html(self, unlock_msg: str = "") -> bytes:
+        page = (PAGE
+                .replace("__UNLOCK_MSG__", json.dumps(unlock_msg, ensure_ascii=False))
+                .replace("__AGENTS__", json.dumps(AGENTS, ensure_ascii=False))
+                .replace("__STATUS_LABEL__", json.dumps(STATUS_LABEL, ensure_ascii=False)))
+        return page.encode("utf-8")
 
     # ---------- GET ----------
     def do_GET(self) -> None:           # noqa: N802
@@ -2536,13 +2642,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path in ("/", "/index.html"):
-            # 带了有效的令牌才把令牌注入页面；没带就注入空串，页面自己弹"输入令牌"卡片。
-            page_token = TOKEN if (TOKEN and self._authorized(qs)) else ""
-            page = (PAGE
-                    .replace("__TOKEN__", json.dumps(page_token))
-                    .replace("__AGENTS__", json.dumps(AGENTS, ensure_ascii=False))
-                    .replace("__STATUS_LABEL__", json.dumps(STATUS_LABEL, ensure_ascii=False)))
-            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+            # ?token= 只在这里用一次：对了就 302 到去掉 token 的同一路径 + 种 Cookie
+            if "token" in qs:
+                supplied = str((qs.get("token") or [""])[0]).strip()
+                if self._token_matches(supplied):
+                    rest = {k: v for k, v in qs.items() if k != "token"}
+                    clean = urlencode(rest, doseq=True)
+                    self._redirect(parsed.path + (("?" + clean) if clean else ""))
+                    return
+                self._send(401, self._page_html("令牌不对，重新粘贴一次"),
+                           "text/html; charset=utf-8")
+                return
+            self._send(200, self._page_html(), "text/html; charset=utf-8")
             return
 
         if not self._guard(parsed, qs):
@@ -2623,7 +2734,12 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self) -> None:
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+        if parsed.path == "/api/unlock":
+            self._post_unlock()
+            return
         if not self._guard(parsed, qs):
+            return
+        if not self._write_guard(parsed.path):
             return
         if parsed.path == "/api/bye":
             PRESENCE["bye_at"] = time.time()
@@ -2650,6 +2766,80 @@ class Handler(BaseHTTPRequestHandler):
             self._post_select(body)
             return
         self._json({"ok": False, "error": "接口不存在"}, 404)
+
+    # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
+    def _client_ip(self) -> str:
+        try:
+            return str(self.client_address[0])
+        except (IndexError, TypeError):
+            return "-"
+
+    def _unlock_limited(self, ip: str) -> bool:
+        now = time.time()
+        with UNLOCK_LOCK:
+            recent = [t for t in UNLOCK_FAILS.get(ip, []) if now - t < UNLOCK_WINDOW]
+            if recent:
+                UNLOCK_FAILS[ip] = recent
+            else:
+                UNLOCK_FAILS.pop(ip, None)
+        return len(recent) >= UNLOCK_MAX_FAILS
+
+    def _unlock_failed(self, ip: str) -> None:
+        now = time.time()
+        with UNLOCK_LOCK:
+            recent = [t for t in UNLOCK_FAILS.get(ip, []) if now - t < UNLOCK_WINDOW]
+            recent.append(now)
+            UNLOCK_FAILS[ip] = recent
+
+    def _unlock_ok(self, ip: str) -> None:
+        with UNLOCK_LOCK:
+            UNLOCK_FAILS.pop(ip, None)
+
+    def _post_unlock(self) -> None:
+        """换取 Cookie：不需要旧凭证，但同样过 CSRF + JSON 校验，并按来源 IP 限流。"""
+        qs = parse_qs(urlparse(self.path).query)
+        if "token" in qs:                   # 令牌只能放 body 里，URL 一律不认
+            self._json({"ok": False,
+                        "error": "令牌不要放在 URL 里，请粘贴到解锁框（走请求体）"}, 401)
+            return
+        ip = self._client_ip()
+        if self._unlock_limited(ip):
+            self._json({"ok": False, "error": "试太多次了，等一分钟再试"}, 429)
+            return
+        if not self._write_guard("/api/unlock"):
+            return
+        body = self._body()
+        if body is None:
+            return
+        supplied = str(body.get("token") or "").strip()
+        if TOKEN and not self._token_matches(supplied):
+            self._unlock_failed(ip)
+            self._json({"ok": False, "error": "令牌不对"}, 401)
+            return
+        self._unlock_ok(ip)
+        payload = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self._set_cookie()
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ---------- 其他写方法：没有对应接口，但照样先过校验再拒 ----------
+    def _other_write(self) -> None:
+        parsed = urlparse(self.path)
+        if not self._guard(parsed, parse_qs(parsed.query)):
+            return
+        if not self._write_guard(parsed.path):
+            return
+        self._json({"ok": False, "error": "接口不存在"}, 404)
+
+    def do_PUT(self) -> None:            # noqa: N802
+        self._other_write()
+
+    do_PATCH = do_PUT
+    do_DELETE = do_PUT
 
     def _post_control(self, body: dict) -> None:
         """网页上的 暂停/继续/停止/批准/重新执行：写一条指令，引擎在步骤边界消费。"""
@@ -2776,7 +2966,8 @@ def main() -> int:
 
     global TOKEN
     TOKEN = _ensure_token()
-    token_note = "链接里的 token 不要外传" if TOKEN else "令牌文件写不进去，本次不启用令牌"
+    token_note = ("链接只能用一次，打开后浏览器会记住；别外传"
+                  if TOKEN else "令牌文件写不进去，本次不启用令牌")
 
     autostop = not args.no_autostop and os.environ.get("AGENT_TEAM_AUTOSTOP", "1") != "0"
     _write_session_state("running")
@@ -2785,7 +2976,7 @@ def main() -> int:
                          daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"协作台: http://{args.host}:{args.port}/?token={TOKEN}", flush=True)
-    print(f"（{token_note}；直接打开不带 token 的地址会要求粘贴令牌）", flush=True)
+    print(f"（{token_note}；令牌也可以从 room/web-token 粘贴到页面里）", flush=True)
     if STORE.ready:
         print("会话存储：session.py 就绪", flush=True)
     else:

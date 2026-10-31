@@ -1,3 +1,39 @@
+## 0.9.0 — 安全迁移：令牌进 Cookie，URL 不再带令牌
+
+四件事同一轮做完（用户要求：任何一项单独上线都不算完成）。
+
+### 1. Cookie 是主凭证
+- `Set-Cookie: team_token=<32hex>; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`；
+- 下发只有一处（`_set_cookie`），302 引导和 `/api/unlock` 都走它，不会两处各写一套；
+- 鉴权顺序：Cookie → `X-Team-Token` 请求头（CLI/测试/doctor 用）。
+
+### 2. URL 令牌只活一次
+- `GET /?token=<对>` → `302` + `Location` 去掉 token（其余查询参数保留）+ Cookie；
+- 令牌错 → 401 解锁页，**不下发** Cookie；
+- **`/api/*` 带 `?token=` 一律 401**，挡住浏览器历史/书签里的旧链接；
+- 页面 HTML 不再注入令牌；前端删掉 `localStorage`、`withToken()`、`?token=` 拼接，全部改 `credentials: 'same-origin'`。
+
+### 3. CSRF / Origin 校验
+- 写操作（`/api/*` 的 POST/PUT/PATCH/DELETE）按顺序校验：
+  `Sec-Fetch-Site` 只能是 `same-origin`/`none` → 否则看 `Origin`（必须 http(s)、回环地址、netloc 等于本次 `Host`）→ 都没有则放行（非浏览器客户端）；
+- 再加 `Content-Type: application/json` 要求（否则 415），挡住简单表单 CSRF；
+- 修了个真 bug：拒绝写请求时没读掉请求体会让 Windows 上直接 RST，客户端连 401/403 都收不到（新增 `_drain_body`）。
+
+### 4. 解锁接口
+- `POST /api/unlock`：JSON + CSRF 校验，令牌对则种 Cookie；按来源 IP 限流，1 分钟错 5 次 → 429（限流期间令牌对也 429，防枚举）。
+
+### 验证
+- 新增 31 项测试（`tests/test_web_control.py` 47 → 78），全项目 **249 项全绿**、`ruff` 干净；
+- Lead 独立验收脚本 27 项全过（302/Location/Set-Cookie 四属性、错令牌无 Cookie、Cookie 鉴权、URL 令牌被拒、Origin 403、`Sec-Fetch-Site` 403、表单 415、unlock 限流 429、`/api/alive` 免鉴权）；
+- 真实服务手工验证：`curl -i "/?token=..."` → `302 Location: /` + 完整 Cookie；`curl -b jar /api/state` → 200（chat-001）；headless 打开引导链接后 `body class="ready"`、HTML 里令牌出现 **0** 次。
+
+### 已知边界
+- 只支持 `http://127.0.0.1`；Cookie 无 `Secure`（http 下会被丢弃），没有 HTTPS；
+- `SameSite=Strict` 意味着从外站（聊天软件/邮件）点进来的**第一次**导航不带 Cookie——但引导那一刻靠 `?token=` 种 Cookie，落地页的同源 `fetch` 会带上，实测正常；
+- 反向代理会改 `Host`/`Origin`，上反代前必须重审 `_csrf_problem`；
+- 升级前开着的旧标签页会 401，刷新一次即可（旧 JS 还在拼 `?token=`）；
+- **在补 HTTPS 之前不要改绑 `0.0.0.0`。**
+
 ## 0.8.1 — 聊天记录不再丢一段
 
 轮询用 `after=<倒数第 20 条>` 只取新消息，两次轮询之间消息如果超过一页，中间那段会永久缺失。

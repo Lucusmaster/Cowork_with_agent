@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -120,6 +121,7 @@ class WebCase(unittest.TestCase):
         control.CONTROL = room_web.ROOM / "control.json"
         control.PAUSE = room_web.ROOM / "pause.json"
         room_web.ROOM.mkdir(parents=True, exist_ok=True)
+        room_web.UNLOCK_FAILS.clear()      # 限流计数是进程级的，测试之间别互相污染
 
         self.server = room_web.ThreadingHTTPServer(("127.0.0.1", 0), room_web.Handler)
         self.port = int(self.server.server_address[1])
@@ -179,6 +181,35 @@ class WebCase(unittest.TestCase):
         except ValueError:
             return status, raw
 
+    # ---------- 原始请求：不跟随重定向，能看到 302 和 Set-Cookie ----------
+    def raw(self, path: str, method: str = "GET", headers: dict | None = None,
+            body=None, cookie: str = "", ctype: str | None = "application/json"):
+        """用 http.client 直连：返回 (status, headers, body_text)，302 不自动跟。
+
+        ctype=None 表示故意不发 Content-Type（测 415 用）。
+        """
+        hdrs = {k: v for k, v in (headers or {}).items()}
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        if data is not None:
+            if ctype:
+                hdrs.setdefault("Content-Type", ctype)
+            hdrs["Content-Length"] = str(len(data))
+        if cookie:
+            hdrs["Cookie"] = cookie
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(method, path, body=data, headers=hdrs)
+            resp = conn.getresponse()
+            text = resp.read().decode("utf-8", errors="replace")
+            return resp.status, resp.headers, text
+        finally:
+            conn.close()
+
+    def set_cookie_values(self, headers) -> list[str]:
+        return [str(v) for v in (headers.get_all("Set-Cookie") or [])]
+
     # ---------- 伪造引擎状态 ----------
     def write_lock(self, pid: int, age: float) -> None:
         """写一个 worker.lock：pid 用真的（本进程），age 是心跳多少秒前。"""
@@ -221,10 +252,11 @@ class TokenGuardTests(WebCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
 
-    def test_query_token_ok(self) -> None:
+    def test_query_token_rejected_on_api(self) -> None:
+        """旧书签/历史里残留的 ?token= 在 /api/* 上不再受理。"""
         status, data = self.call(f"/api/state?token={self.token}")
-        self.assertEqual(status, 200)
-        self.assertTrue(data["ok"])
+        self.assertEqual(status, 401)
+        self.assertIn("URL", data["error"])
 
     def test_alive_is_exempt(self) -> None:
         status, data = self.call("/api/alive")
@@ -234,25 +266,20 @@ class TokenGuardTests(WebCase):
     def test_html_without_token_shows_unlock_card(self) -> None:
         status, html = self.call("/")
         self.assertEqual(status, 200, "HTML 本身不拦，页面里再让用户贴令牌")
-        self.assertIn('const TOKEN = ""', html)
         self.assertIn("需要访问令牌", html)
         self.assertIn('id="unlock"', html)
-
-    def test_html_injects_valid_token(self) -> None:
-        status, html = self.call(f"/?token={self.token}")
-        self.assertEqual(status, 200)
-        self.assertIn(f'const TOKEN = "{self.token}"', html)
-
-    def test_html_does_not_leak_token_on_bad_link(self) -> None:
-        status, html = self.call("/?token=deadbeef")
-        self.assertEqual(status, 200)
-        self.assertIn('const TOKEN = ""', html)
         self.assertNotIn(self.token, html)
+        self.assertNotIn("const TOKEN", html)
 
-    def test_bye_accepts_query_token(self) -> None:
+    def test_bye_rejects_query_token(self) -> None:
         status, data = self.call(f"/api/bye?token={self.token}", method="POST", body={})
+        self.assertEqual(status, 401)
+
+    def test_bye_accepts_cookie(self) -> None:
+        status, headers, body = self.raw("/api/bye", method="POST", body={},
+                                        cookie=f"team_token={self.token}")
         self.assertEqual(status, 200)
-        self.assertTrue(data["ok"])
+        self.assertTrue(json.loads(body)["ok"])
 
     def test_bye_still_requires_token(self) -> None:
         status, data = self.call("/api/bye", method="POST", body={})
@@ -657,6 +684,249 @@ class GapHealContractTests(WebCase):
         self.assertIsNone(MSG_ID.match(incoming[0]["id"]),
                           "网页的 idNum() 解析不出数字 → findGap() 直接跳过自愈")
         self.assertEqual(cli.pages, 0, "跳过自愈就不会去发 /api/messages 请求")
+
+
+class CookieBootstrapTests(WebCase):
+    """?token= 只在 GET / 引导时用一次：302 到干净地址 + 种 Cookie。"""
+
+    def test_bootstrap_redirects_and_sets_cookie(self) -> None:
+        status, headers, body = self.raw(f"/?token={self.token}")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/", "Location 必须是去掉 token 的干净地址")
+        cookies = self.set_cookie_values(headers)
+        self.assertEqual(len(cookies), 1, f"只该有一条 Set-Cookie，实际 {cookies}")
+        cookie = cookies[0]
+        self.assertIn(f"team_token={self.token}", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertIn("Max-Age=2592000", cookie)
+        self.assertNotIn(self.token, body)
+        self.assertEqual(body, "")
+
+    def test_bootstrap_keeps_other_query_params(self) -> None:
+        """其它查询参数要留下（比如 ?token=..&session=chat-a）。"""
+        status, headers, _ = self.raw(f"/?token={self.token}&session=chat-a")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/?session=chat-a")
+        self.assertNotIn(self.token, headers.get("Location"))
+
+    def test_bootstrap_wrong_token_is_401_without_cookie(self) -> None:
+        status, headers, body = self.raw("/?token=deadbeef")
+        self.assertEqual(status, 401)
+        self.assertEqual(self.set_cookie_values(headers), [], "令牌错了绝不能种 Cookie")
+        self.assertNotIn(self.token, body)
+        self.assertIn("令牌不对", body)
+
+    def test_plain_root_serves_page_without_token(self) -> None:
+        status, headers, body = self.raw("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.set_cookie_values(headers), [])
+        self.assertNotIn(self.token, body)
+        self.assertNotIn("const TOKEN", body)
+        self.assertIn('id="unlock"', body)
+
+
+class CookieAuthTests(WebCase):
+    """Cookie 主凭证 + X-Team-Token 兼容头；URL 令牌在 API 上一律拒绝。"""
+
+    def test_state_with_cookie_ok(self) -> None:
+        status, data = self.call("/api/state", token=None)
+        self.assertEqual(status, 401)
+        status, headers, body = self.raw("/api/state",
+                                        cookie=f"team_token={self.token}")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_wrong_cookie_rejected(self) -> None:
+        status, _, body = self.raw("/api/state", cookie="team_token=" + "f" * 32)
+        self.assertEqual(status, 401)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_header_still_works_for_cli(self) -> None:
+        status, data = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+    def test_url_token_rejected_even_if_correct(self) -> None:
+        status, _, body = self.raw(f"/api/state?token={self.token}")
+        self.assertEqual(status, 401)
+        self.assertIn("URL", json.loads(body)["error"])
+
+    def test_url_token_rejected_on_every_api(self) -> None:
+        for path in ("/api/alive", "/api/session", "/api/tasks"):
+            status, _, _ = self.raw(f"{path}?token={self.token}")
+            self.assertEqual(status, 401, f"{path} 不该接受 URL 里的令牌")
+
+    def test_cookie_value_is_ignored_for_other_cookie_names(self) -> None:
+        status, _, _ = self.raw("/api/state", cookie=f"other={self.token}")
+        self.assertEqual(status, 401)
+
+
+class CsrfTests(WebCase):
+    """写操作：Sec-Fetch-Site → Origin → 都没有则放行；只收 JSON。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cookie = f"team_token={self.token}"
+
+    def post(self, path: str, body=None, headers=None, cookie: str | None = None,
+             ctype: str | None = "application/json"):
+        return self.raw(path, method="POST", body=body if body is not None else {},
+                        headers=dict(headers or {}),
+                        cookie=self.cookie if cookie is None else cookie, ctype=ctype)
+
+    def test_post_requires_credentials(self) -> None:
+        status, _, body = self.raw("/api/post", method="POST", body={"content": "hi"})
+        self.assertEqual(status, 401)
+        status, _, body = self.post("/api/post", body={"content": "hi"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_cross_site_origin_rejected(self) -> None:
+        status, _, body = self.post("/api/post", body={"content": "hi"},
+                                    headers={"Origin": "http://evil.com"})
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"], "跨站请求被拒绝")
+
+    def test_loopback_origin_accepted(self) -> None:
+        origin = f"http://127.0.0.1:{self.port}"
+        status, _, body = self.post("/api/post", body={"content": "hi"},
+                                    headers={"Origin": origin})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_origin_port_must_match_host(self) -> None:
+        """Origin 是 localhost 但这次请求的 Host 是 127.0.0.1:port → 端口/主机对不上，拒。"""
+        status, _, _ = self.post("/api/post", body={"content": "hi"},
+                                 headers={"Origin": f"http://localhost:{self.port}"})
+        self.assertEqual(status, 403)
+
+    def test_origin_with_wrong_port_rejected(self) -> None:
+        status, _, _ = self.post("/api/post", body={"content": "hi"},
+                                 headers={"Origin": f"http://127.0.0.1:{self.port + 1}"})
+        self.assertEqual(status, 403)
+
+    def test_sec_fetch_site_cross_site_rejected(self) -> None:
+        status, _, body = self.post("/api/post", body={"content": "hi"},
+                                    headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"], "跨站请求被拒绝")
+
+    def test_sec_fetch_site_same_site_rejected(self) -> None:
+        status, _, _ = self.post("/api/post", body={"content": "hi"},
+                                 headers={"Sec-Fetch-Site": "same-site"})
+        self.assertEqual(status, 403)
+
+    def test_sec_fetch_site_same_origin_ok(self) -> None:
+        status, _, body = self.post("/api/control", body={"action": "pause", "task_id": TASK},
+                                    headers={"Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_no_origin_no_fetch_site_is_allowed(self) -> None:
+        """curl/CLI 两个头都没有：放行（非浏览器客户端）。"""
+        status, _, body = self.post("/api/control", body={"action": "resume", "task_id": TASK})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_form_content_type_is_415(self) -> None:
+        status, _, body = self.post("/api/control", body={"action": "pause"},
+                                    ctype="application/x-www-form-urlencoded")
+        self.assertEqual(status, 415)
+        self.assertEqual(json.loads(body)["error"], "只接受 JSON")
+
+    def test_missing_content_type_is_415(self) -> None:
+        status, _, _ = self.post("/api/post", body={"content": "hi"}, ctype=None)
+        self.assertEqual(status, 415)
+
+    def test_cross_site_checked_before_content_type(self) -> None:
+        """跨站 + 表单类型：先报 403，别告诉外面的人内容类型要求。"""
+        status, _, _ = self.post("/api/post", body={"content": "hi"},
+                                 headers={"Origin": "http://evil.com"},
+                                 ctype="application/x-www-form-urlencoded")
+        self.assertEqual(status, 403)
+
+    def test_get_does_not_require_origin(self) -> None:
+        status, _, _ = self.raw("/api/state", headers={"Origin": "http://evil.com"},
+                                cookie=self.cookie)
+        self.assertEqual(status, 200, "GET 不校验 Origin（也不该有 GET 写状态的接口）")
+
+
+class UnlockTests(WebCase):
+    """/api/unlock：换 Cookie、失败计数限流、同样过 CSRF/JSON。"""
+
+    def unlock(self, token: str, headers=None):
+        return self.raw("/api/unlock", method="POST", body={"token": token},
+                        headers=headers or {})
+
+    def test_unlock_returns_cookie(self) -> None:
+        status, headers, body = self.unlock(self.token)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        cookies = self.set_cookie_values(headers)
+        self.assertEqual(len(cookies), 1)
+        self.assertIn(f"team_token={self.token}", cookies[0])
+        self.assertIn("HttpOnly", cookies[0])
+        self.assertIn("SameSite=Strict", cookies[0])
+
+    def test_unlock_wrong_token_is_401(self) -> None:
+        status, headers, body = self.unlock("nope")
+        self.assertEqual(status, 401)
+        self.assertEqual(self.set_cookie_values(headers), [])
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_unlock_rate_limited_after_five_fails(self) -> None:
+        for i in range(5):
+            status, _, _ = self.unlock(f"bad-{i}")
+            self.assertEqual(status, 401, f"第 {i + 1} 次失败应该是 401")
+        status, _, body = self.unlock("bad-6")
+        self.assertEqual(status, 429)
+        self.assertIn("等一分钟", json.loads(body)["error"])
+        # 限流期间即使令牌对也不放行，避免被拿来做暴力枚举
+        status, _, _ = self.unlock(self.token)
+        self.assertEqual(status, 429)
+
+    def test_unlock_requires_json(self) -> None:
+        status, _, body = self.raw("/api/unlock", method="POST", body={"token": self.token},
+                                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(status, 415)
+        self.assertEqual(json.loads(body)["error"], "只接受 JSON")
+
+    def test_unlock_rejects_cross_site(self) -> None:
+        status, _, _ = self.unlock(self.token, headers={"Origin": "http://evil.com"})
+        self.assertEqual(status, 403)
+
+    def test_unlock_rejects_token_in_url(self) -> None:
+        """令牌只能走请求体；?token= 在 /api/* 上一律不认（unlock 也不例外）。"""
+        status, _, _ = self.raw(f"/api/unlock?token={self.token}", method="POST",
+                                body={"token": self.token})
+        self.assertEqual(status, 401)
+
+
+class AliveTests(WebCase):
+    def test_alive_needs_no_credentials_or_csrf(self) -> None:
+        status, _, body = self.raw("/api/alive")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_no_get_endpoint_writes_state(self) -> None:
+        """GET 不校验 Origin，那就不许有 GET 写状态的接口：读接口照旧只读，写接口只认 POST。"""
+        before = control.pending()
+        status, _, body = self.raw("/api/control", cookie=f"team_token={self.token}")
+        self.assertEqual(status, 200)
+        self.assertIn("paused", json.loads(body), "GET /api/control 只是读状态")
+        self.assertEqual(control.pending(), before, "GET 不能顺手写下控制指令")
+        for path in ("/api/post", "/api/unlock", "/api/session/select"):
+            status, _, _ = self.raw(path, cookie=f"team_token={self.token}")
+            self.assertIn(status, (404, 405), f"{path} 不该用 GET 就能改状态")
+
+    def test_put_and_delete_are_guarded(self) -> None:
+        status, _, _ = self.raw("/api/post", method="PUT", body={"content": "x"})
+        self.assertEqual(status, 401, "写方法先鉴权")
+        status, _, _ = self.raw("/api/post", method="DELETE", body={},
+                                cookie=f"team_token={self.token}")
+        self.assertEqual(status, 404, "有凭证但没有这个接口")
 
 
 if __name__ == "__main__":

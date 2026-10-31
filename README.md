@@ -135,8 +135,20 @@ curl -X POST http://127.0.0.1:8899/api/control \
 想让它在动手前先问你一句，把 `config/team.json` 的 `policy.require_approval` 改成 `true`：
 计划出来后会停在「等你批准」，你点批准才派给执行者。
 
-**访问令牌**：网页只绑 `127.0.0.1`，并且每个请求都要带令牌（`room/web-token`，启动时自动生成）。
-启动器打印的链接自带 `?token=`，直接把那条链接打开就行；不带令牌打开会要求你粘贴一次。
+**访问令牌**：网页只绑 `127.0.0.1`，并且每个请求都要带凭证（`room/web-token`，启动时自动生成）。
+
+启动器打印的链接自带 `?token=`，那条链接**只能用一次**：服务端校验通过就 `302` 到一个干净的地址，
+同时把凭证写进 `HttpOnly; SameSite=Strict` 的 Cookie（`team_token`，30 天），地址栏里不会再留下令牌。
+不带令牌打开会要求你粘贴一次，走 `POST /api/unlock` 换 Cookie。
+
+- `/api/*` **不接受** URL 上的 `?token=`（历史书签、Referer 里的旧令牌都失效），只认 Cookie 或 `X-Team-Token` 请求头；
+- 所有写操作（`/api/*` 的 POST）都校验 `Sec-Fetch-Site` / `Origin`（必须同源回环）并要求 `Content-Type: application/json`，挡跨站请求；
+- 解锁接口按来源 IP 限制：1 分钟错 5 次后返回 429。
+
+给脚本/CI 用还是老办法：`-H "X-Team-Token: $(cat room/web-token)"`（浏览器跨站发不了自定义头，所以这条留着是安全的）。
+
+> 安全边界：只支持 `http://127.0.0.1`。Cookie 故意没加 `Secure`（http 下加了浏览器会直接丢弃），
+> 也没有 HTTPS。**在补上 HTTPS / 反向代理之前，不要把它绑到 `0.0.0.0` 或对外网开放。**
 
 ### 装成包用（不是从仓库里直接跑）
 
