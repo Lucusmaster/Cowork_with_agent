@@ -1292,6 +1292,16 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
 .earlier:hover:not(:disabled){color:var(--fg);border-color:#3d4a5c}
 .earlier:disabled{opacity:.55}
 .earlier[hidden]{display:none}
+.gap-note{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:8px;
+  margin:0 auto 10px;padding:7px 11px;border-radius:9px;border:1px solid #d2992255;
+  background:#2a2213;color:#f3d08a;font-size:11.5px;line-height:1.5;max-width:640px;
+  flex-wrap:wrap}
+.gap-note[hidden]{display:none}
+.gap-note button{height:22px;border-radius:6px;border:1px solid #d2992266;background:#241d10;
+  color:#ffd27a;font-size:11px;padding:0 8px}
+.gap-note button:hover:not(:disabled){border-color:#d29922aa;color:#ffe1a3}
+.gap-note button:disabled{opacity:.5}
+.gap-note .muted{color:#b39a6a}
 .task-card.pending{border-color:#d2992244;background:#1b1a14}
 .task-card.pending .ttitle{color:#f0d9a8}
 
@@ -1610,7 +1620,10 @@ function nearBottom(){
 }
 function scrollDown(){ streamEl.scrollTop = streamEl.scrollHeight; }
 
-/* ---------- 消息增量合并/分页 ---------- */
+/* ---------- 消息增量合并 / 翻页 / 断层自愈 ---------- */
+const MAX_HEAL_PAGES = 5;      // 自动补断层最多补 5 页，补不齐就明说，不静默
+const MAX_RETRY_PAGES = 20;    // 用户点「重试补齐」时给更多页
+
 function msgSig(m){
   return JSON.stringify([m.role, m.agent, m.content, m.artifacts || [],
                          m.status, m.task_id, (m.meta && m.meta.error) || '']);
@@ -1620,7 +1633,7 @@ function byOrder(a, b){
   const ka = orderKey(a), kb = orderKey(b);
   return ka < kb ? -1 : ka > kb ? 1 : 0;
 }
-/* 只把新的/变了的消息塞进本地列表，轮询不整表重画。 */
+/* 翻页和断层自愈共用这一个：只把新的/变了的消息并进来，再按时间+id 排好。 */
 function mergeMessages(list){
   if(!Array.isArray(list) || !list.length) return false;
   const index = new Map(msgs.map(m => [String(m.id), m]));
@@ -1634,6 +1647,40 @@ function mergeMessages(list){
   if(changed) msgs = Array.from(index.values()).sort(byOrder);
   return changed;
 }
+
+/* id 是 msg-数字（也容旧账本的纯数字）：取不到数字就跳过自愈，不报错。 */
+function idNum(m){
+  const id = String((m && m.id) || '');
+  const hit = /^msg-(\d+)$/.exec(id) || /^(\d+)$/.exec(id);
+  return hit ? parseInt(hit[1], 10) : null;
+}
+function lastIdNum(list){
+  for(let i = list.length - 1; i >= 0; i--){
+    const n = idNum(list[i]);
+    if(n !== null) return n;
+  }
+  return null;
+}
+function firstIdNum(list){
+  for(let i = 0; i < list.length; i++){
+    const n = idNum(list[i]);
+    if(n !== null) return n;
+  }
+  return null;
+}
+/* 服务端这页的第一条比本地最后一条大 1 以上 → 中间断了一截。 */
+function findGap(incoming){
+  if(!incoming || !incoming.length) return null;
+  const maxId = lastIdNum(msgs);
+  const firstId = firstIdNum(incoming);
+  if(maxId === null || firstId === null) return null;
+  if(firstId <= maxId + 1) return null;
+  return {from: maxId + 1, to: firstId - 1, boundary: String(incoming[0].id)};
+}
+
+let gapState = null;           // 还没补上的缺口 {from, to}
+let healing = false;           // 正在补，别再触发一轮
+
 function earlierEl(){
   let btn = document.getElementById('earlier');
   if(!btn){
@@ -1647,12 +1694,96 @@ function earlierEl(){
   }
   return btn;
 }
+/* 流顶部固定顺序：断层提示 → 「加载更早」→ 消息 */
 function ensureEarlier(){
   const btn = earlierEl();
-  if(streamEl.firstChild !== btn) streamEl.insertBefore(btn, streamEl.firstChild);
   btn.hidden = !hasMoreBefore;
+  const note = renderGapNote();
+  if(btn.parentNode) btn.remove();
+  streamEl.insertBefore(btn, note && note.parentNode === streamEl ? note.nextSibling : streamEl.firstChild);
   return btn;
 }
+/* 整条流按 msgs 的顺序重建：补断层的消息要插回中间，append 是插不到中间的。 */
+function rebuildStream(){
+  const wasNear = nearBottom();
+  resetStream();
+  renderMessages(msgs);
+  ensureEarlier();
+  if(wasNear) scrollDown();
+}
+function renderGapNote(){
+  let el = document.getElementById('gap');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'gap';
+    el.className = 'gap-note';
+    el.hidden = true;
+  }
+  if(!gapState){
+    if(el.parentNode) el.remove();
+    return null;
+  }
+  const missing = gapState.to - gapState.from + 1;
+  el.innerHTML = '<span>历史消息有断层（缺 ' + missing + ' 条）</span>'
+    + '<button type="button" id="gap-retry">重试补齐</button>'
+    + '<span class="muted">也可以点上面的「加载更早」往前翻</span>';
+  el.hidden = false;
+  streamEl.insertBefore(el, streamEl.firstChild);
+  const retry = document.getElementById('gap-retry');
+  if(retry) retry.onclick = retryGap;
+  return el;
+}
+
+/* 循环 /api/messages?before=<缺口上界+1> 把缺口补回来；boundary 是「第一条新消息」的原始 id。 */
+async function healGap(gap, boundary, maxPages){
+  if(healing) return;
+  healing = true;
+  let from = gap.from, to = gap.to, bound = boundary, pages = 0;
+  try{
+    while(pages < (maxPages || MAX_HEAL_PAGES) && from <= to){
+      pages += 1;
+      const q = new URLSearchParams();
+      q.set('before', bound);                     // before 是不含的
+      q.set('limit', String(PAGE));
+      if(activeId) q.set('session', activeId);
+      const data = await apiGet('/api/messages?' + q.toString());
+      if(!data || data.ok === false || !Array.isArray(data.messages) || !data.messages.length) break;
+      const chunk = data.messages.filter(m => {
+        const n = idNum(m);
+        return n !== null && n >= from && n <= to;
+      });
+      if(!chunk.length) break;
+      mergeMessages(chunk);                       // 和「加载更早」共用合并逻辑
+      const lowest = Math.min.apply(null, chunk.map(idNum));
+      to = lowest - 1;
+      if(to < from) break;
+      const oldest = data.messages.reduce((a, b) => (idNum(a) <= idNum(b) ? a : b));
+      const oldestId = String(oldest.id);
+      if(oldestId === bound) break;               // 没往前走，防死循环
+      bound = oldestId;
+      if(!data.has_more) break;
+    }
+  }finally{
+    healing = false;
+  }
+  gapState = from <= to ? {from: from, to: to} : null;
+  rebuildStream();                     // 补回来的消息要插回中间，整条流按顺序重排一次
+  if(gapState){
+    toast('断层没补全，还缺 ' + (to - from + 1) + ' 条，可以点「重试补齐」');
+  }else{
+    toast('已补齐中间断掉的 ' + (gap.to - gap.from + 1) + ' 条消息');
+  }
+}
+
+async function retryGap(){
+  if(!gapState || healing) return;
+  const btn = document.getElementById('gap-retry');
+  if(btn) btn.disabled = true;
+  const above = msgs.find(m => idNum(m) === gapState.to + 1);
+  const boundary = above ? String(above.id) : String(gapState.to + 1);
+  await healGap({from: gapState.from, to: gapState.to}, boundary, MAX_RETRY_PAGES);
+}
+
 async function loadEarlier(){
   const btn = earlierEl();
   if(btn.disabled) return;
@@ -1674,9 +1805,7 @@ async function loadEarlier(){
     if(!data) toast('翻页失败：需要访问令牌或服务不在');
     return;
   }
-  const index = new Map(msgs.map(m => [String(m.id), m]));
-  data.messages.forEach(m => index.set(String(m.id), m));
-  msgs = Array.from(index.values()).sort(byOrder);
+  mergeMessages(data.messages);      // 和自愈同一套合并
   hasMoreBefore = !!data.has_more;
   resetStream();
   renderMessages(msgs);
@@ -1964,13 +2093,17 @@ function applyState(next, fresh){
     msgs = [];
     syncedSession = sid;
     hasMoreBefore = false;
-    renderedSession = '';
+    gapState = null;
     resetStream();
     firstPaint = true;
   }
   st = Object.assign({}, st, next);
   activeId = sid;
-  mergeMessages(next.messages || []);
+  const incoming = next.messages || [];
+  // 先按「合并前」的本地尾部判断有没有断层，再合并
+  const gap = (!fresh && !healing) ? findGap(incoming) : null;
+  mergeMessages(incoming);
+  if(gap) healGap(gap, gap.boundary, MAX_HEAL_PAGES);
   const total = asInt(next.total_messages, msgs.length);
   hasMoreBefore = msgs.length > 0 && msgs.length < total;
   if(msgs.length){

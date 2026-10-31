@@ -21,6 +21,7 @@ from agent_team import control, procs, room_web
 
 TASK = "T-261031-160000"
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
+MSG_ID = re.compile(r"^msg-(\d+)$")     # 网页里 idNum() 认的格式
 
 
 class FakeStore:
@@ -511,6 +512,151 @@ class BusyTests(WebCase):
         status, state = self.call("/api/state", token=self.token)
         self.assertEqual(state["typing"]["who"], "coordinator", "刚写的 typing 应该可见")
         self.assertTrue(state["busy"]["busy"])
+
+
+class _GapClient:
+    """和网页 JS 里那套「轮询 → 发现断层 → before 循环补」一一对应的客户端。
+
+    这是接口契约测试（HTTP 打真接口、复现同一套算法），不替代浏览器验证。
+    """
+
+    def __init__(self, case, msgs: list[dict]) -> None:
+        self.case = case
+        self.by_id = {m["id"]: m for m in msgs}
+        self.pages = 0
+        self.remaining = 0
+
+    @staticmethod
+    def num(mid: str) -> int:
+        return int(str(mid).split("-")[1])
+
+    def ids(self) -> list[str]:
+        return [m["id"] for m in sorted(self.by_id.values(), key=lambda m: self.num(m["id"]))]
+
+    def merge(self, rows: list[dict]) -> None:
+        for row in rows:
+            self.by_id[row["id"]] = row
+
+    def poll(self, after_id: str) -> tuple[dict, dict | None]:
+        status, state = self.case.call(f"/api/state?after={after_id}", token=self.case.token)
+        self.case.assertEqual(status, 200)
+        incoming = state["messages"]
+        max_id = max(self.num(mid) for mid in self.by_id)
+        first = self.num(incoming[0]["id"])
+        if first <= max_id + 1:
+            self.merge(incoming)
+            return state, None
+        gap = {"from": max_id + 1, "to": first - 1, "boundary": incoming[0]["id"]}
+        self.merge(incoming)                    # 和网页一样：先判断层，再把这页并进来
+        return state, gap
+
+    def heal(self, gap: dict, max_pages: int = 5) -> int:
+        """循环 /api/messages?before= 补缺口，返回还没补上的条数（0 = 补齐）。"""
+        frm, to, bound = gap["from"], gap["to"], gap["boundary"]
+        while self.pages < max_pages and frm <= to:
+            self.pages += 1
+            status, page = self.case.call(
+                f"/api/messages?before={bound}&limit=120&session=chat-test",
+                token=self.case.token)
+            self.case.assertEqual(status, 200)
+            chunk = [m for m in page["messages"] if frm <= self.num(m["id"]) <= to]
+            if not chunk:
+                break
+            self.merge(chunk)
+            lowest = min(self.num(m["id"]) for m in chunk)
+            to = lowest - 1
+            if to < frm:
+                break
+            oldest = min(page["messages"], key=lambda m: self.num(m["id"]))
+            if oldest["id"] == bound:
+                break                       # 没有前进，别死循环
+            bound = oldest["id"]
+            if not page["has_more"]:
+                break
+        self.remaining = max(0, to - frm + 1)
+        return self.remaining
+
+
+class GapHealContractTests(WebCase):
+    """断层自愈的接口契约：按网页同一套算法打 /api/messages?before= 多页拼回完整序列。"""
+
+    def client(self, local_count: int) -> _GapClient:
+        return _GapClient(self, self.store.items[:local_count])
+
+    def test_burst_gap_detected_and_healed(self) -> None:
+        """两次轮询之间来了 200 条：轮询窗口只给 181..300，101..180 得自己补。"""
+        self.store.seed(300)
+        cli = self.client(100)
+        _, gap = cli.poll("msg-081")
+        self.assertIsNotNone(gap, "第一条 181 > 本地 100+1，应该判定断层")
+        self.assertEqual(gap["from"], 101)
+        self.assertEqual(gap["to"], 180)
+        self.assertEqual(gap["boundary"], "msg-181")
+        remaining = cli.heal(gap)
+        self.assertEqual(remaining, 0, "一页就够补 80 条")
+        self.assertEqual(cli.pages, 1)
+        self.assertEqual(cli.ids(), [f"msg-{i:03d}" for i in range(1, 301)],
+                         "补完必须是 1..300 连续，一条不少")
+
+    def test_overlap_means_no_gap(self) -> None:
+        """轮询带 20 条重叠，正常情况不该误报断层。"""
+        self.store.seed(140)
+        cli = self.client(100)
+        _, gap = cli.poll("msg-081")      # 服务端回 82..140，第一条 82 <= 101
+        self.assertIsNone(gap)
+        self.assertEqual(cli.pages, 0)
+
+    def test_gap_larger_than_page_cap_reports_remaining(self) -> None:
+        """缺口 700 条 > 5 页（600 条）：补 5 页后要明确还剩多少，不能静默。"""
+        self.store.seed(900)
+        cli = self.client(100)
+        _, gap = cli.poll("msg-800")
+        self.assertEqual((gap["from"], gap["to"]), (101, 800))
+        remaining = cli.heal(gap, max_pages=5)
+        self.assertEqual(cli.pages, 5, "最多补 5 页，不能无限循环")
+        self.assertEqual(remaining, 100, "600 条补回来，还差 101..200 这 100 条")
+        self.assertTrue(cli.remaining > 0)
+
+    def test_retry_with_more_pages_finishes_the_job(self) -> None:
+        """用户点「重试补齐」（页数放宽）后能补全，且序列连续。"""
+        self.store.seed(900)
+        cli = self.client(100)
+        _, gap = cli.poll("msg-800")
+        cli.heal(gap, max_pages=5)
+        self.assertGreater(cli.remaining, 0)
+        # 重试用「缺口上界 + 1 那条」的原始 id 当边界（它一定已经加载在本地）
+        retry_to = 101 + cli.remaining - 1
+        above = next(m for m in cli.by_id.values() if cli.num(m["id"]) == retry_to + 1)
+        retry_gap = {"from": 101, "to": retry_to, "boundary": above["id"]}
+        remaining = cli.heal(retry_gap, max_pages=20)
+        self.assertEqual(remaining, 0)
+        self.assertEqual(cli.ids(), [f"msg-{i:03d}" for i in range(1, 901)])
+
+    def test_before_page_contract(self) -> None:
+        """自愈依赖的 before 语义：before 不含，返回它之前的一页 + has_more。"""
+        self.store.seed(300)
+        status, page = self.call("/api/messages?before=msg-105&limit=120&session=chat-test",
+                                 token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(page["messages"][-1]["id"], "msg-104")
+        self.assertEqual(page["messages"][0]["id"], "msg-001")
+        self.assertFalse(page["has_more"])
+        status, page2 = self.call("/api/messages?before=msg-181&limit=120&session=chat-test",
+                                  token=self.token)
+        self.assertEqual(page2["messages"][0]["id"], "msg-061")
+        self.assertEqual(page2["messages"][-1]["id"], "msg-180")
+        self.assertTrue(page2["has_more"])
+
+    def test_unparseable_ids_skip_heal(self) -> None:
+        """id 不是 msg-数字 就跳过自愈，不报错、不多发请求。"""
+        self.store.seed(10)
+        for i, item in enumerate(self.store.items):
+            item["id"] = f"legacy-{i + 1}"
+        cli = _GapClient(self, self.store.items[:5])
+        incoming = self.store.items[5:]
+        self.assertIsNone(MSG_ID.match(incoming[0]["id"]),
+                          "网页的 idNum() 解析不出数字 → findGap() 直接跳过自愈")
+        self.assertEqual(cli.pages, 0, "跳过自愈就不会去发 /api/messages 请求")
 
 
 if __name__ == "__main__":
