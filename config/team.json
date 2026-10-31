@@ -10,7 +10,10 @@
     "reasoning_effort": "low",
     "timeout": 600,
     "sandbox": "read-only",
-    "fallback_models": ["gpt-6.1-terra", "gpt-6.1-sol"]
+    "fallback_models": [
+      "gpt-6.1-terra",
+      "gpt-6.1-sol"
+    ]
   },
   "agents": [
     {
@@ -53,5 +56,8 @@
       "sandbox": "read-only",
       "enabled": true
     }
-  ]
+  ],
+  "policy": {
+    "require_approval": false
+  }
 }

@@ -89,6 +89,32 @@ class ScopeCheckTests(unittest.TestCase):
         self.assertEqual(team.scope_violations({"scope": []}, self.ws), [])
 
 
+
+class CollabStrayTests(unittest.TestCase):
+    """协作仓库里的改动：只有命中任务 scope 才算串味。"""
+
+    def _stray(self, scope, changed):
+        from unittest.mock import patch
+        with patch.object(team, "ledger_snapshot", return_value=dict(changed)):
+            return team.collab_stray_changes({}, scope)
+
+    def test_developer_edits_not_flagged_when_scope_given(self) -> None:
+        got = self._stray(["textstats.py"], {"agent_team/worker.py": "abc"})
+        self.assertEqual(got, [], "开发者改自己的代码不该被判失败")
+
+    def test_executor_writing_scope_into_collab_repo_is_flagged(self) -> None:
+        got = self._stray(["textstats.py", "tests"], {"textstats.py": "abc"})
+        self.assertEqual(got, ["textstats.py"])
+
+    def test_scope_dir_match(self) -> None:
+        got = self._stray(["tests"], {"tests/test_textstats.py": "abc"})
+        self.assertEqual(got, ["tests/test_textstats.py"])
+
+    def test_without_scope_keeps_old_strict_behavior(self) -> None:
+        got = self._stray([], {"agent_team/worker.py": "abc"})
+        self.assertEqual(got, ["agent_team/worker.py"])
+
+
 class FinishedOutcomeTests(unittest.TestCase):
     """失败的任务不能因为流程走完就标记成功。"""
 

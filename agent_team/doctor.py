@@ -107,8 +107,15 @@ def check_port(port: int) -> None:
     import json as _json
     import urllib.request
 
+    token = ""
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state?after=999999", timeout=2) as resp:
+        token = (ROOT / "room" / "web-token").read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state?after=999999",
+                                 headers={"X-Team-Token": token} if token else {})
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             payload = _json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001
         busy = False

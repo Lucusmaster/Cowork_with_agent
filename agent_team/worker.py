@@ -34,6 +34,7 @@ TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在�
 LOG = ROOM / "worker.log"
 
 from . import agents  # noqa: E402
+from . import control  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
@@ -313,6 +314,34 @@ def run_step(args: list[str], timeout: int, label: str) -> tuple[int, str]:
     log(f"{label} 退出码 {proc.returncode}")
     return proc.returncode, output
 
+
+def control_note(kind: str, tid: str, stage: str = "") -> None:
+    """把控制状态发成一条消息，用户知道引擎在等什么。"""
+    text = {
+        "paused": "已暂停。点「继续」我接着干，点「停止」就收工。",
+        "resumed": "继续干活。",
+        "waiting_approval": "计划已经出来了，你批准之后我才动手。",
+        "approved": "已批准，开工。",
+        "stopped": "按你的要求停下了。",
+        "rerun": "按你的要求重跑这一步。",
+    }.get(kind, kind)
+    say(text, task_id=tid)
+
+
+def step(tid: str, argv: list[str], timeout: int, label: str, stage: str) -> tuple[int, str]:
+    """跑一步，跑之前先过闸门：暂停就等，停止就抛，重跑就重做这一步。"""
+    while True:
+        try:
+            action = control.gate(
+                tid, stage,
+                on_event=lambda ev, st: control_note(ev, tid, st),
+                heartbeat=beat)
+        except control.TaskStopped:
+            raise
+        if action != "rerun":
+            return run_step(argv, timeout, label)
+        control_note("rerun", tid, stage)
+        event(f"按你的要求重跑：{label}", stage, "run", "coordinator", tid)
 
 VAGUE = {"继续", "好的", "好", "嗯", "可以", "ok", "继续吧", "下一步", "继续干"}
 
@@ -862,6 +891,15 @@ def handle_chat(request: str) -> None:
     # action == chat：话已经说了，不动手
 
 
+def _require_approval() -> bool:
+    """配置里 policy.require_approval=true 时，计划出来先等用户点头。"""
+    try:
+        cfg = json.loads((ROOT / "config" / "team.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool((cfg.get("policy") or {}).get("require_approval"))
+
+
 def run_card(card: dict, workspace: Path, request: str) -> None:
     args = ["new", "--title", card["title"], "--goal", card["goal"]]
     for item in card["acceptance"]:
@@ -892,15 +930,42 @@ def run_card(card: dict, workspace: Path, request: str) -> None:
     post_agent("planner", tid, True,
                f"需求已拆好：{len(card['acceptance'])} 条验收标准，"
                f"{len(card['scope'])} 个允许改动的路径，计划写进了 plan.md。")
+    if _require_approval():
+        try:
+            control.wait_approval(tid, on_event=lambda ev, st: control_note(ev, tid, st),
+                                  heartbeat=beat)
+        except control.TaskStopped:
+            control_note("stopped", tid)
+            post_agent("coordinator", tid, False, "已按你的要求停下，这一轮还没开始执行。")
+            return
     pipeline(tid, card, request)
 
 
 def pipeline(tid: str, card: dict, request: str) -> None:
     """执行 → 验收 → 复核 → 报告 → 交接记录。每一步都单独发一条 Agent 消息。"""
+    try:
+        _pipeline(tid, card, request)
+    except control.TaskStopped:
+        control_note("stopped", tid)
+        post_agent("coordinator", tid, False, "已按你的要求停止，这轮不算完成。")
+        card_path = TASKS / tid / "task.json"
+        try:
+            task = json.loads(card_path.read_text(encoding="utf-8"))
+            task["status"] = "stopped"
+            task["outcome"] = "failure"
+            task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            card_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            pass
+        do_report(tid)
+        mark_finished(tid)
+
+
+def _pipeline(tid: str, card: dict, request: str) -> None:
     for round_no in range(1, 3):
         with thinking("executor"):
-            code, _ = run_step(["dispatch", "-t", tid], timeout=1200,
-                               label=f"第 {round_no} 轮执行")
+            code, _ = step(tid, ["dispatch", "-t", tid], 1200,
+                           f"第 {round_no} 轮执行", "dispatch")
         exec_log = TASKS / tid / f"exec-{round_no:02d}.last.md"
         post_agent("executor", tid, code == 0,
                    _read(exec_log, 900) if exec_log.exists() else "",
@@ -908,8 +973,8 @@ def pipeline(tid: str, card: dict, request: str) -> None:
         if code != 0:
             event(f"第 {round_no} 轮执行未正常结束", "dispatch", "bad", "codex", tid)
         with thinking("tester"):
-            code, _ = run_step(["verify", "-t", tid], timeout=600,
-                               label=f"第 {round_no} 轮验收")
+            code, _ = step(tid, ["verify", "-t", tid], 600,
+                           f"第 {round_no} 轮验收", "verify")
         post_agent("tester", tid, code == 0,
                    f"第 {round_no} 轮验收{'通过' if code == 0 else '未通过'}")
         if code == 0:
@@ -931,8 +996,8 @@ def pipeline(tid: str, card: dict, request: str) -> None:
 
     for attempt in range(1, 3):
         with thinking("reviewer"):
-            code, _ = run_step(["review", "-t", tid], timeout=900,
-                               label=f"第 {attempt} 次复核")
+            code, _ = step(tid, ["review", "-t", tid], 900,
+                           f"第 {attempt} 次复核", "review")
         if code == 0:
             post_agent("reviewer", tid, True, "复核通过")
             break
@@ -949,11 +1014,11 @@ def pipeline(tid: str, card: dict, request: str) -> None:
             json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         event(f"{tid} 复核挑出问题，自动返工第 {next_round} 轮", "review", "bad", "reviewer", tid)
         with thinking("executor"):
-            run_step(["dispatch", "-t", tid], timeout=1200,
-                     label=f"第 {next_round} 轮返工")
+            step(tid, ["dispatch", "-t", tid], 1200,
+                     f"第 {next_round} 轮返工", "dispatch")
         with thinking("tester"):
-            vcode, _ = run_step(["verify", "-t", tid], timeout=600,
-                                label=f"第 {next_round} 轮验收")
+            vcode, _ = step(tid, ["verify", "-t", tid], 600,
+                                f"第 {next_round} 轮验收", "verify")
         post_agent("executor", tid, vcode == 0, f"按复核意见返工第 {next_round} 轮")
         post_agent("tester", tid, vcode == 0, f"返工后验收{'通过' if vcode == 0 else '未通过'}")
         if vcode != 0:
@@ -1018,13 +1083,22 @@ def main() -> int:
                     handle(request)
                 except subprocess.TimeoutExpired:
                     event("执行超时，已中止这条", "dispatch", "bad", "codex")
-                    say(f"任务执行超时被中止：{request[:120]}")
+                    say(f"任务执行超时被中止：{request[:120]}", status="failed")
                 except Exception as exc:  # noqa: BLE001
                     log(f"处理失败：{type(exc).__name__}: {exc}")
                     event(f"处理异常：{type(exc).__name__}", "done", "bad", "deepseek")
-                    say(f"这条我处理时出错了（{type(exc).__name__}: {exc}），原始需求：{request[:160]}")
+                    say(f"这条我处理时出错了（{type(exc).__name__}: {exc}），原始需求：{request[:160]}",
+                        status="failed")
                 finally:
                     typing(False)
+                # 干活期间又来了新需求：明确告诉用户"排上了"，别让人以为漏掉
+                try:
+                    rest = [m for m in room.pending() if int(m.get("id") or 0) > int(msg.get("id") or 0)]
+                except Exception:  # noqa: BLE001
+                    rest = []
+                if rest:
+                    preview = "；".join((m.get("text") or "").strip()[:40] for m in rest[:3])
+                    say(f"收到 {len(rest)} 条新需求，已排进队列，等手上这条结束就办：{preview}")
         except Exception as exc:  # noqa: BLE001
             log(f"主循环异常：{type(exc).__name__}: {exc}")
 

@@ -377,14 +377,25 @@ def ledger_snapshot() -> dict[str, str]:
     return snapshot
 
 
-def collab_stray_changes(baseline: dict[str, str] | None = None) -> list[str]:
-    """检查协作仓库里有没有本该落在项目工作区的代码改动。"""
+def collab_stray_changes(baseline: dict[str, str] | None = None,
+                         scope: list[str] | None = None) -> list[str]:
+    """检查协作仓库里有没有本该落在项目工作区的代码改动。
+
+    只把「命中任务 scope 的改动」算串味：开发者自己在协作仓库里改
+    agent_team/、tests/、docs/ 是正常开发行为，不该被判成失败。
+    没声明 scope 时保持旧行为（任何非账本改动都算），因为那时无法判断边界。
+    """
+    scope_norm = [str(item).strip().replace("\\", "/").rstrip("/")
+                  for item in (scope or [])]
+    scope_norm = [item for item in scope_norm if item]
     stray = []
     for path, mark in ledger_snapshot().items():
         if path.startswith(LEDGER_PREFIXES) or path.endswith(".pyc") or "__pycache__" in path:
             continue
         if baseline and baseline.get(path) == mark:
             continue  # dispatch 之前就有、且没被改过 —— 不是这次的锅
+        if scope_norm and not any(path == item or path.startswith(item + "/") for item in scope_norm):
+            continue  # 不在任务 scope 里：这是开发者自己的改动
         stray.append(path)
     return stray
 
@@ -509,7 +520,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
                   "", "要么把这些改动移出本轮，要么先扩 scope 再重跑。", ""]
         print(f"  ⚠ {len(out_of_scope)} 个文件越界，判 FAIL")
 
-    stray = collab_stray_changes(task.get("ledger_baseline")) if task_workspace(task) != ROOT else []
+    stray = (collab_stray_changes(task.get("ledger_baseline"), task.get("scope"))
+             if task_workspace(task) != ROOT else [])
     if stray:
         all_ok = False
         lines += ["## 工作区串味（阻塞）",

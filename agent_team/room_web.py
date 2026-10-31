@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -32,6 +33,11 @@ try:
     from . import room
 except Exception:  # noqa: BLE001 - room.py 可能在 session.py 未就绪时导入失败，网页也得能起
     room = None
+
+try:
+    from . import control
+except Exception:  # noqa: BLE001 - 控制模块缺失时网页照常能看，只是按钮点了没反应
+    control = None
 
 # Windows 控制台默认 GBK，中文会炸；统一按 UTF-8 输出。
 for _stream in (sys.stdout, sys.stderr):
@@ -48,7 +54,12 @@ PROJECT_FILE = ROOM / "project.json"
 TYPING_FILE = ROOM / "typing.json"
 NUDGE_FILE = ROOM / "nudge"
 SESSION_STATE = ROOM / "session_state.json"
+TOKEN_FILE = ROOM / "web-token"          # 网页访问令牌；main() 启动时读/生成
 MAX_ARTIFACT = 200 * 1024
+CONTROL_ACTIONS = ("pause", "resume", "stop", "approve", "rerun")
+
+# 访问令牌：启动时由 _ensure_token() 填。为空表示"没启用令牌"（安全兜底，不把人锁在外面）。
+TOKEN = ""
 
 # 网页在线状态：页面每次轮询都会刷新 last_seen，关页面时尽力发一次 bye。
 PRESENCE = {"last_seen": 0.0, "bye_at": 0.0, "ever": False, "deferred": False}
@@ -497,6 +508,62 @@ def _typing_info() -> dict:
     return data
 
 
+def _ensure_token() -> str:
+    """网页访问令牌：room/web-token 有就复用，没有就生成 32 位 hex 并落盘。
+
+    写成文件是为了让"换个浏览器/重开页面"还能用同一个令牌；删掉文件重启就换新的。
+    """
+    try:
+        existing = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if len(existing) >= 16:
+        return existing
+    token = secrets.token_hex(16)
+    try:
+        ROOM.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(token, encoding="utf-8")
+        try:
+            os.chmod(TOKEN_FILE, 0o600)        # 只有自己能读
+        except OSError:
+            pass
+    except OSError:
+        pass                                    # 写不进去也别拦着启动，内存里照样有令牌
+    return token
+
+
+def _engine_info() -> dict:
+    """工作流引擎在不在跑：只看 worker.lock 的 pid + 心跳，不额外起进程。"""
+    try:
+        info = json.loads((ROOM / "worker.lock").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"alive": False, "pid": 0, "beat": 0.0}
+    if not isinstance(info, dict):
+        return {"alive": False, "pid": 0, "beat": 0.0}
+    pid = _as_int(info.get("pid"))
+    try:
+        beat = float(info.get("beat") or 0)
+    except (TypeError, ValueError):
+        beat = 0.0
+    # 和 worker.take_lock 一个口径：90 秒内有心跳才算活着
+    return {"alive": bool(pid) and (time.time() - beat) < 90, "pid": pid, "beat": beat}
+
+
+def _control_state() -> tuple[dict | None, dict | None]:
+    """(暂停标记, 还没被引擎消费的指令)。控制模块不可用时都是 None。"""
+    if control is None:
+        return None, None
+    try:
+        paused = control.paused()
+    except Exception:  # noqa: BLE001 - 控制文件坏了不该让整个状态接口挂掉
+        paused = None
+    try:
+        pending = control.pending()
+    except Exception:  # noqa: BLE001
+        pending = None
+    return paused, pending
+
+
 def _tail(path: Path, lines: int = 22) -> str:
     try:
         content = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -765,6 +832,7 @@ def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "") 
     task = _task_detail(task_id) if task_id else _current_task(active, messages)
     project = _project_info()
     changes = _changes(task)
+    paused, pending = _control_state()
     workspaces = _workspaces(sessions, str(project.get("workspace") or ""))
     current_ws = _project_workspace() or str(active.get("workspace") or "")
     for item in workspaces:
@@ -779,6 +847,9 @@ def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "") 
         "typing": typing,
         "task": task,
         "changes": changes,
+        "paused": paused,                        # 暂停中：{task, stage, reason, since}
+        "control": pending,                      # 还没被引擎消费的控制指令
+        "engine": _engine_info(),                # 引擎在不在跑，控制按钮据此启停
         "workspace": current_ws,
         "project": project,                       # 兼容旧前端
         "total_messages": _as_int(active.get("message_count"), len(messages)),
@@ -871,7 +942,8 @@ body{background:var(--bg);color:var(--fg);overflow:hidden;
   -webkit-font-smoothing:antialiased}
 button{font:inherit;color:inherit;cursor:pointer}
 .mono{font-family:"Cascadia Mono",Consolas,"SF Mono",monospace}
-.app{display:grid;grid-template-columns:264px minmax(0,1fr) 344px;height:100vh}
+.app{display:none;grid-template-columns:264px minmax(0,1fr) 344px;height:100vh}
+body.ready .app{display:grid}
 
 /* ---------- 左栏 ---------- */
 .side{background:var(--panel);border-right:1px solid var(--line);display:flex;
@@ -1046,6 +1118,44 @@ ul.files li{font-size:11.5px;color:var(--dim);padding-left:14px;position:relativ
 ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
 .empty{color:var(--dim2);font-size:11.5px;text-align:center;padding:16px 8px;line-height:1.8}
 
+/* ---------- 控制按钮（暂停/继续/停止/重新执行） ---------- */
+.ctrl{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
+.ctrl button{height:27px;border-radius:8px;border:1px solid var(--line2);background:var(--panel);
+  color:var(--dim);font-size:11.5px;padding:0 8px;white-space:nowrap;transition:border-color .15s,color .15s}
+.ctrl button:hover:not(:disabled){color:var(--fg);border-color:#3d4a5c}
+.ctrl button:disabled{opacity:.34;cursor:default}
+.ctrl button.hl{color:#cfe4ff;border-color:#2e5a86;background:#16283c}
+.ctrl button.hl:hover:not(:disabled){background:#1b3550;border-color:#3d6f9e}
+.ctrl button.danger{color:#ffb4ad;border-color:#f8514955;background:#f8514910}
+.ctrl button.danger:hover:not(:disabled){color:#ffd7d3;border-color:#f8514999}
+.ctrl-hint{margin-top:7px;font-size:10.5px;color:var(--dim2);line-height:1.55}
+.paused-banner{margin-top:8px;font-size:11px;color:#f3d08a;background:#2a2213;
+  border:1px solid #d2992255;border-radius:8px;padding:6px 8px;line-height:1.55;
+  word-break:break-word}
+.paused-banner b{color:#ffd27a;font-weight:600}
+.live.paused{color:#f3d08a;border-color:#d2992255;background:#d2992214}
+.live.paused .dot{background:var(--warn);box-shadow:0 0 0 3px #d2992222}
+
+/* ---------- 访问令牌 ---------- */
+.unlock{position:fixed;inset:0;display:grid;place-items:center;padding:32px;z-index:70;
+  background:radial-gradient(1100px 560px at 50% -10%,#141b27,#0a0d12 72%)}
+.unlock[hidden]{display:none}
+.unlock-card{width:min(430px,100%);background:var(--panel);border:1px solid var(--line2);
+  border-radius:14px;padding:22px 22px 16px;box-shadow:0 24px 60px #00000066}
+.unlock-mark{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;
+  background:linear-gradient(135deg,#a371f7,#58a6ff);color:#0a0d12;font-weight:800;
+  font-size:14px;margin-bottom:13px}
+.unlock-card h2{font-size:15px;font-weight:650;margin-bottom:7px}
+.unlock-card p{font-size:12px;color:var(--dim2);line-height:1.7;margin-bottom:13px}
+.unlock-card input{width:100%;height:34px;border-radius:9px;border:1px solid var(--line2);
+  background:var(--bg);color:var(--fg);padding:0 11px;font-size:12.5px;outline:none;
+  font-family:"Cascadia Mono",Consolas,monospace}
+.unlock-card input:focus{border-color:#3d5a7d}
+.unlock-card button{width:100%;height:34px;margin-top:9px;border-radius:9px;
+  border:1px solid #2e5a86;background:#16283c;color:#cfe4ff;font-size:12.5px}
+.unlock-card button:hover{background:#1b3550}
+.unlock-err{margin-top:9px;font-size:11.5px;color:var(--bad);min-height:16px;line-height:1.5}
+
 /* ---------- 弹层 ---------- */
 .modal{position:fixed;inset:0;background:#05070ac7;display:grid;place-items:center;
   padding:44px;z-index:50}
@@ -1140,11 +1250,35 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
 </div>
 <div class="toast" id="toast"></div>
 
+<div class="unlock" id="unlock" hidden>
+  <div class="unlock-card">
+    <div class="unlock-mark">协</div>
+    <h2>需要访问令牌</h2>
+    <p>协作台只给本机用。把启动时打印的链接里的 token 复制过来，或者直接粘贴
+      <span class="mono">room/web-token</span> 文件里的内容。</p>
+    <input id="unlock-input" spellcheck="false" autocomplete="off" placeholder="粘贴访问令牌">
+    <button id="unlock-btn">进入工作台</button>
+    <div class="unlock-err" id="unlock-err"></div>
+  </div>
+</div>
+
 <script>
 const AGENTS = __AGENTS__;
 const STATUS_LABEL = __STATUS_LABEL__;
+const TOKEN = __TOKEN__;                       // 服务端只在带了有效令牌时才注入，否则是 ""
 const ROLES = ['coordinator','planner','executor','tester','reviewer'];
 const ALIAS = {deepseek:'coordinator', brain:'coordinator', codex:'executor', relay:'user'};
+const CTRL_LABEL = {pause:'暂停', resume:'继续', stop:'停止', approve:'批准', rerun:'重新执行'};
+const STAGE_LABEL = {plan:'规划', dispatch:'执行', execute:'执行', exec:'执行',
+  verify:'验收', review:'复核', approve:'等你批准', report:'报告'};
+const TOKEN_KEY = 'team-token';
+
+/* 令牌三种来源：链接里带来的（服务端验证通过才会注入）、localStorage 里存的、URL 上的 ?token=。 */
+const injectedToken = String(TOKEN || '').trim();
+const storedToken = (() => { try { return String(localStorage.getItem(TOKEN_KEY) || '').trim(); } catch(e){ return ''; } })();
+const urlToken = (() => { try { return String(new URLSearchParams(location.search).get('token') || '').trim(); } catch(e){ return ''; } })();
+let ACTIVE_TOKEN = injectedToken || storedToken || urlToken;
+let controlCooldown = 0;
 
 const $ = id => document.getElementById(id);
 const streamEl = $('stream'), sessionsEl = $('sessions'), inspEl = $('insp');
@@ -1152,6 +1286,8 @@ const wsInput = $('ws-input'), wsBtn = $('ws-btn'), wsStatus = $('ws-status');
 const input = $('input'), sendBtn = $('send');
 const modal = $('modal'), modalPath = $('modal-path'), modalBody = $('modal-body');
 const toastEl = $('toast');
+const unlockEl = $('unlock'), unlockInput = $('unlock-input');
+const unlockBtn = $('unlock-btn'), unlockErr = $('unlock-err');
 
 let st = {};
 let activeId = '';
@@ -1176,6 +1312,48 @@ function timeLabel(s){
   const now = new Date();
   if(!isNaN(d) && d.toDateString() === now.toDateString()) return t.slice(0, 5);
   return String(s).slice(5, 10);
+}
+
+/* ---------- 令牌与请求封装 ---------- */
+function rememberToken(value){
+  if(!value) return;
+  try { localStorage.setItem(TOKEN_KEY, value); } catch(e){}
+}
+
+function withToken(url){
+  if(!ACTIVE_TOKEN) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(ACTIVE_TOKEN);
+}
+
+function tokenHeaders(extra){
+  const h = Object.assign({'Content-Type': 'application/json'}, extra || {});
+  if(ACTIVE_TOKEN) h['X-Team-Token'] = ACTIVE_TOKEN;
+  return h;
+}
+
+function showUnlock(message){
+  document.body.classList.remove('ready');
+  unlockEl.hidden = false;
+  unlockErr.textContent = message || '';
+  try { unlockInput.focus(); } catch(e){}
+}
+
+async function apiGet(url){
+  try{
+    const res = await fetch(url, {cache: 'no-store', headers: tokenHeaders()});
+    if(res.status === 401){ showUnlock('访问令牌不对，重新粘贴一次'); return null; }
+    if(!res.ok) return null;
+    return await res.json();
+  }catch(e){ return null; }
+}
+
+async function apiPost(url, body){
+  try{
+    const res = await fetch(url, {method: 'POST', headers: tokenHeaders(),
+      body: JSON.stringify(body || {})});
+    if(res.status === 401){ showUnlock('访问令牌不对，重新粘贴一次'); return null; }
+    return await res.json().catch(() => ({ok: false, error: '服务端返回异常'}));
+  }catch(e){ return {ok: false, error: '网络异常'}; }
 }
 
 function inlineCode(s){ return s.replace(/`([^`\n]+)`/g, '<code>$1</code>'); }
@@ -1383,6 +1561,40 @@ function renderInspector(){
       + artHtml + '</div>';
   }
 
+  const engine = st.engine || {};
+  const pausedInfo = st.paused || null;
+  const pausedHere = !!pausedInfo && (!pausedInfo.task || !task || pausedInfo.task === task.id);
+  const status = String((task && task.status) || '');
+  const runningStatus = ['planned', 'executing', 'dispatched', 'executed'].indexOf(status) >= 0;
+  const running = !!engine.alive && runningStatus;
+  const cooling = Date.now() < controlCooldown;
+  const canPause = running && !pausedInfo;
+  const canResume = !!pausedInfo || running;
+  const canStop = !!pausedInfo || running;
+  const canRerun = !!pausedInfo || running;
+  const ctrlBtn = (act, label, on, cls) => '<button'
+    + (cls ? ' class="' + cls + '"' : '') + ' data-act="' + act + '"'
+    + ((on && !cooling) ? '' : ' disabled') + '>' + label + '</button>';
+  const ctrlHtml = '<div class="ctrl">'
+    + ctrlBtn('pause', '暂停', canPause, '')
+    + ctrlBtn('resume', '继续', canResume, pausedInfo ? 'hl' : '')
+    + ctrlBtn('stop', '停止', canStop, 'danger')
+    + ctrlBtn('rerun', '重新执行', canRerun, '')
+    + '</div>';
+  const ctrlHint = !task
+    ? '没有任务在跑，四个按钮都灰着。'
+    : pausedHere
+      ? '已暂停：点「继续」接着干，点「停止」就收工。'
+      : running
+        ? '引擎在跑，指令会在下一个步骤边界生效。'
+        : (engine.alive ? '引擎在跑，不过这个任务不在执行中。' : '引擎没在跑，任务卡是历史记录，按钮点不动。');
+  const pausedBanner = pausedHere
+    ? '<div class="paused-banner"><b>已暂停</b>' + esc(pausedInfo.reason || '等你决定')
+      + (pausedInfo.stage ? '（' + esc(STAGE_LABEL[pausedInfo.stage] || pausedInfo.stage) + '）' : '')
+      + (pausedInfo.since ? ' · ' + esc(timeLabel(pausedInfo.since)) + ' 起' : '')
+      + '</div>'
+    : '';
+
   const verify = (task && task.verify_tail)
     ? '<pre class="block">' + esc(task.verify_tail) + '</pre>'
     : '<div class="empty">' + esc(changes.last_verify || '还没有验收记录') + '</div>';
@@ -1398,13 +1610,19 @@ function renderInspector(){
     + '<section class="panel"><h3>Agent 状态<span class="n">'
     +   (busyCount ? busyCount + ' 个在忙' : '全部空闲') + '</span></h3>'
     +   '<div class="agents">' + agentRows + '</div></section>'
-    + '<section class="panel"><h3>当前任务</h3>' + taskBlock + '</section>'
+    + '<section class="panel"><h3>当前任务<span class="n">'
+    +   (engine.alive ? '引擎在跑' : '引擎没在跑') + '</span></h3>'
+    +   taskBlock + pausedBanner + ctrlHtml
+    +   '<div class="ctrl-hint">' + esc(ctrlHint) + '</div></section>'
     + '<section class="panel"><h3>测试结果</h3>' + verify + '</section>'
     + '<section class="panel"><h3>代码改动<span class="n">' + files.length
     +   ' 个文件</span></h3>' + filesHtml + diffHtml + '</section>';
 
   inspEl.querySelectorAll('.art[data-art]').forEach(btn => {
     btn.onclick = () => openArtifact(btn.dataset.art);
+  });
+  inspEl.querySelectorAll('.ctrl button[data-act]').forEach(btn => {
+    btn.onclick = () => sendControl(btn.dataset.act);
   });
 }
 
@@ -1415,11 +1633,16 @@ function renderChrome(){
   const busy = ROLES.filter(r => agents[r] === 'working');
   const live = $('live');
   const txt = $('live-txt');
-  if(busy.length){
+  const paused = st.paused || null;
+  live.classList.remove('busy', 'paused');
+  if(paused){
+    live.classList.add('paused');
+    const wait = String(paused.stage || '') === 'approve' || /批准/.test(String(paused.reason || ''));
+    txt.textContent = wait ? '已暂停：等你批准' : '已暂停';
+  } else if(busy.length){
     live.classList.add('busy');
     txt.textContent = busy.map(r => agentOf(r).name).join(' / ') + ' 在干活';
   } else {
-    live.classList.remove('busy');
     txt.textContent = '空闲';
   }
   const note = $('store-note');
@@ -1452,27 +1675,17 @@ function applyState(next){
 }
 
 async function load(){
-  try{
-    const q = new URLSearchParams();
-    if(activeId) q.set('session', activeId);
-    const res = await fetch('/api/state?' + q.toString(), {cache: 'no-store'});
-    if(!res.ok) return st;
-    const data = await res.json();
-    applyState(data);
-    return data;
-  }catch(e){
-    return st;   // 服务重启中，下一轮再试
-  }
+  const q = new URLSearchParams();
+  if(activeId) q.set('session', activeId);
+  const data = await apiGet('/api/state?' + q.toString());
+  if(!data) return st;      // 没令牌/服务重启中：下一轮再试
+  applyState(data);
+  return data;
 }
 
 async function selectSession(id){
   if(!id || id === activeId) return;
-  try{
-    await fetch('/api/session/select', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: id})
-    });
-  }catch(e){}
+  await apiPost('/api/session/select', {session_id: id});
   localTyping = null;
   activeId = id;
   await load();
@@ -1482,22 +1695,14 @@ async function newSession(){
   const btn = $('new-chat');
   btn.disabled = true;
   const workspace = st.workspace || (st.session && st.session.workspace) || '';
-  try{
-    const res = await fetch('/api/session', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({workspace: workspace})
-    });
-    const data = await res.json().catch(() => ({}));
-    if(data.ok && data.session && data.session.id){
-      localTyping = null;
-      activeId = data.session.id;
-      await load();
-      input.focus();
-    } else {
-      toast(data.error || '新建会话失败');
-    }
-  }catch(e){
-    toast('网络异常，新建会话失败');
+  const data = await apiPost('/api/session', {workspace: workspace}) || {};
+  if(data.ok && data.session && data.session.id){
+    localTyping = null;
+    activeId = data.session.id;
+    await load();
+    input.focus();
+  } else if(data && data.error){
+    toast(data.error);
   }
   btn.disabled = false;
 }
@@ -1512,21 +1717,15 @@ async function bindWorkspace(){
   if(!raw){ showWsStatus(false, '请先填写工作区绝对路径'); return; }
   wsBtn.disabled = true;
   showWsStatus(null, '正在验证…');
-  try{
-    const res = await fetch('/api/workspace', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({path: raw})
-    });
-    const data = await res.json().catch(() => ({ok: false, error: '服务端返回异常'}));
-    if(data.ok){
-      showWsStatus(true, '已绑定：' + (data.workspace || raw)
-        + (data.name && data.name !== data.workspace ? '（' + data.name + '）' : ''));
-      await load();
-    } else {
-      showWsStatus(false, data.error || '这个路径不可用');
-    }
-  }catch(e){
-    showWsStatus(false, '验证失败：网络异常');
+  const data = await apiPost('/api/workspace', {path: raw});
+  if(!data){
+    showWsStatus(false, '需要访问令牌，先在解锁卡片里粘贴令牌');
+  } else if(data.ok){
+    showWsStatus(true, '已绑定：' + (data.workspace || raw)
+      + (data.name && data.name !== data.workspace ? '（' + data.name + '）' : ''));
+    await load();
+  } else {
+    showWsStatus(false, data.error || '这个路径不可用');
   }
   wsBtn.disabled = false;
 }
@@ -1541,6 +1740,29 @@ function autosize(){
   input.style.height = 'auto';
   input.style.height = Math.min(150, input.scrollHeight) + 'px';
   sendBtn.disabled = !input.value.trim();
+}
+
+async function sendControl(action){
+  if(Date.now() < controlCooldown) return;          // 1 秒内不重复发
+  const label = CTRL_LABEL[action] || action;
+  const taskId = (st.task && st.task.id) || '';
+  controlCooldown = Date.now() + 1000;
+  renderInspector();                                // 立刻禁掉按钮，别让用户连点
+  const data = await apiPost('/api/control', {action: action, task_id: taskId});
+  if(data && data.ok){
+    toast('已' + label + (taskId ? '（' + taskId + '）' : '') + '，引擎会在下一步生效');
+    // 本地先回显，别等引擎写 pause.json 才变
+    if(action === 'pause' && !st.paused){
+      st.paused = {task: taskId, reason: '你点了暂停', stage: '', since: new Date().toISOString()};
+    } else if((action === 'resume' || action === 'approve' || action === 'stop') && st.paused){
+      st.paused = null;
+    }
+    renderChrome();
+    renderInspector();
+  } else {
+    toast((data && data.error) || (label + '没发出去'));
+  }
+  await load();
 }
 
 function showEcho(text){
@@ -1565,16 +1787,8 @@ async function send(){
   localTyping = {who: 'coordinator'};
   renderTyping();
   scrollDown();
-  try{
-    const res = await fetch('/api/post', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: activeId || '', content: text})
-    });
-    const data = await res.json().catch(() => ({}));
-    if(!data || data.ok === false) toast((data && data.error) || '发送失败');
-  }catch(e){
-    toast('网络异常，消息可能没发出去');
-  }
+  const data = await apiPost('/api/post', {session_id: activeId || '', content: text});
+  if(!data || data.ok === false) toast((data && data.error) || '发送失败');
   const next = await load();
   const list = (next && next.messages) || [];
   if(list.some(m => m.role === 'user' && String(m.content || '').trim() === text)) echo.remove();
@@ -1588,17 +1802,16 @@ async function openArtifact(path){
   modal.hidden = false;
   modalPath.textContent = path;
   modalBody.textContent = '正在加载…';
-  try{
-    const res = await fetch('/api/artifact?path=' + encodeURIComponent(path));
-    const data = await res.json();
-    if(data.ok){
-      modalBody.textContent = data.content || '（空文件）';
-      if(data.truncated) modalPath.textContent = path + '（内容过长，已截断）';
-    } else {
-      modalBody.textContent = data.error || '读取失败';
-    }
-  }catch(e){
-    modalBody.textContent = '读取失败：网络异常';
+  const data = await apiGet('/api/artifact?path=' + encodeURIComponent(path));
+  if(!data){
+    modalBody.textContent = '读取失败：需要访问令牌或服务不在';
+    return;
+  }
+  if(data.ok){
+    modalBody.textContent = data.content || '（空文件）';
+    if(data.truncated) modalPath.textContent = path + '（内容过长，已截断）';
+  } else {
+    modalBody.textContent = data.error || '读取失败';
   }
 }
 
@@ -1624,20 +1837,42 @@ function tick(){
   lastClock += 1;
 }
 
-autosize();
-load();
-setInterval(tick, 1000);
-input.focus();
+/* ---------- 启动：有令牌才进工作台，没有就先让用户粘贴 ---------- */
+function submitUnlock(){
+  const value = String(unlockInput.value || '').trim();
+  if(!value){ unlockErr.textContent = '先粘贴访问令牌'; return; }
+  rememberToken(value);
+  unlockInput.value = '';
+  unlockErr.textContent = '';
+  location.reload();          // 刷新一次，让页面按新令牌重新拉状态
+}
+
+function startWorkbench(){
+  rememberToken(ACTIVE_TOKEN);
+  unlockEl.hidden = true;
+  document.body.classList.add('ready');
+  autosize();
+  load();
+  setInterval(tick, 1000);
+  input.focus();
+}
+
+unlockBtn.onclick = submitUnlock;
+unlockInput.addEventListener('keydown', e => {
+  if(e.key === 'Enter'){ e.preventDefault(); submitUnlock(); }
+});
+
+if(ACTIVE_TOKEN) startWorkbench(); else showUnlock('');
 
 /* 页面开着就一直在（每秒打一次 /api/state，服务端据此判断在线）。
-   关页面/关标签页时尽力发一次告别；发不出去也没关系，服务端有超时兜底。 */
+   关页面/关标签页时尽力发一次告别；sendBeacon 不能带头，所以令牌放 URL 上。 */
 function sayBye(){
   try{
     const body = JSON.stringify({reason: 'page-unloaded'});
     if(navigator.sendBeacon){
-      navigator.sendBeacon('/api/bye', new Blob([body], {type: 'application/json'}));
+      navigator.sendBeacon(withToken('/api/bye'), new Blob([body], {type: 'application/json'}));
     } else {
-      fetch('/api/bye', {method:'POST', body, headers:{'Content-Type':'application/json'}, keepalive: true});
+      fetch(withToken('/api/bye'), {method:'POST', body, headers: tokenHeaders(), keepalive: true});
     }
   }catch(e){}
 }
@@ -1812,6 +2047,34 @@ class Handler(BaseHTTPRequestHandler):
         PRESENCE["bye_at"] = 0.0        # 刷新页面会重新发请求，撤销关闭标记
         PRESENCE["deferred"] = False
 
+    # ---------- 访问令牌 ----------
+    def _supplied_token(self, qs: dict) -> str:
+        """令牌两种带法都认：请求头 X-Team-Token，或 URL 上的 ?token=。"""
+        header = (self.headers.get("X-Team-Token") or "").strip()
+        if header:
+            return header
+        return str((qs.get("token") or [""])[0]).strip()
+
+    def _authorized(self, qs: dict) -> bool:
+        if not TOKEN:
+            return True                     # 没启用令牌（比如令牌文件写不进去）就别拦人
+        supplied = self._supplied_token(qs)
+        if not supplied:
+            return False
+        try:
+            return secrets.compare_digest(supplied, TOKEN)
+        except TypeError:                   # 极端情况下类型不一致
+            return supplied == TOKEN
+
+    def _guard(self, parsed, qs: dict) -> bool:
+        """除 /api/alive 外的所有 /api/* 都要令牌；通过了返回 True。"""
+        if not parsed.path.startswith("/api/") or parsed.path == "/api/alive":
+            return True
+        if self._authorized(qs):
+            return True
+        self._json({"ok": False, "error": "需要访问令牌"}, 401)
+        return False
+
     # ---------- GET ----------
     def do_GET(self) -> None:           # noqa: N802
         try:
@@ -1821,14 +2084,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_get(self) -> None:
         parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
         if parsed.path in ("/", "/index.html"):
+            # 带了有效的令牌才把令牌注入页面；没带就注入空串，页面自己弹"输入令牌"卡片。
+            page_token = TOKEN if (TOKEN and self._authorized(qs)) else ""
             page = (PAGE
+                    .replace("__TOKEN__", json.dumps(page_token))
                     .replace("__AGENTS__", json.dumps(AGENTS, ensure_ascii=False))
                     .replace("__STATUS_LABEL__", json.dumps(STATUS_LABEL, ensure_ascii=False)))
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
             return
 
-        qs = parse_qs(parsed.query)
+        if not self._guard(parsed, qs):
+            return
 
         def one(name: str) -> str:
             return (qs.get(name) or [""])[0]
@@ -1840,6 +2108,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/alive":
             self._touch()
             self._json({"ok": True})
+            return
+        if parsed.path == "/api/control":
+            paused, pending = _control_state()
+            self._json({"ok": True, "paused": paused, "control": pending,
+                        "engine": _engine_info(), "actions": list(CONTROL_ACTIONS),
+                        "available": control is not None})
             return
         if parsed.path == "/api/session":
             self._json({"ok": True, "session": STORE.active(one("session")),
@@ -1891,6 +2165,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_post(self) -> None:
         parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        if not self._guard(parsed, qs):
+            return
         if parsed.path == "/api/bye":
             PRESENCE["bye_at"] = time.time()
             self._json({"ok": True, "bye_at": PRESENCE["bye_at"]})
@@ -1903,6 +2180,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/post":
             self._post_message(body)
             return
+        if parsed.path == "/api/control":
+            self._post_control(body)
+            return
         if parsed.path == "/api/workspace":
             self._post_workspace(body)
             return
@@ -1913,6 +2193,28 @@ class Handler(BaseHTTPRequestHandler):
             self._post_select(body)
             return
         self._json({"ok": False, "error": "接口不存在"}, 404)
+
+    def _post_control(self, body: dict) -> None:
+        """网页上的 暂停/继续/停止/批准/重新执行：写一条指令，引擎在步骤边界消费。"""
+        action = str(body.get("action") or "").strip().lower()
+        task_id = str(body.get("task_id") or body.get("task") or "").strip() or None
+        if control is None:
+            self._json({"ok": False, "error": "控制模块（control.py）不可用，点了也不会生效"}, 503)
+            return
+        if not action:
+            self._json({"ok": False, "error": "缺少 action（只认 "
+                                             + "/".join(CONTROL_ACTIONS) + "）"}, 400)
+            return
+        try:
+            payload = control.request(action, task_id)
+        except ValueError as exc:       # 不认识的指令
+            self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:        # noqa: BLE001 - 盘写不了也要说人话
+            self._json({"ok": False, "error": f"控制指令没写进去：{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"ok": True, "action": payload.get("action"),
+                    "task": payload.get("task") or "", "at": payload.get("at")})
 
     def _post_message(self, body: dict) -> None:
         content = str(body.get("content") or body.get("text") or "").strip()
@@ -2015,13 +2317,18 @@ def main() -> int:
                     help="收到关闭通知后等待几秒，留时间给刷新页面")
     args = ap.parse_args()
 
+    global TOKEN
+    TOKEN = _ensure_token()
+    token_note = "链接里的 token 不要外传" if TOKEN else "令牌文件写不进去，本次不启用令牌"
+
     autostop = not args.no_autostop and os.environ.get("AGENT_TEAM_AUTOSTOP", "1") != "0"
     _write_session_state("running")
     if autostop:
         threading.Thread(target=_guardian, args=(args.idle_seconds, args.grace_seconds),
                          daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"协作台: http://{args.host}:{args.port}/", flush=True)
+    print(f"协作台: http://{args.host}:{args.port}/?token={TOKEN}", flush=True)
+    print(f"（{token_note}；直接打开不带 token 的地址会要求粘贴令牌）", flush=True)
     if STORE.ready:
         print("会话存储：session.py 就绪", flush=True)
     else:

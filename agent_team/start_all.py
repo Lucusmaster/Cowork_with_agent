@@ -32,6 +32,16 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
+def web_url(port: int) -> str:
+    """带令牌的网页地址：令牌在 room/web-token 里，没有就退回裸地址。"""
+    try:
+        token = (ROOT / "room" / "web-token").read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    base = f"http://127.0.0.1:{port}/"
+    return f"{base}?token={token}" if token else base
+
+
 def port_busy(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.4)
@@ -126,7 +136,7 @@ def find_web_pid(port: int) -> list[int]:
 
 def status(port: int) -> None:
     print(f"仓库      {ROOT}")
-    print(f"协作台    {'在跑' if port_busy(port) else '未启动'}  http://127.0.0.1:{port}/")
+    print(f"协作台    {'在跑' if port_busy(port) else '未启动'}  {web_url(port)}")
     pid = worker_pid()
     print(f"引擎      {'在跑 pid ' + str(pid) if pid else '未启动'}")
     print(f"日志      {ROOM / 'worker.log'}")
@@ -157,14 +167,14 @@ def status(port: int) -> None:
 def start(port: int) -> int:
     ROOM.mkdir(parents=True, exist_ok=True)
     if port_busy(port):
-        print(f"协作台已在运行: http://127.0.0.1:{port}/")
+        print(f"协作台已在运行: {web_url(port)}")
     else:
         spawn([*WEB, "--port", str(port)])
         for _ in range(20):
             if port_busy(port):
                 break
             time.sleep(0.25)
-        print(f"协作台已启动: http://127.0.0.1:{port}/" if port_busy(port)
+        print(f"协作台已启动: {web_url(port)}" if port_busy(port)
               else "协作台启动失败，看 room/web.out 或直接前台跑 python bin/room_web.py")
     pid = worker_pid()
     if pid:
@@ -175,7 +185,7 @@ def start(port: int) -> int:
         new_pid = spawn([*WORKER, "--interval", "0.5"])
         print(f"引擎已启动 (pid {new_pid})：发任务后 3 秒内自动开工")
     print()
-    print("打开上面的地址，中间输入框发任务即可。")
+    print("打开上面的地址（链接里带访问令牌），中间输入框发任务即可。")
     return 0
 
 

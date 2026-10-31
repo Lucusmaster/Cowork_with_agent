@@ -9,7 +9,7 @@
 ## 开发循环
 
 ```powershell
-python -m unittest discover -s tests -t .     # 110 项，必须全绿
+python -m unittest discover -s tests -t .     # 151 项，必须全绿
 python -m agent_team.cli doctor               # 体检
 python -m agent_team.cli start --restart      # 改完代码重启才生效
 ```
