@@ -89,6 +89,9 @@ class FakeStore:
     def restore(self, trash_name: str) -> dict:
         raise RuntimeError("FakeStore 不支持还原（还原的真实链路在 TrashAndRenameTests）")
 
+    def empty_trash(self) -> dict:
+        raise RuntimeError("FakeStore 不支持清空回收站（真实链路在 TrashAndRenameTests）")
+
     def rename(self, session_id: str, title: str) -> dict:
         raise RuntimeError("FakeStore 不支持改名（改名的真实链路在 TrashAndRenameTests）")
 
@@ -1406,6 +1409,42 @@ class TrashAndRenameTests(WebCase):
         self.assertIn(status, (400, 404), data)
         self.assertFalse(data["ok"])
 
+    # ---------- 回收站：清空 ----------
+    def test_empty_trash_clears_everything(self) -> None:
+        a = self.make("会话 A")
+        b = self.make("会话 B")
+        keep = self.make("留着的")
+        self.delete(a)
+        self.delete(b)
+        self.assertEqual(len(self.trash_of()), 2)
+        status, data = self.post("/api/session/empty-trash", {})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["removed"], 2)
+        self.assertEqual(data["failed"], [])
+        self.assertEqual(data["trash"], [], "清完 state 里不该还有东西")
+        self.assertEqual(self.trash_of(), [])
+        trash_dir = self.sess.ROOM / "sessions" / "trash"
+        self.assertEqual(list(trash_dir.glob("*.jsonl")), [], "文件要真的删掉，不是只从列表里藏起来")
+        self.assertEqual(list(trash_dir.glob("*.json")), [], "sidecar 也不能留下")
+        self.assertIn(keep, [r["id"] for r in self.rows()], "没删过的会话必须原样还在")
+
+    def test_empty_trash_twice_is_fine(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        self.post("/api/session/empty-trash", {})
+        status, data = self.post("/api/session/empty-trash", {})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["removed"], 0, "空回收站再清一次不报错")
+
+    def test_empty_trash_requires_token(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        status, data = self.call("/api/session/empty-trash", method="POST", body={})
+        self.assertEqual(status, 401)
+        self.assertEqual(len(self.trash_of()), 1, "没令牌的请求不能真把回收站清掉")
+
     def test_restore_requires_token(self) -> None:
         a = self.make("会话 A")
         self.delete(a)
@@ -1576,6 +1615,15 @@ class PageContractTests(unittest.TestCase):
         for glyph in ("🗑", "📄", "📁", "📦"):
             self.assertNotIn(glyph, page, f"页面里还有 emoji 当图标：{glyph}")
         self.assertIn('id="i-trash"', page)
+
+    def test_trash_can_be_emptied(self) -> None:
+        """回收站不能只进不出：清空按钮 + 接口 + 确认框文案都得在。"""
+        page = room_web.PAGE
+        for hook in ('id="trash-empty"', "/api/session/empty-trash", "askEmptyTrash",
+                     "askConfirm", "id=\"confirm-warn\""):
+            self.assertIn(hook, page, f"页面里少了清空回收站的钩子：{hook}")
+        self.assertIn("彻底删除", page, "清空是不可逆的，文案要说清楚")
+        self.assertIn("runConfirm", page, "确认框要能带着动作跑，别写死成只删会话")
 
 
 if __name__ == "__main__":

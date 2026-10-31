@@ -748,6 +748,38 @@ def restore(trash_name: str) -> dict:
         return result
 
 
+def empty_trash() -> dict:
+    """清空回收站：把 ``sessions/trash/`` 里的会话文件连同 sidecar 一并彻底删掉。
+
+    返回 ``{"removed": 已删会话数, "failed": [删不掉的文件名]}``：
+
+    - 只删回收站目录里的**普通文件**（不递归、不跟符号链接），主列表和磁盘上别的
+      地方一个字节都不动；
+    - 单条删不掉（被别的进程占着、权限不够）不抛异常，记进 ``failed`` 继续删别的，
+      免得一个坏文件把整个清空卡住；
+    - 回收站本来就是空的（或目录还不存在）属于正常情况：``removed`` 为 0，不报错。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        directory = _trash_dir()
+        if not directory.is_dir():
+            return {"removed": 0, "failed": []}
+        removed: list[str] = []
+        failed: list[str] = []
+        for path in sorted(directory.iterdir()):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                failed.append(path.name)
+                continue
+            if path.suffix.lower() == ".jsonl":
+                removed.append(path.name)
+        return {"removed": len(removed), "failed": failed, "names": removed}
+
+
 def append(session_id: str, *, role: str, agent: str, content: str,
            task_id: str | None = None, artifacts: list[str] | None = None,
            status: str = "complete", meta: dict | None = None) -> dict:

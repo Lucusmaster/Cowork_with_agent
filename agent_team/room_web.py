@@ -688,6 +688,21 @@ class ChatStore:
             out["trash_name"] = str(entry["trash_name"])
         return out
 
+    def empty_trash(self) -> dict:
+        """清空回收站：``session.py`` 负责真删文件，这里只把结果收拾成界面要的形状。
+
+        ``session.py`` 版本旧（没有 ``empty_trash()``）时明确报错，而不是假装删了。
+        """
+        if self.mod is None:
+            raise RuntimeError("会话模块（session.py）还没就绪")
+        fn = getattr(self.mod, "empty_trash", None)
+        if not callable(fn):
+            raise RuntimeError("session.py 版本太旧，没有 empty_trash()，先升级再清空")
+        result = fn()
+        data = result if isinstance(result, dict) else {}
+        failed = [str(name) for name in (data.get("failed") or []) if str(name)]
+        return {"removed": _as_int(data.get("removed")), "failed": failed}
+
     def rename(self, session_id: str, title: str) -> dict:
         """改会话标题（改完锁住，之后新增消息不会再被首条消息覆盖）。"""
         if self.mod is None:
@@ -1987,6 +2002,15 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
 .trash-row .back:hover{background:#1b3550}
 .trash-empty{padding:var(--sp-6) var(--sp-4);text-align:center;color:var(--dim2);
   font-size:var(--fs-sm);line-height:1.9}
+/* 卡片底部：左边说清后果，右边才是动作（默认禁用，免得空回收站还让人点） */
+.trash-foot{display:flex;align-items:center;gap:var(--sp-3);flex:0 0 auto;
+  padding:var(--sp-3) var(--sp-4);border-top:var(--hair) solid var(--line);
+  background:var(--panel2)}
+.trash-foot .hint{flex:1;min-width:0;font-size:var(--fs-xs);color:var(--dim2);
+  line-height:1.5}
+.trash-foot button{flex:0 0 auto;height:28px;padding:0 var(--sp-3);border-radius:var(--r-1);
+  font-size:var(--fs-sm)}
+.trash-foot button[disabled]{opacity:.45}
 
 /* ---------- 响应式 ---------- */
 /* 1180：三栏收窄，次要统计先让位（结构不动） */
@@ -2344,7 +2368,7 @@ body.fx-on .fx-tap{
   <div class="confirm-card">
     <div class="confirm-title" id="confirm-title">删除会话</div>
     <div class="confirm-line" id="confirm-target"></div>
-    <div class="confirm-warn">删除后这个会话不再出现在列表里，但会留在左栏底部的
+    <div class="confirm-warn" id="confirm-warn">删除后这个会话不再出现在列表里，但会留在左栏底部的
       「回收站」里，随时能还原</div>
     <div class="confirm-actions">
       <button id="confirm-cancel">取消</button>
@@ -2363,6 +2387,10 @@ body.fx-on .fx-tap{
       <button class="x" id="trash-close" title="关闭（Esc）">×</button>
     </div>
     <div class="trash-list" id="trash-list"></div>
+    <div class="trash-foot">
+      <span class="hint" id="trash-hint">「还原」能捡回来；「清空」是彻底删除，找不回来</span>
+      <button class="btn-danger" id="trash-empty" disabled>清空回收站</button>
+    </div>
   </div>
 </div>
 
@@ -3282,6 +3310,7 @@ const confirmEl = $('confirm');
 const trashEl = $('trash'), trashListEl = $('trash-list');
 const trashEntry = $('trash-entry'), trashCountEl = $('trash-count');
 const trashCloseBtn = $('trash-close');
+const trashEmptyBtn = $('trash-empty');
 const unlockEl = $('unlock'), unlockInput = $('unlock-input');
 const unlockBtn = $('unlock-btn'), unlockErr = $('unlock-err');
 
@@ -3675,7 +3704,7 @@ let archOpen = false;          // 已归档分组是否展开（归档后自动�
 let menuSessId = '';           // 菜单当前对应的会话
 let menuAnchor = null;         // 打开菜单的那一行/按钮（Esc 后焦点还回去）
 let menuIndex = 0;
-let confirmSessId = '';        // 删除确认框对应的会话
+let confirmRun = null;         // 「确定」要跑的动作（删会话 / 清空回收站…），空则不动作
 let confirmBack = null;        // 关掉确认框后焦点还回去
 let lastSessHtml = '';         // 上一次渲染出来的列表 HTML（没变就不重建 DOM）
 let renamingId = '';           // 正在行内改名的会话（非空时暂停列表重绘，别把输入框吞掉）
@@ -3852,33 +3881,52 @@ function sessKeys(ev){
   }
 }
 
-/* ---------- 删除确认框 ---------- */
-function openConfirm(id){
-  const s = sessById(id);
-  if(!s) return;
-  closeSessMenu(false);
+/* ---------- 确认框（通用）：默认「取消」有焦点，回车不会误删 ---------- */
+function askConfirm(opts){
+  const o = opts || {};
   confirmBack = document.activeElement;
-  confirmSessId = id;
-  $('confirm-target').innerHTML = '<b>' + esc(s.title || '新会话') + '</b> · '
-    + esc(String(s.message_count || 0)) + ' 条消息';
+  confirmRun = typeof o.run === 'function' ? o.run : null;
+  $('confirm-title').textContent = o.title || '确认';
+  $('confirm-target').innerHTML = o.target || '';
+  $('confirm-warn').innerHTML = o.warn || '';
+  $('confirm-ok').textContent = o.ok || '确定';
   confirmEl.hidden = false;
   const cancel = $('confirm-cancel');
   if(cancel){ try { cancel.focus(); } catch(e){} }      // 焦点默认在「取消」
 }
 
+function openConfirm(id){
+  const s = sessById(id);
+  if(!s) return;
+  closeSessMenu(false);
+  askConfirm({
+    title: '删除会话',
+    target: '<b>' + esc(s.title || '新会话') + '</b> · '
+      + esc(String(s.message_count || 0)) + ' 条消息',
+    warn: '删除后这个会话不再出现在列表里，但会留在左栏底部的「回收站」里，随时能还原',
+    ok: '删除',
+    run: () => doDelete(id)
+  });
+}
+
 function closeConfirm(focusBack){
   if(confirmEl.hidden) return;
   confirmEl.hidden = true;
-  confirmSessId = '';
+  confirmRun = null;
   if(focusBack && confirmBack && confirmBack.focus){
     try { confirmBack.focus(); } catch(e){}
   }
   confirmBack = null;
 }
 
-async function doDelete(){
-  const id = confirmSessId;
+/* 「确定」按钮统一走这里：先收起框，再跑这一轮登记的动作 */
+function runConfirm(){
+  const run = confirmRun;
   closeConfirm(false);
+  if(run){ try { run(); } catch(e){} }
+}
+
+async function doDelete(id){
   if(!id) return;
   const data = await apiPost('/api/session/delete', {id: id, confirm: true});
   if(!data || !data.ok){ toast((data && data.error) || '删除失败'); return; }
@@ -3954,6 +4002,10 @@ function startRename(id){
 function renderTrash(){
   if(!trashListEl) return;
   const rows = st.trash || [];
+  if(trashEmptyBtn){                                    // 空的就别让人点
+    trashEmptyBtn.disabled = !rows.length;
+    trashEmptyBtn.textContent = rows.length ? ('清空回收站（' + rows.length + '）') : '清空回收站';
+  }
   const sig = rows.map(t => t.trash_name).join('|');
   if(sig === lastTrashSig) return;
   lastTrashSig = sig;
@@ -3993,6 +4045,31 @@ function closeTrash(focusBack){
   lastTrashSig = '';
   if(focusBack && trashBack && trashBack.focus){ try { trashBack.focus(); } catch(e){} }
   trashBack = null;
+}
+
+/* 清空回收站：先问一句（默认落在「取消」上），确认才真删 */
+function askEmptyTrash(){
+  const n = (st.trash || []).length;
+  if(!n){ toast('回收站本来就是空的'); return; }
+  askConfirm({
+    title: '清空回收站',
+    target: '这里的 <b>' + n + '</b> 个会话会被彻底删除',
+    warn: '「还原」是捡回来，「清空」是删掉文件，删完就找不回来了',
+    ok: '彻底删除',
+    run: doEmptyTrash
+  });
+}
+
+async function doEmptyTrash(){
+  const data = await apiPost('/api/session/empty-trash', {});
+  if(!data || !data.ok){ toast((data && data.error) || '清空失败'); return; }
+  const gone = Number(data.removed || 0);
+  toast(gone ? ('已清空 ' + gone + ' 个会话') : '回收站本来就是空的');
+  if(data.error) toast(data.error);                     // 个别文件删不掉时单独说一句
+  lastTrashSig = '';
+  await load({fresh: true});
+  renderTrash();
+  if(!(st.trash || []).length) closeTrash(true);
 }
 
 async function restoreSession(name, btn){
@@ -4753,7 +4830,7 @@ $('menu-rename').onclick = () => { const id = menuSessId; if(id) startRename(id)
 $('menu-archive').onclick = () => { const id = menuSessId; if(id) sessArchive(id, true); };
 $('menu-delete').onclick = () => { const id = menuSessId; if(id) openConfirm(id); };
 $('confirm-cancel').onclick = () => closeConfirm(true);
-$('confirm-ok').onclick = doDelete;
+$('confirm-ok').onclick = runConfirm;
 if(confirmEl) confirmEl.addEventListener('click', ev => {
   if(ev.target === confirmEl) closeConfirm(true);      // 点遮罩 = 取消
 });
@@ -4770,6 +4847,7 @@ document.addEventListener('keydown', sessKeys);
 /* ---------- 回收站的接线 ---------- */
 if(trashEntry) trashEntry.onclick = openTrash;
 if(trashCloseBtn) trashCloseBtn.onclick = () => closeTrash(true);
+if(trashEmptyBtn) trashEmptyBtn.onclick = askEmptyTrash;
 if(trashEl) trashEl.addEventListener('click', ev => {
   if(ev.target === trashEl) closeTrash(true);          // 点遮罩 = 关闭
 });
@@ -5353,6 +5431,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/session/restore":
             self._post_session_restore(body)
             return
+        if parsed.path == "/api/session/empty-trash":
+            self._post_session_empty_trash(body)
+            return
         if parsed.path == "/api/session/rename":
             self._post_session_rename(body)
             return
@@ -5609,6 +5690,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json({"ok": True, "session": entry, "active": STORE.active_id(),
                     "trash": STORE.trash()})
+
+    def _post_session_empty_trash(self, body: dict) -> None:
+        try:
+            result = STORE.empty_trash()
+        except Exception as exc:    # noqa: BLE001
+            self._json({"ok": False, "error": f"清空回收站失败：{type(exc).__name__}: {exc}"}, 500)
+            return
+        failed = list(result.get("failed") or [])
+        self._json({"ok": True, "removed": int(result.get("removed") or 0),
+                    "failed": failed, "trash": STORE.trash(),
+                    "error": ("有 %d 个文件删不掉（可能被占用）：%s"
+                              % (len(failed), "、".join(failed[:3]))) if failed else None})
 
     def _post_session_rename(self, body: dict) -> None:
         session_id = str(body.get("id") or body.get("session_id") or "").strip()

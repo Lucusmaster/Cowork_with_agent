@@ -454,5 +454,75 @@ class RenameTests(SessionOpsBase):
         self.assertEqual(self._row(entry["id"])["title"], "自动标题", "没 rename 过的行为不能变")
 
 
+class EmptyTrashTests(SessionOpsBase):
+    """清空回收站：只删回收站里的东西，别的一律不动。"""
+
+    def test_empty_trash_removes_files_and_sidecars(self) -> None:
+        a = self._make("会话 A")
+        b = self._make("会话 B")
+        session.delete(a["id"])
+        session.delete(b["id"])
+        trash_dir = session._trash_dir()
+        self.assertEqual(len(list(trash_dir.glob("*.jsonl"))), 2)
+        self.assertEqual(len(list(trash_dir.glob("*.json"))), 2, "两条都该有 sidecar")
+
+        result = session.empty_trash()
+
+        self.assertEqual(result["removed"], 2)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(list(trash_dir.glob("*.jsonl")), [], "jsonl 要全删掉")
+        self.assertEqual(list(trash_dir.glob("*.json")), [], "sidecar 不能留下来当垃圾")
+        self.assertEqual(session.list_trash(), [])
+
+    def test_empty_trash_on_empty_trash_is_noop(self) -> None:
+        for _ in range(2):                       # 空的时候连点两次都不许炸
+            result = session.empty_trash()
+            self.assertEqual(result["removed"], 0)
+            self.assertEqual(result["failed"], [])
+
+    def test_empty_trash_keeps_live_sessions(self) -> None:
+        a = self._make("留下的")
+        b = self._make("要清掉的")
+        session.delete(b["id"])
+        session.empty_trash()
+        ids = [item["id"] for item in session.sessions()]
+        self.assertIn(a["id"], ids, "没删过的会话不能被牵连")
+        self.assertEqual(len(session.messages(a["id"])), 1)
+        self.assertTrue(session._session_file(a["id"]).is_file())
+
+    def test_empty_trash_also_clears_legacy_rows_without_sidecar(self) -> None:
+        self._old_trash()
+        self.assertEqual(len(session.list_trash()), 1)
+        self.assertEqual(session.empty_trash()["removed"], 1)
+        self.assertEqual(session.list_trash(), [])
+
+    def test_empty_trash_leaves_foreign_files_alone(self) -> None:
+        a = self._make("会话 A")
+        session.delete(a["id"])
+        outside = session.ROOM / "sessions" / "keep-me.jsonl"
+        outside.write_text('{"id":"x"}\n', encoding="utf-8")
+        session.empty_trash()
+        self.assertTrue(outside.is_file(), "回收站之外的目录不允许被扫到")
+
+    def test_empty_trash_survives_undeletable_file(self) -> None:
+        a = self._make("会话 A")
+        b = self._make("会话 B")
+        session.delete(a["id"])
+        session.delete(b["id"])
+        real_unlink = Path.unlink
+        locked = f"{a['id']}-"
+
+        def picky(path, *args, **kwargs):          # 只让 a 的 jsonl 删不掉（模拟被占用）
+            if path.suffix == ".jsonl" and path.name.startswith(locked):
+                raise PermissionError("被占用了")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", picky):
+            result = session.empty_trash()
+        self.assertEqual(len(result["failed"]), 1, "删不掉的文件要报出来，不能静默")
+        self.assertEqual(result["removed"], 1, "另外那条照删，一个坏文件不能把清空全卡住")
+        self.assertEqual(len(session.list_trash()), 1, "删不掉的那条还留在回收站里")
+
+
 if __name__ == "__main__":
     unittest.main()
