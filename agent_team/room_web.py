@@ -188,6 +188,23 @@ def _ledger_inside(path: Path) -> bool:
     return resolved == ROOT_RESOLVED or ROOT_RESOLVED in resolved.parents
 
 
+def _workspace_blocked(path: Path) -> tuple[bool, str]:
+    """这个目录能不能当工作区：协作台自己的仓库（含它里面的子目录）不行。
+
+    ``POST /api/workspace`` 本来就会拒（见 ``_ledger_inside``），这里提前算出来，
+    目录对话框就能直接把「确认」按钮禁掉，而不是让用户点一次、等后端拒一次。
+    """
+    if not _ledger_inside(path):
+        return False, ""
+    try:
+        same = path.resolve() == ROOT_RESOLVED
+    except OSError:
+        same = False
+    if same:
+        return True, "这是协作台自己的目录，不能当选工作区"
+    return True, "这个目录在协作台仓库里面，不能当工作区"
+
+
 def _run_git(args: list[str], workspace: str, timeout: float = 4.0) -> str:
     """只跑固定参数数组，绝不拼接 shell 字符串。"""
     try:
@@ -310,13 +327,15 @@ def _dir_hint(summary: dict, branch: str = "") -> str:
 def _browse_selected(path: Path) -> dict:
     """对当前路径的体检：确认之前就让人看清这是不是要的那个仓库。"""
     info = {"exists": False, "is_git": False, "git_branch": "", "file_count": 0,
-            "entry_count": 0, "writable": False, "has_tasks": False}
+            "entry_count": 0, "writable": False, "has_tasks": False,
+            "blocked": False, "block_reason": ""}
     try:
         if not path.exists() or not path.is_dir():
             return info
     except OSError:
         return info
     info["exists"] = True
+    info["blocked"], info["block_reason"] = _workspace_blocked(path)
     summary = _dir_summary(path)
     info["is_git"] = summary["is_git"]
     info["file_count"] = summary["files"]
@@ -349,13 +368,14 @@ def _browse_payload(raw_path) -> tuple[dict, int]:
     if not text:
         entries = [{"name": r.rstrip("\\/") or r, "path": r, "is_git": False,
                     "hint": "系统盘" if os.name == "nt" else "起点", "noise": False,
-                    "file_count": 0, "entry_count": 0, "writable": False}
+                    "file_count": 0, "entry_count": 0, "writable": False,
+                    "blocked": False, "block_reason": ""}
                    for r in roots]
         return ({"ok": True, "path": "", "parent": "", "entries": entries,
                  "drives": roots, "home": home, "truncated": False, "dir_count": len(entries),
                  "selected": {"exists": False, "is_git": False, "git_branch": "",
                               "file_count": 0, "entry_count": 0, "writable": False,
-                              "has_tasks": False}}, 200)
+                              "has_tasks": False, "blocked": False, "block_reason": ""}}, 200)
 
     path = Path(os.path.abspath(os.path.expanduser(text)))
     try:
@@ -385,11 +405,13 @@ def _browse_payload(raw_path) -> tuple[dict, int]:
     entries = []
     for noise, name, full in dirs[:BROWSE_LIMIT]:
         summary = _dir_summary(Path(full))
+        blocked, block_reason = _workspace_blocked(Path(full))
         entries.append({"name": name, "path": os.path.normpath(full),
                         "is_git": summary["is_git"], "hint": _dir_hint(summary),
                         "noise": noise, "file_count": summary["files"],
                         "entry_count": summary["files"] + summary["dirs"],
-                        "writable": not summary["denied"]})
+                        "writable": not summary["denied"],
+                        "blocked": blocked, "block_reason": block_reason})
 
     parent = "" if path.parent == path else os.path.normpath(str(path.parent))
     return ({"ok": True, "path": os.path.normpath(str(path)), "parent": parent,
@@ -619,6 +641,62 @@ class ChatStore:
         if isinstance(entry, dict) and entry.get("trash"):
             out["trash"] = str(entry["trash"])
         return out
+
+    def trash(self) -> list[dict]:
+        """回收站里的会话：``delete()`` 挪进 ``sessions/trash/`` 的那些文件。
+
+        读不了就当空列表（回收站坏了不该让整个页面挂掉），字段固定成界面要用的那几个。
+        """
+        if self.mod is None:
+            return []
+        fn = getattr(self.mod, "list_trash", None)
+        if not callable(fn):
+            return []
+        try:
+            rows = fn()
+        except Exception:  # noqa: BLE001
+            return []
+        if not isinstance(rows, list):
+            return []
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("trash_name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "trash_name": name,
+                "session_id": str(row.get("session_id") or ""),
+                "title": str(row.get("title") or "").strip() or "（没有标题的会话）",
+                "deleted_at": str(row.get("deleted_at") or ""),
+                "message_count": _as_int(row.get("message_count")),
+                "workspace": _norm_path(row.get("workspace") or ""),
+            })
+        return out
+
+    def restore(self, trash_name: str) -> dict:
+        """把回收站里的一份会话文件挪回主列表（session.py 负责改文件名/index）。"""
+        if self.mod is None:
+            raise RuntimeError("会话模块（session.py）还没就绪")
+        fn = getattr(self.mod, "restore", None)
+        if not callable(fn):
+            raise RuntimeError("session.py 版本太旧，没有 restore()，先升级再还原")
+        entry = fn(str(trash_name or "").strip())
+        out = _normalize_session(entry if isinstance(entry, dict) else {})
+        if isinstance(entry, dict) and entry.get("trash_name"):
+            out["trash_name"] = str(entry["trash_name"])
+        return out
+
+    def rename(self, session_id: str, title: str) -> dict:
+        """改会话标题（改完锁住，之后新增消息不会再被首条消息覆盖）。"""
+        if self.mod is None:
+            raise RuntimeError("会话模块（session.py）还没就绪")
+        fn = getattr(self.mod, "rename", None)
+        if not callable(fn):
+            raise RuntimeError("session.py 版本太旧，没有 rename()，先升级再改名")
+        entry = fn(str(session_id or "").strip(), str(title or "").strip())
+        return _normalize_session(entry if isinstance(entry, dict) else {})
 
     def active_id(self) -> str:
         """归档/删除之后该打开哪个会话：以索引里的 active 为准（不猜、不建会话）。
@@ -1195,6 +1273,7 @@ def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "",
         "ok": True,
         "session": active,
         "sessions": sessions,
+        "trash": STORE.trash(),                  # 回收站：左栏底部「回收站 · N」+ 还原面板
         "workspaces": workspaces,
         "messages": messages,
         "messages_limit": page_limit,
@@ -1384,6 +1463,11 @@ input,textarea{caret-color:var(--user)}
 .sess:not(.archived) .sess-top{padding-right:var(--sp-6)}   /* 给「⋯」留位，标题和时间不挪 */
 .sess-title{font-size:var(--fs-md);font-weight:600;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;flex:1;min-width:0}
+/* 行内改名：输入框跟标题同字号同高，列表不会跳一下 */
+.sess-rename{flex:1;min-width:0;height:21px;font-size:var(--fs-md);font-weight:600;
+  font-family:inherit;color:var(--fg);background:var(--panel3);
+  border:var(--hair) solid var(--ring);border-radius:var(--r-1);
+  padding:0 var(--sp-1);line-height:19px}
 .sess-time{font-size:var(--fs-xs);color:var(--dim2);flex:0 0 auto}
 .sess-sub{font-size:var(--fs-xs);color:var(--dim2);margin-top:var(--sp-1);
   display:flex;align-items:center;gap:var(--sp-2)}
@@ -1434,6 +1518,19 @@ input,textarea{caret-color:var(--user)}
 .side-foot{margin-top:auto;padding:var(--sp-2) var(--sp-3);
   border-top:var(--hair) solid var(--line);font-size:var(--fs-xs);color:var(--dim2);
   line-height:1.5}
+/* 左栏底部「回收站 · N」：删掉的会话从这里捡回来 */
+.side-trash{display:flex;align-items:center;gap:var(--sp-2);width:100%;
+  background:none;border:0;border-top:var(--hair) solid var(--line);
+  padding:var(--sp-2) var(--sp-4);color:var(--dim2);font-size:var(--fs-sm);
+  text-align:left;flex:0 0 auto}
+.side-trash .ic{font-size:var(--fs-sm);opacity:.75;line-height:1}
+.side-trash .lbl{flex:1;min-width:0}
+.side-trash .count{flex:0 0 auto;min-width:20px;text-align:center;font-size:var(--fs-xs);
+  color:var(--dim2);border:var(--hair) solid var(--line2);border-radius:var(--r-pill);
+  padding:0 var(--sp-2)}
+.side-trash:hover{background:var(--panel2);color:var(--fg)}
+.side-trash:hover .count{color:var(--dim);border-color:#3d4a5c}
+.side-trash.has .count{color:var(--fg);border-color:#3d4a5c}
 
 /* ---------- 中栏 ---------- */
 .main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
@@ -1491,6 +1588,9 @@ input,textarea{caret-color:var(--user)}
 .msg.user .meta{justify-content:flex-end}
 .msg.user .bubble{background:#14263c;border-color:#26456b;border-radius:var(--r-3);
   color:#e6f0fb}
+/* 气泡「尾巴」：贴着头像那一角收成小圆角（其余三只角仍是 14px），指回发送者 */
+.msg:not(.user) .bubble{border-top-left-radius:var(--r-1)}
+.msg.user .bubble{border-top-right-radius:var(--r-1)}
 .msg.failed .bubble{border-color:#f8514966;background:#1e1214}
 .msg.streaming .bubble{opacity:.9}
 .msg .bubble pre.code{background:#0a0f16;border:var(--hair) solid var(--line);
@@ -1750,6 +1850,12 @@ ul.files li:before{content:"•";position:absolute;left:var(--sp-0);color:var(--
 .pick-row:hover .use,.pick-row:focus-visible .use,.pick-row:focus-within .use,
 .pick-row.cur .use{opacity:1}
 .pick-row .use:hover{color:var(--fg);border-color:#3d4a5c}
+/* 协作台自己的目录：能进去看，但「选它」是禁的（后端也会拒，这里提前挡住白点一次） */
+.pick-row.blocked{opacity:.62;cursor:default}
+.pick-row.blocked:hover{background:transparent}
+.pick-row.blocked .nm{color:var(--dim)}
+.pick-row.blocked .hh{color:var(--warn)}
+.pick-row.blocked .use{opacity:1;color:var(--dim2);cursor:not-allowed}
 .pick-empty{padding:var(--sp-5) var(--sp-4);text-align:center;font-size:var(--fs-md);
   color:var(--dim2);line-height:1.8}
 .pick-more{padding:var(--sp-2);text-align:center;font-size:var(--fs-xs);color:var(--dim2)}
@@ -1785,6 +1891,40 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
 .confirm-actions button:hover{background:var(--panel3)}
 .btn-danger{border-color:#f8514966;background:#f8514922;color:#ffb4ad}
 .btn-danger:hover{background:#f8514933;border-color:#f8514999;color:#ffd7d3}
+
+/* ---------- 回收站（删掉的会话还能捡回来） ---------- */
+.trash{position:fixed;inset:0;z-index:81;display:flex;align-items:center;
+  justify-content:center;padding:var(--sp-4);background:#05070ac7}
+.trash[hidden]{display:none}
+.trash-card{width:min(560px,100%);max-height:min(76vh,620px);display:flex;
+  flex-direction:column;background:var(--panel);border:var(--hair) solid var(--line2);
+  border-radius:var(--r-3);overflow:hidden;box-shadow:0 var(--sp-5) 60px #00000080}
+.trash-head{display:flex;align-items:flex-start;gap:var(--sp-2);
+  padding:var(--sp-4) var(--sp-4) var(--sp-3);
+  border-bottom:var(--hair) solid var(--line);background:var(--panel2)}
+.trash-hd{flex:1;min-width:0}
+.trash-head .t{font-size:var(--fs-lg);font-weight:650}
+.trash-head .s{font-size:var(--fs-xs);color:var(--dim2);margin-top:var(--sp-1);
+  line-height:1.5}
+.trash-head .x{flex:0 0 auto;height:26px;width:28px;border-radius:var(--r-1);
+  border:var(--hair) solid var(--line2);background:var(--panel);color:var(--dim);
+  font-size:var(--fs-lg);line-height:1}
+.trash-head .x:hover{color:var(--fg)}
+.trash-list{flex:1;min-height:0;overflow-y:auto;padding:var(--sp-2) var(--sp-2) var(--sp-3)}
+.trash-row{display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-2);
+  border:var(--hair) solid transparent;border-radius:var(--r-2)}
+.trash-row:hover{background:var(--panel2);border-color:var(--line)}
+.trash-row .info{flex:1;min-width:0}
+.trash-row .ttl{font-size:var(--fs-md);font-weight:600;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.trash-row .sub{font-size:var(--fs-xs);color:var(--dim2);margin-top:var(--sp-0);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trash-row .back{flex:0 0 auto;height:24px;border-radius:var(--r-1);
+  border:var(--hair) solid #2e5a86;background:#16283c;color:#cfe4ff;
+  font-size:var(--fs-sm);padding:0 var(--sp-3)}
+.trash-row .back:hover{background:#1b3550}
+.trash-empty{padding:var(--sp-6) var(--sp-4);text-align:center;color:var(--dim2);
+  font-size:var(--fs-sm);line-height:1.9}
 
 /* ---------- 响应式 ---------- */
 /* 1180：三栏收窄，次要统计先让位（结构不动） */
@@ -1850,6 +1990,10 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
     <div class="ws-card" id="ws-card"></div>
     <div class="side-label">历史会话<span class="count" id="session-count">0</span></div>
     <div class="sessions" id="sessions"></div>
+    <button class="side-trash" id="trash-entry" aria-haspopup="dialog" title="看看删掉的会话">
+      <span class="ic">🗑</span><span class="lbl">回收站</span>
+      <span class="count" id="trash-count">0</span>
+    </button>
     <div class="side-foot" id="store-note"></div>
   </aside>
 
@@ -1911,6 +2055,7 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
 <div class="toast" id="toast"></div>
 
 <div class="sess-menu" id="sess-menu" role="menu" aria-label="会话操作" hidden>
+  <button class="mi" id="menu-rename" role="menuitem" tabindex="-1">重命名</button>
   <button class="mi" id="menu-archive" role="menuitem" tabindex="-1">归档</button>
   <div class="menu-sep"></div>
   <button class="mi danger" id="menu-delete" role="menuitem" tabindex="-1">删除</button>
@@ -1921,12 +2066,25 @@ body.picking .main,body.picking .side,body.picking .inspector{pointer-events:non
   <div class="confirm-card">
     <div class="confirm-title" id="confirm-title">删除会话</div>
     <div class="confirm-line" id="confirm-target"></div>
-    <div class="confirm-warn">删除后这个会话的聊天记录不再出现在列表里（文件会留在
-      sessions/trash/，需要时去那里找）</div>
+    <div class="confirm-warn">删除后这个会话不再出现在列表里，但会留在左栏底部的
+      「回收站」里，随时能还原</div>
     <div class="confirm-actions">
       <button id="confirm-cancel">取消</button>
       <button class="btn-danger" id="confirm-ok">删除</button>
     </div>
+  </div>
+</div>
+
+<div class="trash" id="trash" hidden role="dialog" aria-modal="true" aria-labelledby="trash-title">
+  <div class="trash-card">
+    <div class="trash-head">
+      <div class="trash-hd">
+        <div class="t" id="trash-title">回收站</div>
+        <div class="s">删掉的会话留在这儿，还原后回到左栏列表</div>
+      </div>
+      <button class="x" id="trash-close" title="关闭（Esc）">×</button>
+    </div>
+    <div class="trash-list" id="trash-list"></div>
   </div>
 </div>
 
@@ -1985,6 +2143,9 @@ const modal = $('modal'), modalPath = $('modal-path'), modalBody = $('modal-body
 const toastEl = $('toast');
 const sessMenu = $('sess-menu');
 const confirmEl = $('confirm');
+const trashEl = $('trash'), trashListEl = $('trash-list');
+const trashEntry = $('trash-entry'), trashCountEl = $('trash-count');
+const trashCloseBtn = $('trash-close');
 const unlockEl = $('unlock'), unlockInput = $('unlock-input');
 const unlockBtn = $('unlock-btn'), unlockErr = $('unlock-err');
 
@@ -2380,6 +2541,9 @@ let menuIndex = 0;
 let confirmSessId = '';        // 删除确认框对应的会话
 let confirmBack = null;        // 关掉确认框后焦点还回去
 let lastSessHtml = '';         // 上一次渲染出来的列表 HTML（没变就不重建 DOM）
+let renamingId = '';           // 正在行内改名的会话（非空时暂停列表重绘，别把输入框吞掉）
+let lastTrashSig = '';         // 回收站面板上一次渲染的内容签名
+let trashBack = null;          // 关掉回收站后焦点还回去
 
 function sessRow(s, archived){
   const ws = baseName(s.workspace || '');
@@ -2405,6 +2569,10 @@ function renderSessions(){
   const live = list.filter(s => !s.archived_at);
   const arch = list.filter(s => s.archived_at);
   $('session-count').textContent = live.length;
+  const trashed = st.trash || [];
+  if(trashCountEl) trashCountEl.textContent = trashed.length;
+  if(trashEntry) trashEntry.classList.toggle('has', trashed.length > 0);
+  if(trashEl && !trashEl.hidden) renderTrash();
   let html = '';
   if(!live.length){
     html += '<div class="empty sess-empty">还没有会话 · 在下面说一句话就会开一个新的</div>';
@@ -2419,6 +2587,7 @@ function renderSessions(){
       + '</div></div>';
   }
   // 每秒轮询都会走到这里：内容没变就别重建 DOM，否则键盘焦点每秒被清一次
+  if(renamingId) return;        // 正在改名：先把列表冻住，等改名结束再重绘
   if(html === lastSessHtml) return;
   lastSessHtml = html;
   sessionsEl.innerHTML = html;
@@ -2433,6 +2602,13 @@ function wireSessions(){
       if(ev.target.closest('.sess-more') || ev.target.closest('.sess-restore')) return;
       if(archived){ toast('已归档，先恢复再打开'); return; }
       selectSession(id);
+    };
+    // 双击标题行 = 行内改名（已归档的不给改，先恢复）
+    el.ondblclick = ev => {
+      if(archived) return;
+      if(ev.target.closest('.sess-more') || ev.target.closest('.sess-restore')) return;
+      ev.preventDefault();
+      startRename(id);
     };
     el.onkeydown = ev => {
       if(ev.key === 'Enter'){ ev.preventDefault(); openSessMenu(id, el); }
@@ -2583,6 +2759,119 @@ async function sessArchive(id, archived){
   if(archived) archOpen = true;
   const next = (data && data.active) || '';
   if(next !== activeId){ activeId = next; localTyping = null; }
+  await load({fresh: true});
+}
+
+/* ---------- 行内改名：双击标题（或菜单里的「重命名」） ---------- */
+function sessRowEl(id){
+  return Array.from(sessionsEl.querySelectorAll('.sess'))
+    .find(el => el.dataset.id === id) || null;
+}
+
+function endRename(){
+  renamingId = '';
+  lastSessHtml = '';            // DOM 已经落后了，逼下一次重绘把标题换回来
+  renderSessions();
+}
+
+async function commitRename(inputEl, id, before){
+  if(!renamingId) return;       // Enter 之后 blur 还会再来一次，别提交两遍
+  const title = String(inputEl.value || '').trim();
+  renamingId = '';
+  if(!title || title === before){ endRename(); return; }
+  const data = await apiPost('/api/session/rename', {id: id, title: title});
+  if(!data || !data.ok){
+    toast((data && data.error) || '改名失败');
+    endRename();
+    return;
+  }
+  toast('已改名');
+  await load({fresh: true});
+}
+
+function startRename(id){
+  const s = sessById(id);
+  const row = sessRowEl(id);
+  closeSessMenu(false);
+  if(!s || !row || renamingId) return;
+  const title = row.querySelector('.sess-title');
+  if(!title) return;
+  renamingId = id;
+  const box = document.createElement('input');
+  box.type = 'text';
+  box.className = 'sess-rename';
+  box.maxLength = 60;
+  box.value = s.title || '';
+  box.setAttribute('aria-label', '会话标题，回车保存，Esc 取消');
+  title.replaceWith(box);
+  box.onkeydown = ev => {
+    if(ev.key === 'Enter'){ ev.preventDefault(); commitRename(box, id, s.title || ''); }
+    else if(ev.key === 'Escape'){ ev.preventDefault(); renamingId = ''; endRename(); }
+  };
+  box.onblur = () => { commitRename(box, id, s.title || ''); };
+  box.focus();
+  try { box.select(); } catch(e){}
+}
+
+/* ---------- 回收站：列出去掉的会话，一键还原 ---------- */
+function renderTrash(){
+  if(!trashListEl) return;
+  const rows = st.trash || [];
+  const sig = rows.map(t => t.trash_name).join('|');
+  if(sig === lastTrashSig) return;
+  lastTrashSig = sig;
+  if(!rows.length){
+    trashListEl.innerHTML = '<div class="trash-empty">回收站是空的<br>删掉的会话会出现在这里，随时能还原</div>';
+    return;
+  }
+  trashListEl.innerHTML = rows.map(t => {
+    const sub = [];
+    if(t.session_id) sub.push(esc(t.session_id));
+    sub.push(esc(String(t.message_count || 0)) + ' 条消息');
+    const when = timeLabel(t.deleted_at);
+    if(when) sub.push('删于 ' + esc(when));
+    return '<div class="trash-row">'
+      + '<div class="info"><div class="ttl" title="' + esc(t.title) + '">' + esc(t.title) + '</div>'
+      + '<div class="sub">' + sub.join(' · ') + '</div></div>'
+      + '<button class="back" data-back="' + esc(t.trash_name) + '">还原</button></div>';
+  }).join('');
+  trashListEl.querySelectorAll('button[data-back]').forEach(btn => {
+    btn.onclick = () => restoreSession(btn.dataset.back, btn);
+  });
+}
+
+function openTrash(){
+  if(!trashEl || !trashEl.hidden) return;
+  trashBack = document.activeElement;
+  lastTrashSig = '';
+  trashEl.hidden = false;
+  renderTrash();
+  const first = trashListEl.querySelector('button[data-back]') || trashCloseBtn;
+  if(first){ try { first.focus(); } catch(e){} }
+}
+
+function closeTrash(focusBack){
+  if(!trashEl || trashEl.hidden) return;
+  trashEl.hidden = true;
+  lastTrashSig = '';
+  if(focusBack && trashBack && trashBack.focus){ try { trashBack.focus(); } catch(e){} }
+  trashBack = null;
+}
+
+async function restoreSession(name, btn){
+  if(!name) return;
+  if(btn){ btn.disabled = true; btn.textContent = '还原中…'; }
+  const data = await apiPost('/api/session/restore', {trash_name: name});
+  if(!data || !data.ok){
+    if(btn){ btn.disabled = false; btn.textContent = '还原'; }
+    toast((data && data.error) || '还原失败');
+    return;
+  }
+  const got = (data && data.session) || {};
+  toast('已还原：' + (got.title || '会话'));
+  closeTrash(false);
+  const next = (data && data.active) || '';
+  if(next && next !== activeId){ activeId = next; localTyping = null; }
   await load({fresh: true});
 }
 
@@ -3019,13 +3308,19 @@ function renderPicker(data){
   } else {
     pickList.innerHTML = pick.entries.map((e, i) => {
       const noisy = e.noise ? ' noise' : '';
+      const blocked = e.blocked ? ' blocked' : '';
       const icon = e.is_git ? '📦' : '📁';
-      return '<div class="pick-row' + noisy + '" data-i="' + i + '" role="option"'
+      // 协作台自己的目录：能进去看，但「选它」是灰的（后端也会拒，这里提前挡住）
+      const hint = e.blocked ? (e.block_reason || '不能当工作区') : (e.hint || '');
+      const use = e.blocked
+        ? '<button class="use" disabled title="' + esc(hint) + '">不能选</button>'
+        : '<button class="use" data-use="' + i + '" title="只选中，不进入">选它</button>';
+      return '<div class="pick-row' + noisy + blocked + '" data-i="' + i + '" role="option"'
         + ' tabindex="-1" aria-selected="false" title="' + esc(e.path) + '">'
         + '<span class="ic">' + icon + '</span>'
         + '<span class="nm">' + esc(e.name) + '</span>'
-        + '<span class="hh">' + esc(e.hint || '') + '</span>'
-        + '<button class="use" data-use="' + i + '" title="只选中，不进入">选它</button></div>';
+        + '<span class="hh">' + esc(hint) + '</span>'
+        + use + '</div>';
     }).join('');
     if(data.truncated) pickList.insertAdjacentHTML('beforeend',
       '<div class="pick-more">目录太多，只显示前 ' + pick.entries.length
@@ -3105,12 +3400,17 @@ function renderPickFoot(message){
     bits.push(sel.writable ? '可写' : '不可写');
     if(!sel.writable) reasons.push('目录不可写，换一个位置');
     if(sel.has_tasks) bits.push('已有任务账本');
+    if(sel.blocked){                       // 协作台自己的目录：后端也会拒，这里直接说清为什么
+      const why = sel.block_reason || '这个目录不能当工作区';
+      reasons.push(why);
+      bits.push('✘ ' + why);
+    }
     text = bits.join(' · ');
     cls += reasons.length ? ' bad' : ' ok';
   }
   pickHealthEl.className = cls;
   pickHealthEl.textContent = text;
-  const can = !!(sel && sel.exists && sel.is_git && sel.writable) && !message;
+  const can = !!(sel && sel.exists && sel.is_git && sel.writable && !sel.blocked) && !message;
   pickOk.disabled = !can;
   pickOk.title = can ? '绑定这个目录作为工作区' : (reasons.join('；') || '先选一个可用的仓库目录');
 }
@@ -3136,12 +3436,17 @@ async function pickEnter(i){
 async function pickSelect(i){
   const entry = pick.entries[i];
   if(!entry) return;
+  if(entry.blocked){                                 // 协作台自己的目录：只提示，不选中
+    renderPickFoot(entry.block_reason || '这个目录不能当工作区，换一个仓库');
+    return;
+  }
   pick.index = i;
   paintRowPick();
   pick.selPath = entry.path;
   pick.sel = {exists: true, is_git: !!entry.is_git, git_branch: '',
     file_count: entry.file_count || 0, entry_count: entry.entry_count || 0,
-    writable: entry.writable !== false, has_tasks: false};
+    writable: entry.writable !== false, has_tasks: false,
+    blocked: false, block_reason: ''};
   renderPickFoot();
   const data = await apiBrowse(entry.path);        // 补分支/账本这些只有体检才给的
   if(!pick.open || !samePath(pick.selPath, entry.path)) return;
@@ -3301,6 +3606,7 @@ document.addEventListener('keydown', e => { if(e.key === 'Escape' && !modal.hidd
 document.addEventListener('keydown', pickerKeys);
 
 /* ---------- 会话归档 / 删除的接线 ---------- */
+$('menu-rename').onclick = () => { const id = menuSessId; if(id) startRename(id); };
 $('menu-archive').onclick = () => { const id = menuSessId; if(id) sessArchive(id, true); };
 $('menu-delete').onclick = () => { const id = menuSessId; if(id) openConfirm(id); };
 $('confirm-cancel').onclick = () => closeConfirm(true);
@@ -3317,6 +3623,16 @@ document.addEventListener('click', ev => {
 window.addEventListener('resize', () => closeSessMenu(false));
 sessionsEl.addEventListener('scroll', () => closeSessMenu(false), {passive: true});
 document.addEventListener('keydown', sessKeys);
+
+/* ---------- 回收站的接线 ---------- */
+if(trashEntry) trashEntry.onclick = openTrash;
+if(trashCloseBtn) trashCloseBtn.onclick = () => closeTrash(true);
+if(trashEl) trashEl.addEventListener('click', ev => {
+  if(ev.target === trashEl) closeTrash(true);          // 点遮罩 = 关闭
+});
+document.addEventListener('keydown', ev => {
+  if(ev.key === 'Escape' && trashEl && !trashEl.hidden) closeTrash(true);
+});
 
 let lastClock = 0;
 function tick(){
@@ -3835,6 +4151,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/session/delete":
             self._post_session_delete(body)
             return
+        if parsed.path == "/api/session/restore":
+            self._post_session_restore(body)
+            return
+        if parsed.path == "/api/session/rename":
+            self._post_session_rename(body)
+            return
         self._json({"ok": False, "error": "接口不存在"}, 404)
 
     # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
@@ -4071,6 +4393,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"删除失败：{type(exc).__name__}: {exc}"}, 500)
             return
         self._json({"ok": True, "deleted": entry, "active": STORE.active_id()})
+
+    # ---------- 回收站还原 / 改名 ----------
+    def _post_session_restore(self, body: dict) -> None:
+        name = str(body.get("trash_name") or body.get("name") or "").strip()
+        if not name:
+            self._json({"ok": False, "error": "缺少 trash_name"}, 400)
+            return
+        try:
+            entry = STORE.restore(name)
+        except ValueError as exc:               # 文件名非法 / 文件已经不在回收站
+            self._json(*self._session_op_error(exc))
+            return
+        except Exception as exc:    # noqa: BLE001
+            self._json({"ok": False, "error": f"还原失败：{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"ok": True, "session": entry, "active": STORE.active_id(),
+                    "trash": STORE.trash()})
+
+    def _post_session_rename(self, body: dict) -> None:
+        session_id = str(body.get("id") or body.get("session_id") or "").strip()
+        if not session_id:
+            self._json({"ok": False, "error": "缺少 id"}, 400)
+            return
+        try:
+            entry = STORE.rename(session_id, str(body.get("title") or ""))
+        except ValueError as exc:               # 标题为空 / 会话不存在
+            self._json(*self._session_op_error(exc))
+            return
+        except Exception as exc:    # noqa: BLE001
+            self._json({"ok": False, "error": f"改名失败：{type(exc).__name__}: {exc}"}, 500)
+            return
+        self._json({"ok": True, "session": entry})
 
 
 def main() -> int:

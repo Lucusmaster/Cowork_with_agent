@@ -25,6 +25,8 @@ ROOM = ROOT / "room"
 DEFAULT_TITLE = "新会话"
 LEGACY_SESSION = "legacy"
 LEGACY_TITLE = "历史记录"
+# 手动改标题后的长度上限（超过就截断，不再加省略号）
+TITLE_MAX = 60
 
 ROLES = ("user", "assistant", "system")
 STATUSES = ("pending", "streaming", "complete", "failed")
@@ -58,6 +60,8 @@ AGENT_LABELS = {
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MESSAGE_ID_RE = re.compile(r"^msg-(\d+)$")
 _CONV_ID_RE = re.compile(r"^chat-(\d+)$")
+# 回收站里的文件名：会话 id + 删除时间戳（chat-003-20261101-002136）
+_TRASH_STAMP_RE = re.compile(r"^(?P<sid>.+)-(?P<stamp>\d{8}-\d{6})$")
 
 # 一个进程里可能同时有网页线程和 worker 线程在写，用可重入锁串起来
 _LOCK = threading.RLock()
@@ -244,8 +248,15 @@ def _make_title(content: str) -> str:
 
 
 def _should_retitle(entry: dict) -> bool:
-    """标题还是默认值时，用第一条用户消息补上（历史会话不参与）。"""
+    """标题还是默认值时，用第一条用户消息补上。
+
+    - 历史会话（legacy）不参与；
+    - 用户手动 ``rename()`` 过的（``title_locked``）不再自动改，哪怕他改回了
+      默认标题或空标题——不然「用户自己的选择」会被下一条消息冲掉。
+    """
     if entry.get("legacy"):
+        return False
+    if entry.get("title_locked"):
         return False
     return str(entry.get("title") or "").strip() in ("", DEFAULT_TITLE)
 
@@ -264,6 +275,126 @@ def _next_message_id(records: list[dict]) -> str:
         if match:
             seq = max(seq, int(match.group(1)))
     return f"msg-{seq + 1:03d}"
+
+
+# ---------------- 回收站（trash） ----------------
+def _trash_sidecar(jsonl_path: Path) -> Path:
+    """sidecar 与回收站里的 jsonl 同名（只换后缀），存删除前的索引字段。"""
+    return jsonl_path.with_suffix(".json")
+
+
+def _trash_name_parts(trash_name: str) -> tuple[str, str]:
+    """校验回收站文件名，返回 ``(session_id, 文件名)``。
+
+    只认 ``_trash_dir()`` 下的纯文件名：带路径分隔符、``..``、绝对路径或后缀不对的
+    一律 ValueError，免得 ``restore()`` 变成任意文件搬运。会话 id 也要过硬
+    （沿用 ``_valid_session_id``）：``chat-003-20261101-002136`` → ``chat-003``。
+    """
+    text = str(trash_name or "").strip()
+    if not text or text != Path(text).name or "/" in text or "\\" in text or ".." in text:
+        raise ValueError(f"回收站文件名非法：{trash_name}")
+    if not text.lower().endswith(".jsonl"):
+        raise ValueError(f"回收站文件名非法：{trash_name}")
+    stem = text[: -len(".jsonl")]
+    match = _TRASH_STAMP_RE.match(stem)
+    session_id = match.group("sid") if match else stem
+    if not _valid_session_id(session_id):
+        raise ValueError(f"回收站文件名非法：{trash_name}")
+    return session_id, text
+
+
+def _trash_file(trash_name: str) -> Path:
+    """回收站文件的路径（名字已校验过，只会落在 ``_trash_dir()`` 里）。"""
+    _, name = _trash_name_parts(trash_name)
+    return _trash_dir() / name
+
+
+def _read_sidecar(jsonl_path: Path) -> dict:
+    """读 sidecar；没有（0.9.3～0.9.5 删的旧记录）或读坏了都当空字典。"""
+    try:
+        data = json.loads(_trash_sidecar(jsonl_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def _write_sidecar(jsonl_path: Path, entry: dict, deleted_at: str) -> None:
+    """给删进回收站的会话留一份索引快照，``restore()`` 靠它还原标题/工作区/归档状态。
+
+    尽力而为：写不成也不影响删除本身（删都删完了，不能因为快照失败再抛）。
+    """
+    payload = {
+        "id": str(entry.get("id") or ""),
+        "title": str(entry.get("title") or ""),
+        "workspace": str(entry.get("workspace") or ""),
+        "created_at": str(entry.get("created_at") or ""),
+        "updated_at": str(entry.get("updated_at") or ""),
+        "message_count": int(entry.get("message_count") or 0),
+        "archived_at": str(entry.get("archived_at") or ""),
+        # 手动改过标题的标记也要一起存：不然还原之后下一条用户消息又会把标题冲掉
+        "title_locked": bool(entry.get("title_locked")),
+        "deleted_at": deleted_at,
+    }
+    try:
+        _atomic_write(_trash_sidecar(jsonl_path), json.dumps(payload, ensure_ascii=False, indent=2))
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _trash_row(path: Path) -> dict | None:
+    """一个回收站文件 → 一行列表数据；名字不合法 / 读不了就返回 None（跳过，不抛）。
+
+    ``GET /api/state`` 每秒都会调 ``list_trash()``，所以 sidecar 能满足时**不读正文**：
+    只有没有 sidecar、或 sidecar 缺标题 / 缺条数时才读一次 jsonl（一次补齐两个字段）。
+    """
+    try:
+        session_id, name = _trash_name_parts(path.name)
+        sidecar = _read_sidecar(path)
+        title = str(sidecar.get("title") or "")
+        count = sidecar.get("message_count")
+        has_count = isinstance(count, int) and count >= 0
+        records: list[dict] = []
+        if not title.strip() or not has_count:
+            records = _read_json_lines(path)          # 缺字段才读正文，且只读这一次
+        if not title.strip():
+            title = _title_from_records(records) or DEFAULT_TITLE
+        if not has_count:
+            count = len(records)
+        deleted_at = str(sidecar.get("deleted_at") or "")
+        if not deleted_at:
+            deleted_at = datetime.fromtimestamp(float(path.stat().st_mtime)).isoformat(timespec="seconds")
+    except (OSError, ValueError):
+        return None
+    return {
+        "trash_name": name,
+        "session_id": str(sidecar.get("id") or "") or session_id,
+        "title": title,
+        "deleted_at": deleted_at,
+        "message_count": int(count),
+        "workspace": str(sidecar.get("workspace") or ""),
+    }
+
+
+def _list_trash_locked() -> list[dict]:
+    """扫回收站目录（调用方须持锁）；坏文件跳过，不因为一个文件让整个回收站打不开。"""
+    rows: list[dict] = []
+    for path in sorted(_trash_dir().glob("*.jsonl")):
+        row = _trash_row(path)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: (row["deleted_at"], row["trash_name"]), reverse=True)
+    return rows
+
+
+def _free_session_id(index: dict) -> str:
+    """挑一个索引里和磁盘上都没占用的 ``chat-NNN``（restore 遇到 id 冲突时用）。"""
+    candidate = _next_session_id(index)
+    match = _CONV_ID_RE.match(candidate)
+    seq = int(match.group(1)) if match else 0
+    while _find_entry(index, candidate) is not None or _session_file(candidate).exists():
+        seq += 1
+        candidate = f"chat-{seq:03d}"
+    return candidate
 
 
 # ---------------- 旧账本迁移 ----------------
@@ -471,8 +602,39 @@ def archive(session_id: str, archived: bool = True) -> dict:
         return dict(entry)
 
 
+def rename(session_id: str, title: str) -> dict:
+    """手动改会话标题，返回改后的条目。
+
+    - 标题先合并空白再判断：空的（含只有空格）抛 ``ValueError("标题不能为空")``；
+    - 超过 ``TITLE_MAX``（60）字直接截断，不加省略号；
+    - 会话不存在抛 ValueError；
+    - 改完在条目里写 ``title_locked: True``：之后 ``append()`` 的第一条用户消息
+      不会再自动覆盖标题（用户就算改回默认标题也认这个标记）；
+    - ``updated_at`` 换成这一刻，侧栏里会靠前一点。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        index = _read_index()
+        entry = _find_entry(index, session_id)
+        if entry is None:
+            raise ValueError(f"会话不存在：{session_id}")
+        text = " ".join(str(title or "").split())
+        if not text:
+            raise ValueError("标题不能为空")
+        entry["title"] = text[:TITLE_MAX]
+        entry["title_locked"] = True
+        entry["updated_at"] = _now()
+        _write_index(index)
+        return dict(entry)
+
+
 def delete(session_id: str) -> dict:
     """删除会话：消息文件挪进 `sessions/trash/`，索引里移除。返回被删的那条。
+
+    挪文件的同时在回收站写一份同名 sidecar（``<id>-<stamp>.json``），记下删除前的
+    索引字段，``restore()`` 才能把标题/工作区/归档状态原样捡回来；sidecar 只是
+    附加信息，写失败不影响删除。
 
     旧账本（legacy）会话不允许删：它和多条历史记录绑在一起。
     """
@@ -497,6 +659,8 @@ def delete(session_id: str) -> dict:
                 moved = str(target)
             except OSError:
                 moved = ""
+            if moved:
+                _write_sidecar(target, entry, datetime.now().isoformat(timespec="seconds"))
         index["sessions"] = [item for item in index.get("sessions") or []
                              if str(item.get("id")) != sid]
         if str(index.get("active") or "") == sid:
@@ -504,6 +668,83 @@ def delete(session_id: str) -> dict:
         _write_index(index)
         result = dict(entry)
         result["trash"] = moved
+        return result
+
+
+def list_trash() -> list[dict]:
+    """回收站里的会话，按删除时间倒序（最近删的在最前面）。
+
+    每条 ``{"trash_name", "session_id", "title", "deleted_at", "message_count", "workspace"}``：
+
+    - 有 sidecar（0.9.6 起删除时写的）就用它记的标题 / 时间 / 条数 / 工作区；
+    - 没有 sidecar（0.9.3～0.9.5 时代删的）就从 jsonl 首条消息推标题、用文件 mtime
+      当 ``deleted_at``；
+    - 名字不合法或读不了的文件跳过，不让一个坏文件把整个回收站弄崩。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        return _list_trash_locked()
+
+
+def restore(trash_name: str) -> dict:
+    """把回收站里的会话搬回主列表，返回还原后的条目（额外带 ``trash_name``）。
+
+    ``trash_name`` 只接受回收站目录里的文件名（``list_trash()`` 给的那个）：带路径
+    分隔符 / ``..`` / 绝对路径 / 后缀不对一律 ``ValueError``，不会去动回收站之外的文件；
+    文件不存在也 ValueError。
+
+    **id 冲突策略**：索引里已经有一条同 id、或 ``sessions/<id>.jsonl`` 还占着时，
+    用 ``_next_session_id()`` 另分配一个 ``chat-NNN``，并把 jsonl 改成新文件名。
+    jsonl 里旧消息的 ``session_id`` 字段保持原样不动——消息以文件为准，重写正文有
+    丢坏行的风险；索引和文件名用新 id 已经够区分，条目里另记 ``restored_from`` 原 id。
+
+    标题 / 工作区 / 创建时间 / 归档状态照 sidecar 还原（没 sidecar 就从消息推标题），
+    手动改过标题的连 ``title_locked`` 一起还原；
+    ``message_count`` 按文件里实际读到的条数算；``updated_at`` 取还原这一刻。
+    还原的会话不是归档状态就顺手切为活动会话；搬回成功后删掉 sidecar。
+    """
+    with _LOCK:
+        _ensure()
+        _migrate_legacy_locked()
+        session_id, name = _trash_name_parts(trash_name)
+        path = _trash_dir() / name
+        if not path.is_file():
+            raise ValueError(f"回收站里没有这个文件：{trash_name}")
+        sidecar = _read_sidecar(path)
+        records = _read_json_lines(path)
+        index = _read_index()
+        stamp = _now()
+        restored_id = session_id
+        if _find_entry(index, restored_id) is not None or _session_file(restored_id).exists():
+            restored_id = _free_session_id(index)
+        first_stamp = str((records[0] if records else {}).get("created_at") or "")
+        entry = {
+            "id": restored_id,
+            "title": (str(sidecar.get("title") or "").strip()
+                      or _title_from_records(records) or DEFAULT_TITLE),
+            "workspace": _clean_workspace(sidecar.get("workspace")),
+            "created_at": str(sidecar.get("created_at") or "") or first_stamp or stamp,
+            "updated_at": stamp,
+            "message_count": len(records),
+            "archived_at": str(sidecar.get("archived_at") or ""),
+        }
+        if restored_id != session_id:
+            entry["restored_from"] = session_id
+        if sidecar.get("title_locked"):
+            # 用户手改过的标题要连「锁定」一起还回来，否则下一条用户消息会把它冲掉
+            entry["title_locked"] = True
+        path.replace(_session_file(restored_id))
+        index["sessions"].append(entry)
+        if not entry["archived_at"]:
+            index["active"] = restored_id
+        _write_index(index)
+        try:
+            _trash_sidecar(path).unlink()
+        except OSError:
+            pass
+        result = dict(entry)
+        result["trash_name"] = name
         return result
 
 

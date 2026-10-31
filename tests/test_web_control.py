@@ -37,6 +37,7 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.appended: list[dict] = []
+        self.trashed: list[dict] = []      # 回收站：够 state 载荷用即可
         self.items = [{
             "id": "msg-001", "session_id": "chat-test", "role": "user", "agent": "user",
             "task_id": None, "content": "测试：给登录页加记住我", "artifacts": [],
@@ -80,6 +81,16 @@ class FakeStore:
 
     def select(self, session_id: str) -> dict:
         return self.sessions()[0]
+
+    def trash(self) -> list[dict]:
+        """回收站：state 载荷每秒都会读一遍，假存储给空列表就够。"""
+        return list(self.trashed)
+
+    def restore(self, trash_name: str) -> dict:
+        raise RuntimeError("FakeStore 不支持还原（还原的真实链路在 TrashAndRenameTests）")
+
+    def rename(self, session_id: str, title: str) -> dict:
+        raise RuntimeError("FakeStore 不支持改名（改名的真实链路在 TrashAndRenameTests）")
 
     def append(self, session_id: str, role: str = "assistant", agent: str = "coordinator",
                content: str = "", task_id: str | None = None, artifacts=None,
@@ -1270,6 +1281,273 @@ class SessionOpsTests(WebCase):
         status, data = self.post("/api/session/select", {"session_id": a})
         self.assertEqual(status, 400, data)
         self.assertIn("归档", data["error"])
+
+
+class TrashAndRenameTests(WebCase):
+    """回收站还原 + 会话改名：真 session.py，测「路由 → 适配层 → 存储层」整条链。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from agent_team import session as sess_mod
+        self.sess = sess_mod
+        self._saved_sess_room = sess_mod.ROOM
+        sess_mod.ROOM = self.tmp / "session_room"
+        (sess_mod.ROOM / "sessions").mkdir(parents=True, exist_ok=True)
+        room_web.STORE = room_web.ChatStore()
+        self.assertTrue(room_web.STORE.ready, "session.py 应该可用")
+
+    def tearDown(self) -> None:
+        self.sess.ROOM = self._saved_sess_room
+        super().tearDown()
+
+    # ---------- 工具 ----------
+    def make(self, title: str, lines: int = 3) -> str:
+        entry = self.sess.create_session(title=title)
+        sid = str(entry["id"])
+        for i in range(lines):
+            self.sess.append(sid, role="user", agent="user", content=f"{title} 第 {i + 1} 句")
+        return sid
+
+    def state(self) -> dict:
+        status, data = self.call("/api/state", token=self.token)
+        self.assertEqual(status, 200, data)
+        return data
+
+    def rows(self) -> list[dict]:
+        status, data = self.call("/api/session", token=self.token)
+        self.assertEqual(status, 200, data)
+        return data["sessions"]
+
+    def post(self, path: str, body: dict):
+        return self.call(path, method="POST", body=body, token=self.token)
+
+    def trash_of(self) -> list[dict]:
+        return self.state().get("trash") or []
+
+    def delete(self, sid: str) -> None:
+        status, data = self.post("/api/session/delete", {"id": sid, "confirm": True})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+
+    # ---------- 回收站：列出来 ----------
+    def test_delete_puts_session_into_trash_and_state_lists_it(self) -> None:
+        a = self.make("会话 A")
+        self.assertEqual(self.trash_of(), [], "删之前回收站是空的")
+        self.delete(a)
+        self.assertNotIn(a, [r["id"] for r in self.rows()], "删掉的不能还在主列表")
+        items = self.trash_of()
+        self.assertEqual(len(items), 1, "state 里要带上回收站列表")
+        item = items[0]
+        self.assertTrue(item["trash_name"], "要给出能还原的标识")
+        self.assertEqual(item["session_id"], a)
+        self.assertEqual(item["message_count"], 3)
+        self.assertIn("会话 A", item["title"])
+
+    def test_state_trash_is_empty_when_nothing_deleted(self) -> None:
+        self.make("会话 A")
+        self.assertEqual(self.trash_of(), [])
+
+    # ---------- 回收站：还原 ----------
+    def test_restore_returns_session_with_all_messages(self) -> None:
+        a = self.make("会话 A")
+        before = [m["content"] for m in self.sess.messages(a)]
+        self.delete(a)
+        name = self.trash_of()[0]["trash_name"]
+        status, data = self.post("/api/session/restore", {"trash_name": name})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["session"]["id"], a, "没有 id 冲突就沿用原来的 id")
+        self.assertEqual(data["trash"], [], "还原完回收站里就不该还有它")
+        self.assertEqual(data["active"], a, "还原的会话应该直接打开")
+        self.assertEqual([r["id"] for r in self.rows()], [a])
+        self.assertEqual([m["content"] for m in self.sess.messages(a)], before, "消息一条都不能少")
+        self.assertEqual(self.trash_of(), [])
+
+    def test_restored_session_can_still_take_messages(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        name = self.trash_of()[0]["trash_name"]
+        self.post("/api/session/restore", {"trash_name": name})
+        status, data = self.post("/api/post", {"content": "还原之后再说一句"})
+        self.assertEqual(status, 200, data)
+        rows = self.rows()
+        self.assertEqual([r["id"] for r in rows], [a])
+        self.assertEqual(rows[0]["message_count"], 4)
+
+    def test_restore_after_new_session_with_same_name_keeps_both(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        b = self.make("会话 B")                       # 删掉之后又开了一个
+        name = self.trash_of()[0]["trash_name"]
+        status, data = self.post("/api/session/restore", {"trash_name": name})
+        self.assertEqual(status, 200, data)
+        ids = [r["id"] for r in self.rows()]
+        self.assertIn(b, ids)
+        self.assertEqual(len(ids), 2, "两个会话都要在，不能互相顶掉")
+
+    def test_restore_rejects_path_traversal(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        for bad in ("../index.json", "..\\index.json", "sessions/chat-001.jsonl", "/etc/passwd"):
+            status, data = self.post("/api/session/restore", {"trash_name": bad})
+            self.assertIn(status, (400, 404), f"{bad} 应该被拒：{data}")
+            self.assertFalse(data["ok"])
+        self.assertTrue((self.sess.ROOM / "sessions" / "index.json").is_file(),
+                        "被拒的路径不能动到索引文件")
+
+    def test_restore_missing_name_is_400(self) -> None:
+        status, data = self.post("/api/session/restore", {})
+        self.assertEqual(status, 400, data)
+        self.assertFalse(data["ok"])
+
+    def test_restore_unknown_file_is_rejected(self) -> None:
+        status, data = self.post("/api/session/restore",
+                                 {"trash_name": "chat-999-20260101-000000.jsonl"})
+        self.assertIn(status, (400, 404), data)
+        self.assertFalse(data["ok"])
+
+    def test_restore_requires_token(self) -> None:
+        a = self.make("会话 A")
+        self.delete(a)
+        name = self.trash_of()[0]["trash_name"]
+        status, data = self.call("/api/session/restore", method="POST",
+                                 body={"trash_name": name})
+        self.assertEqual(status, 401)
+        self.assertEqual(len(self.trash_of()), 1, "没令牌的请求不能真的还原")
+
+    # ---------- 改名 ----------
+    def test_rename_changes_title(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post("/api/session/rename", {"id": a, "title": "登录页方案"})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["session"]["title"], "登录页方案")
+        row = [r for r in self.rows() if r["id"] == a][0]
+        self.assertEqual(row["title"], "登录页方案", "列表里也要跟着变")
+
+    def test_rename_survives_later_messages(self) -> None:
+        a = self.make("会话 A")
+        self.post("/api/session/rename", {"id": a, "title": "登录页方案"})
+        self.sess.append(a, role="user", agent="user", content="新的一句不该覆盖标题")
+        row = [r for r in self.rows() if r["id"] == a][0]
+        self.assertEqual(row["title"], "登录页方案", "手改过的标题要锁住")
+
+    def test_rename_trims_and_caps_long_title(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.post("/api/session/rename", {"id": a, "title": "  两边有空格的  "})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["session"]["title"], "两边有空格的")
+        status, data = self.post("/api/session/rename", {"id": a, "title": "长" * 200})
+        self.assertEqual(status, 200, data)
+        self.assertLessEqual(len(data["session"]["title"]), 61, "标题要截断，别把列表撑爆")
+
+    def test_rename_empty_title_is_400(self) -> None:
+        a = self.make("会话 A")
+        for bad in ("", "   ", None):
+            status, data = self.post("/api/session/rename", {"id": a, "title": bad})
+            self.assertEqual(status, 400, f"{bad!r} 应该被拒：{data}")
+            self.assertFalse(data["ok"])
+        row = [r for r in self.rows() if r["id"] == a][0]
+        self.assertEqual(row["title"], "会话 A", "被拒的改名不能改到标题")
+
+    def test_rename_missing_id_is_400(self) -> None:
+        status, data = self.post("/api/session/rename", {"title": "随便"})
+        self.assertEqual(status, 400, data)
+        self.assertFalse(data["ok"])
+
+    def test_rename_unknown_session_is_404(self) -> None:
+        status, data = self.post("/api/session/rename", {"id": "chat-999", "title": "不存在"})
+        self.assertEqual(status, 404, data)
+        self.assertFalse(data["ok"])
+
+    def test_rename_requires_token(self) -> None:
+        a = self.make("会话 A")
+        status, data = self.call("/api/session/rename", method="POST",
+                                 body={"id": a, "title": "偷偷改"})
+        self.assertEqual(status, 401)
+        row = [r for r in self.rows() if r["id"] == a][0]
+        self.assertEqual(row["title"], "会话 A")
+
+
+class BrowseBlockedTests(WebCase):
+    """目录对话框要提前把「协作台自己的目录」灰掉（后端本来就会拒）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        (self.repo / "agent_team").mkdir(parents=True)
+        self.other = self.tmp / "other-repo"
+        (self.other / ".git").mkdir(parents=True)
+        self._saved_root = room_web.ROOT_RESOLVED
+        room_web.ROOT_RESOLVED = self.repo.resolve()      # 假装工作台仓库就是它
+        self._saved_ws_mod = room_web.WORKSPACE_MOD
+        room_web.WORKSPACE_MOD = None                     # 用 _fallback_validate，它认 ROOT_RESOLVED
+
+    def tearDown(self) -> None:
+        room_web.ROOT_RESOLVED = self._saved_root
+        room_web.WORKSPACE_MOD = self._saved_ws_mod
+        super().tearDown()
+
+    def browse(self, path=None):
+        url = "/api/browse"
+        if path is not None:
+            url += "?path=" + quote(str(path), safe="")
+        return self.call(url, token=self.token)
+
+    def test_self_directory_is_flagged_blocked(self) -> None:
+        status, data = self.browse(self.tmp)
+        self.assertEqual(status, 200, data)
+        rows = {e["name"]: e for e in data["entries"]}
+        self.assertTrue(rows["repo"]["blocked"], "协作台自己的目录要塞 blocked")
+        self.assertIn("协作台", rows["repo"]["block_reason"], "要有一句人话解释为什么不能选")
+        self.assertFalse(rows["other-repo"]["blocked"], "别的仓库不能误伤")
+
+    def test_directory_inside_self_repo_is_blocked_too(self) -> None:
+        status, data = self.browse(self.repo)
+        self.assertEqual(status, 200, data)
+        rows = {e["name"]: e for e in data["entries"]}
+        self.assertTrue(rows["agent_team"]["blocked"], "仓库里面的子目录同样不能选")
+
+    def test_selected_carries_blocked_for_current_path(self) -> None:
+        status, data = self.browse(self.repo)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["selected"]["blocked"], "停在仓库上时「确认」要能直接禁掉")
+        self.assertTrue(data["selected"]["block_reason"])
+        status, data = self.browse(self.other)
+        self.assertFalse(data["selected"]["blocked"], "别的仓库照样能确认")
+
+    def test_post_workspace_still_rejects_self(self) -> None:
+        status, data = self.post("/api/workspace", {"path": str(self.repo)})
+        self.assertEqual(status, 200)
+        self.assertFalse(data["ok"], "后端兜底校验不许退化")
+
+    def post(self, path, body):
+        return self.call(path, method="POST", body=body, token=self.token)
+
+
+class PageContractTests(unittest.TestCase):
+    """页面契约：删掉的这些钩子会让界面悄悄退化，用测试钉住。"""
+
+    def test_trash_entry_and_panel_hooks(self) -> None:
+        page = room_web.PAGE
+        for hook in ('id="trash-entry"', 'id="trash-count"', 'id="trash-list"',
+                     'id="trash-close"', "/api/session/restore"):
+            self.assertIn(hook, page, f"页面里少了回收站钩子：{hook}")
+
+    def test_rename_hooks(self) -> None:
+        page = room_web.PAGE
+        for hook in ('id="menu-rename"', "/api/session/rename", ".sess-rename"):
+            self.assertIn(hook, page, f"页面里少了改名钩子：{hook}")
+
+    def test_bubble_tail_is_back(self) -> None:
+        page = room_web.PAGE
+        self.assertIn("border-top-left-radius:var(--r-1)", page, "助手气泡贴头像那一角要收角")
+        self.assertIn("border-top-right-radius:var(--r-1)", page, "用户气泡贴头像那一角要收角")
+
+    def test_picker_marks_blocked_rows(self) -> None:
+        page = room_web.PAGE
+        self.assertIn(".pick-row.blocked", page)
+        self.assertIn("block_reason", page)
 
 
 if __name__ == "__main__":
