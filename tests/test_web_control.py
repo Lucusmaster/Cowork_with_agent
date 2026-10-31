@@ -10,6 +10,8 @@ import http.client
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -17,6 +19,8 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
+from urllib.parse import quote
 
 from agent_team import control, procs, room_web
 
@@ -927,6 +931,149 @@ class AliveTests(WebCase):
         status, _, _ = self.raw("/api/post", method="DELETE", body={},
                                 cookie=f"team_token={self.token}")
         self.assertEqual(status, 404, "有凭证但没有这个接口")
+
+
+class BrowseTests(WebCase):
+    """/api/browse：只列目录 + 体检，给「选工作区」对话框用。"""
+
+    def make_tree(self) -> Path:
+        root = self.tmp / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "tests").mkdir()
+        (root / "README.md").write_text("hi", encoding="utf-8")
+        (root / "main.py").write_text("print(1)", encoding="utf-8")
+        (root / "空文件.txt").write_text("", encoding="utf-8")
+        return root
+
+    def browse(self, path=None):
+        url = "/api/browse"
+        if path is not None:
+            url += "?path=" + quote(str(path), safe="")
+        return self.call(url, token=self.token)
+
+    def test_root_lists_drives_or_roots(self) -> None:
+        status, data = self.browse()
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["drives"], "至少给一个起点（盘符）")
+        self.assertEqual(data["path"], "")
+        self.assertTrue(data["home"])
+        self.assertTrue(data["entries"], "根模式也要有可点的条目")
+        self.assertFalse(data["selected"]["exists"], "还没选具体目录时不该假装存在")
+
+    def test_lists_only_directories_and_counts_files(self) -> None:
+        root = self.make_tree()
+        status, data = self.browse(root)
+        self.assertEqual(status, 200)
+        names = [e["name"] for e in data["entries"]]
+        self.assertEqual(names, ["src", "tests"], "只列目录，不列文件")
+        self.assertTrue(all("file_count" in e for e in data["entries"]))
+        selected = data["selected"]
+        self.assertTrue(selected["exists"])
+        self.assertEqual(selected["file_count"], 3, "这一层 3 个文件")
+        self.assertEqual(selected["entry_count"], 5)
+        self.assertFalse(selected["is_git"])
+        self.assertTrue(selected["writable"])
+        self.assertEqual(data["path"], str(root))
+        self.assertEqual(data["parent"], str(root.parent))
+        self.assertFalse(data["truncated"])
+
+    def test_missing_dir_is_404_and_file_is_400(self) -> None:
+        status, data = self.browse(self.tmp / "nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(data["error"], "目录不存在")
+        target = self.tmp / "plain.txt"
+        target.write_text("x", encoding="utf-8")
+        status, data = self.browse(target)
+        self.assertEqual(status, 400)
+        self.assertIn("不是目录", data["error"])
+
+    def test_entries_capped_at_200_but_counts_are_real(self) -> None:
+        root = self.tmp / "many"
+        root.mkdir()
+        for i in range(250):
+            (root / f"d{i:03d}").mkdir()
+        for i in range(5):
+            (root / f"f{i}.txt").write_text("x", encoding="utf-8")
+        status, data = self.browse(root)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["entries"]), 200, "entries 最多 200 条")
+        self.assertTrue(data["truncated"])
+        self.assertEqual(data["dir_count"], 250)
+        self.assertEqual(data["selected"]["file_count"], 5, "file_count 不被 200 条截断影响")
+        self.assertEqual(data["selected"]["entry_count"], 255)
+
+    def test_git_repo_detected_with_branch(self) -> None:
+        root = self.tmp / "gitted"
+        root.mkdir()
+        (root / "a.txt").write_text("x", encoding="utf-8")
+        git = shutil.which("git")
+        if git:
+            subprocess.run([git, "init", "-q"], cwd=root, capture_output=True)
+            subprocess.run([git, "symbolic-ref", "HEAD", "refs/heads/main"],
+                           cwd=root, capture_output=True)
+        else:                                   # 没装 git：至少 .git 目录要认出来
+            (root / ".git").mkdir()
+        status, data = self.browse(root)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["selected"]["is_git"])
+        branch = data["selected"]["git_branch"]
+        self.assertIsInstance(branch, str)
+        if git:
+            self.assertEqual(branch, "main")
+
+    def test_noise_dirs_go_last_and_are_marked(self) -> None:
+        root = self.tmp / "noisy"
+        root.mkdir()
+        for name in ("app", "node_modules", "__pycache__", ".venv", "docs"):
+            (root / name).mkdir()
+        status, data = self.browse(root)
+        self.assertEqual(status, 200)
+        names = [e["name"] for e in data["entries"]]
+        self.assertEqual(names[:2], ["app", "docs"], "正常目录在前，按名字排")
+        noisy = [e for e in data["entries"] if e["noise"]]
+        self.assertEqual({e["name"] for e in noisy}, {"node_modules", "__pycache__", ".venv"})
+        self.assertFalse(data["entries"][0]["noise"])
+
+    def test_permission_denied_is_403(self) -> None:
+        target = self.tmp / "locked"
+        target.mkdir()
+        (target / "sub").mkdir()
+        real_scandir = room_web.os.scandir
+
+        def fake_scandir(path="."):
+            if str(path).replace("\\", "/").endswith("locked"):
+                raise PermissionError(13, "denied", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(room_web.os, "scandir", fake_scandir):
+            status, data = self.call("/api/browse?path=" + quote(str(target), safe=""),
+                                     token=self.token)
+        self.assertEqual(status, 403, "权限不足要 403，不能 500")
+        self.assertIn("权限", data["error"])
+
+    def test_non_ascii_path_decoded(self) -> None:
+        """中文目录：正常 percent-encode 能读；没 encode 的 latin-1 串也要救回来。"""
+        target = self.tmp / "中文目录"
+        target.mkdir()
+        status, data = self.browse(target)
+        self.assertEqual(status, 200)
+        self.assertEqual(Path(data["path"]).name, "中文目录")
+        mojibake = str(target).encode("utf-8").decode("latin-1")
+        status, data = self.call("/api/browse?path=" + quote(mojibake, safe=""),
+                                 token=self.token)
+        self.assertEqual(status, 200, "latin-1 串进来的中文路径也要认")
+        self.assertEqual(Path(data["path"]).name, "中文目录")
+
+    def test_browse_requires_credentials(self) -> None:
+        status, data = self.call("/api/browse")
+        self.assertEqual(status, 401)
+        self.assertFalse(data["ok"])
+
+    def test_browse_rejects_url_token(self) -> None:
+        status, data = self.call(f"/api/browse?token={self.token}")
+        self.assertEqual(status, 401)
+        self.assertIn("URL", data["error"])
 
 
 if __name__ == "__main__":

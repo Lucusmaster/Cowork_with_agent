@@ -249,6 +249,155 @@ def _scope_ok(base: Path, rel: str) -> tuple[bool, str]:
     return (True, "") if _inside(base, target) else (False, "路径越界：不在允许范围内")
 
 
+# ---------------------------------------------------------------- 目录索引（选工作区用）
+BROWSE_LIMIT = 200
+
+# 这些目录对“挑仓库”没帮助：列出来但排到最后、标成 noise，前端会压暗
+_BROWSE_NOISE = frozenset({
+    "__pycache__", ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env",
+    ".idea", ".vscode", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    ".cache", ".next", ".nuxt", "dist", "build", "target", ".gradle",
+})
+
+
+def _browse_roots() -> tuple[list[str], str]:
+    """起点：Windows 给盘符；其它系统给主目录和 /。"""
+    home = str(Path.home())
+    if os.name == "nt":
+        drives = [f"{c}:\\" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.isdir(f"{c}:\\")]
+        return (drives or [home], home)
+    return (["~", "/"], home)
+
+
+def _dir_summary(path: Path) -> dict:
+    """轻量摘要：是不是 git 仓库、这一层有多少文件/子目录（不递归）。"""
+    is_git = (path / ".git").exists()
+    files = dirs = 0
+    denied = False
+    try:
+        with os.scandir(path) as it:
+            for item in it:
+                try:
+                    if item.is_dir(follow_symlinks=False):
+                        dirs += 1
+                    else:
+                        files += 1
+                except OSError:
+                    continue
+    except PermissionError:
+        denied = True
+    except OSError:
+        denied = True
+    return {"is_git": is_git, "files": files, "dirs": dirs, "denied": denied}
+
+
+def _dir_hint(summary: dict, branch: str = "") -> str:
+    if summary["denied"]:
+        return "没有权限读取"
+    bits = []
+    if summary["is_git"]:
+        bits.append("git 仓库" + ((" · " + branch) if branch else ""))
+    if not summary["files"] and not summary["dirs"]:
+        bits.append("空目录")
+    else:
+        if summary["files"]:
+            bits.append(f"{summary['files']} 个文件")
+        if summary["dirs"]:
+            bits.append(f"{summary['dirs']} 个子目录")
+    return " · ".join(bits)
+
+
+def _browse_selected(path: Path) -> dict:
+    """对当前路径的体检：确认之前就让人看清这是不是要的那个仓库。"""
+    info = {"exists": False, "is_git": False, "git_branch": "", "file_count": 0,
+            "entry_count": 0, "writable": False, "has_tasks": False}
+    try:
+        if not path.exists() or not path.is_dir():
+            return info
+    except OSError:
+        return info
+    info["exists"] = True
+    summary = _dir_summary(path)
+    info["is_git"] = summary["is_git"]
+    info["file_count"] = summary["files"]
+    info["entry_count"] = summary["files"] + summary["dirs"]
+    try:
+        info["writable"] = bool(os.access(path, os.W_OK))
+    except OSError:
+        info["writable"] = False
+    if summary["is_git"]:
+        branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], str(path))
+        if branch in ("", "HEAD"):           # 空仓库还没提交：HEAD 只是别名，读真分支名
+            branch = _run_git(["symbolic-ref", "--short", "HEAD"], str(path))
+        info["git_branch"] = branch
+    try:
+        info["has_tasks"] = _latest_task(str(path)) is not None
+    except Exception:  # noqa: BLE001 - 账本读不了不算错
+        info["has_tasks"] = False
+    return info
+
+
+def _browse_payload(raw_path) -> tuple[dict, int]:
+    """GET /api/browse 的实现：只列目录，永远不吐文件内容。"""
+    text = str(raw_path or "").strip().strip('"').strip("'").strip()
+    if text and any("\x80" <= ch <= "\xff" for ch in text):
+        try:      # 有的客户端不会 percent-encode，中文路径会以 latin-1 串进来，救一下
+            text = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    roots, home = _browse_roots()
+    if not text:
+        entries = [{"name": r.rstrip("\\/") or r, "path": r, "is_git": False,
+                    "hint": "系统盘" if os.name == "nt" else "起点", "noise": False,
+                    "file_count": 0, "entry_count": 0, "writable": False}
+                   for r in roots]
+        return ({"ok": True, "path": "", "parent": "", "entries": entries,
+                 "drives": roots, "home": home, "truncated": False, "dir_count": len(entries),
+                 "selected": {"exists": False, "is_git": False, "git_branch": "",
+                              "file_count": 0, "entry_count": 0, "writable": False,
+                              "has_tasks": False}}, 200)
+
+    path = Path(os.path.abspath(os.path.expanduser(text)))
+    try:
+        if not path.exists():
+            return ({"ok": False, "error": "目录不存在", "path": str(path)}, 404)
+        if not path.is_dir():
+            return ({"ok": False, "error": "这不是目录（只能选目录）", "path": str(path)}, 400)
+        with os.scandir(path) as it:
+            raw_entries = list(it)
+    except PermissionError:
+        return ({"ok": False, "error": "没有权限读取这个目录", "path": str(path)}, 403)
+    except OSError as exc:
+        return ({"ok": False, "error": f"读不了这个目录：{exc}", "path": str(path)}, 400)
+
+    dirs: list[tuple[bool, str, str]] = []
+    for item in raw_entries:
+        try:
+            if not item.is_dir(follow_symlinks=False):
+                continue                 # 只列目录；文件名一个字都不往外给
+        except OSError:
+            continue
+        name = item.name
+        noise = name.startswith(".") or name.lower() in _BROWSE_NOISE
+        dirs.append((noise, name, item.path))
+    dirs.sort(key=lambda row: (row[0], row[1].lower()))     # 正常目录在前，噪音在后，各自按名字
+
+    entries = []
+    for noise, name, full in dirs[:BROWSE_LIMIT]:
+        summary = _dir_summary(Path(full))
+        entries.append({"name": name, "path": os.path.normpath(full),
+                        "is_git": summary["is_git"], "hint": _dir_hint(summary),
+                        "noise": noise, "file_count": summary["files"],
+                        "entry_count": summary["files"] + summary["dirs"],
+                        "writable": not summary["denied"]})
+
+    parent = "" if path.parent == path else os.path.normpath(str(path.parent))
+    return ({"ok": True, "path": os.path.normpath(str(path)), "parent": parent,
+             "entries": entries, "drives": roots, "home": home,
+             "truncated": len(dirs) > BROWSE_LIMIT, "dir_count": len(dirs),
+             "selected": _browse_selected(path)}, 200)
+
+
 # ---------------------------------------------------------------- 会话适配层
 
 _NEEDED_SESSION_FUNCS = (
@@ -1165,6 +1314,14 @@ body.ready .app{display:grid}
   min-height:17px;word-break:break-all}
 .ws-status.ok{color:var(--ok)}
 .ws-status.bad{color:var(--bad)}
+.ws-card .ws-pick{margin-top:9px;width:100%;height:28px;border-radius:8px;border:1px solid #2e5a86;
+  background:#16283c;color:#cfe4ff;font-size:11.5px}
+.ws-card .ws-pick:hover{background:#1b3550}
+.insp-ws{margin-bottom:10px;padding:8px 9px;border:1px solid var(--line);border-radius:9px;
+  background:var(--panel2)}
+.insp-ws .p{font-family:"Cascadia Mono",Consolas,monospace;font-size:10.5px;color:var(--dim);
+  word-break:break-all;line-height:1.5}
+.insp-ws .pick-btn{margin-top:7px}
 .stream{flex:1;min-height:0;overflow-y:auto;padding:22px 22px 4px}
 .msg{display:flex;gap:10px;max-width:860px;margin:0 auto 17px;width:100%}
 .msg .av{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;
@@ -1213,6 +1370,12 @@ body.ready .app{display:grid}
 @keyframes blink{0%,80%,100%{opacity:.25;transform:translateY(0)}
   40%{opacity:1;transform:translateY(-2px)}}
 .welcome{max-width:620px;margin:56px auto 0;text-align:center;color:var(--dim)}
+.welcome-cta{margin-top:16px}
+.welcome-cta:empty{display:none}
+.welcome-cta .cta-btn{height:34px;border-radius:9px;border:1px solid #2e5a86;background:#16283c;
+  color:#cfe4ff;font-size:12.5px;padding:0 16px}
+.welcome-cta .cta-btn:hover{background:#1b3550}
+.welcome-cta .cta-hint{display:block;margin-top:8px;font-size:11px;color:var(--dim2)}
 .welcome h1{font-size:19px;font-weight:650;color:var(--fg);margin-bottom:10px}
 .welcome p{font-size:12.5px;line-height:1.9;color:var(--dim2)}
 .composer{flex:0 0 auto;padding:10px 22px 14px;border-top:1px solid var(--line);
@@ -1360,6 +1523,75 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
   border:1px solid #f8514966;color:#ffb4ad;font-size:12px;padding:6px 12px;border-radius:8px;
   z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:1}
+
+/* ---------- 选工作区：目录索引 + 体检 + 确认 ---------- */
+.picker{position:fixed;inset:0;z-index:75;display:flex;align-items:center;justify-content:center;
+  padding:28px;background:#05070ac7}
+.picker[hidden]{display:none}
+.picker-card{width:min(720px,100%);max-height:min(84vh,660px);display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid var(--line2);border-radius:14px;overflow:hidden;
+  box-shadow:0 24px 70px #00000080}
+.picker-head{display:flex;align-items:center;gap:9px;padding:11px 14px;
+  border-bottom:1px solid var(--line);background:var(--panel2)}
+.picker-head .t{font-size:13px;font-weight:650}
+.picker-head .s{font-size:11px;color:var(--dim2)}
+.picker-head .x{margin-left:auto;height:26px;width:28px;border-radius:7px;border:1px solid var(--line2);
+  background:var(--panel);color:var(--dim);font-size:14px;line-height:1}
+.picker-head .x:hover{color:var(--fg)}
+.picker-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;
+  border-bottom:1px solid var(--line);background:var(--panel2)}
+.pick-btn{height:26px;border-radius:7px;border:1px solid var(--line2);background:var(--panel);
+  color:var(--dim);font-size:11.5px;padding:0 9px;flex:0 0 auto}
+.pick-btn:hover:not(:disabled){color:var(--fg);border-color:#3d4a5c}
+.pick-btn:disabled{opacity:.4;cursor:default}
+.topbar-row .pick-btn{height:32px;border-radius:9px;padding:0 11px;font-size:12.5px}
+.crumbs{display:flex;align-items:center;gap:1px;flex:1;min-width:0;overflow-x:auto;
+  white-space:nowrap;font-size:11.5px;color:var(--dim2);scrollbar-width:thin;padding-bottom:1px}
+.crumbs button{background:none;border:0;color:var(--dim);font:inherit;padding:3px 5px;
+  border-radius:5px;flex:0 0 auto}
+.crumbs button:hover{color:var(--fg);background:var(--panel3)}
+.crumbs button:last-child{color:var(--fg)}
+.crumbs .sep{color:var(--dim2);flex:0 0 auto;font-size:10px}
+.pick-drives{display:flex;gap:6px;flex-wrap:wrap;padding:0 12px 8px;
+  border-bottom:1px solid var(--line);background:var(--panel2)}
+.pick-drives:empty{display:none}
+.pick-drives .pick-btn.on{color:#cfe4ff;border-color:#2e5a86;background:#16283c}
+.pick-list{flex:1;min-height:140px;overflow-y:auto;padding:6px;contain:content}
+.pick-row{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:8px;
+  cursor:pointer;border:1px solid transparent;outline:none}
+.pick-row:hover{background:var(--panel2)}
+.pick-row.cur{background:var(--panel3);border-color:var(--line2)}
+.pick-row:focus-visible{outline:2px solid #3d5a7d;outline-offset:-2px}
+.pick-row.noise{opacity:.55}
+.pick-row .ic{width:15px;text-align:center;color:var(--dim2);flex:0 0 auto;font-size:12px}
+.pick-row .nm{font-size:12.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.pick-row .hh{font-size:10.5px;color:var(--dim2);flex:0 0 auto;max-width:48%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.pick-row .use{height:21px;border-radius:6px;border:1px solid var(--line2);background:var(--panel);
+  color:var(--dim);font-size:10.5px;padding:0 7px;flex:0 0 auto;opacity:0;transition:opacity .12s}
+.pick-row:hover .use,.pick-row:focus-visible .use,.pick-row.cur .use{opacity:1}
+.pick-row .use:hover{color:var(--fg);border-color:#3d4a5c}
+.pick-empty{padding:26px 18px;text-align:center;font-size:12px;color:var(--dim2);line-height:1.8}
+.pick-more{padding:8px;text-align:center;font-size:10.5px;color:var(--dim2)}
+.pick-foot{display:flex;align-items:center;gap:12px;padding:10px 14px;
+  border-top:1px solid var(--line);background:var(--panel2)}
+.pick-selinfo{flex:1;min-width:0}
+.pick-path{font-family:"Cascadia Mono",Consolas,monospace;font-size:11.5px;color:var(--fg);
+  word-break:break-all;line-height:1.45}
+.pick-health{font-size:11px;color:var(--dim2);margin-top:3px;line-height:1.5}
+.pick-health.ok{color:var(--ok)}
+.pick-health.bad{color:var(--bad)}
+.pick-health.warn{color:#d29922}
+.pick-go{height:34px;font-size:12.5px;padding:0 14px}
+@media (max-width:620px){
+  .picker{padding:10px}
+  .picker-card{max-height:92vh}
+  .pick-row .hh{display:none}
+  .pick-foot{gap:8px;padding:9px 10px}
+  .pick-go{padding:0 10px;font-size:12px}
+}
+body.picking .main,body.picking .side,body.picking .inspector{pointer-events:none}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:#232c38;border-radius:9px;border:2px solid var(--panel)}
 ::-webkit-scrollbar-thumb:hover{background:#2f3a49}
@@ -1392,6 +1624,7 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
         <input class="ws-input" id="ws-input" spellcheck="false"
                placeholder="工作区绝对路径，例如 E:\my-project（回车验证并绑定）">
         <button class="btn-primary" id="ws-btn">验证并绑定</button>
+        <button class="pick-btn" id="ws-browse" title="浏览目录、看体检结果再确认">浏览…</button>
       </div>
       <div class="ws-status" id="ws-status"></div>
     </div>
@@ -1401,6 +1634,7 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
         <h1>把需求说成一句话就行</h1>
         <p>协调者理解意图、规划者拆步骤、执行者写代码、验收员跑测试、复核员审查。<br>
            这里只显示对话和结果，任务卡与验收证据在右边。</p>
+        <div class="welcome-cta" id="welcome-cta"></div>
       </div>
     </div>
 
@@ -1434,6 +1668,29 @@ ul.files li:before{content:"•";position:absolute;left:2px;color:var(--dim2)}
   </div>
 </div>
 <div class="toast" id="toast"></div>
+
+<div class="picker" id="picker" hidden role="dialog" aria-modal="true" aria-labelledby="picker-title">
+  <div class="picker-card">
+    <div class="picker-head">
+      <span class="t" id="picker-title">选择工作区</span>
+      <span class="s">点目录进去 · 「选它」只选中不进入 · Esc 关闭</span>
+      <button class="x" id="picker-close" title="关闭（Esc）">×</button>
+    </div>
+    <div class="picker-bar">
+      <button class="pick-btn" id="picker-up" title="上一级（Backspace）">↑ 上一级</button>
+      <div class="crumbs" id="pick-crumbs"></div>
+    </div>
+    <div class="pick-drives" id="pick-drives"></div>
+    <div class="pick-list" id="pick-list" role="listbox" aria-label="目录列表" tabindex="-1"></div>
+    <div class="pick-foot">
+      <div class="pick-selinfo">
+        <div class="pick-path" id="pick-path"></div>
+        <div class="pick-health" id="pick-health"></div>
+      </div>
+      <button class="btn-primary pick-go" id="pick-ok" disabled>确认使用这个工作区</button>
+    </div>
+  </div>
+</div>
 
 <div class="unlock" id="unlock" hidden>
   <div class="unlock-card">
@@ -1877,9 +2134,12 @@ function renderWorkspace(){
   const card = $('ws-card');
   const hint = $('composer-ws');
   if(!ws){
-    card.innerHTML = '<div class="wname">未绑定工作区</div>'
-      + '<div class="wpath">在上方输入仓库绝对路径，回车绑定</div>';
-    if(hint) hint.textContent = '';
+    card.innerHTML = '<div class="wname"><span class="dot"></span>还没有工作区</div>'
+      + '<div class="wpath">先选一个仓库目录，协作台才知道在哪儿改代码</div>'
+      + '<button class="ws-pick" id="ws-pick">选择工作区</button>';
+    const pickBtn = $('ws-pick');
+    if(pickBtn) pickBtn.onclick = () => openPicker();
+    if(hint) hint.textContent = '未绑定工作区 · 点上面「选择工作区」浏览目录';
   } else {
     const known = (st.workspaces || []).find(w => w.path === ws);
     const exists = known ? known.exists : true;
@@ -1888,8 +2148,19 @@ function renderWorkspace(){
       + esc(baseName(ws) || ws) + '</div>'
       + '<div class="wpath">' + esc(ws) + '</div>'
       + '<div class="wmeta"><span>' + (exists ? '可用' : '路径不可用') + '</span>'
-      + '<span>' + count + ' 个会话</span></div>';
+      + '<span>' + count + ' 个会话</span></div>'
+      + '<button class="ws-pick" id="ws-pick">换一个工作区</button>';
+    const pickBtn = $('ws-pick');
+    if(pickBtn) pickBtn.onclick = () => openPicker();
     if(hint) hint.textContent = '工作区：' + ws;
+  }
+  const cta = $('welcome-cta');
+  if(cta){
+    cta.innerHTML = ws ? '' :
+      '<button class="cta-btn" id="welcome-pick">选择工作区</button>'
+      + '<span class="cta-hint">可以浏览目录、先看「是不是 git 仓库 · 多少文件 · 能不能写」再确认</span>';
+    const wb = $('welcome-pick');
+    if(wb) wb.onclick = () => openPicker();
   }
   if(document.activeElement !== wsInput) wsInput.value = ws;
 }
@@ -2003,7 +2274,20 @@ function renderInspector(){
   const diffHtml = changes.diff_stat
     ? '<pre class="block">' + esc(changes.diff_stat) + '</pre>' : '';
 
+  const wsNow = st.workspace || (st.session && st.session.workspace) || '';
+  const wsKnown = (st.workspaces || []).find(w => w.path === wsNow);
+  const wsPanel = '<section class="panel"><h3>工作区<span class="n">'
+    + (wsNow ? (wsKnown && wsKnown.exists === false ? '路径不可用' : '已绑定') : '未绑定')
+    + '</span></h3><div class="insp-ws">'
+    + (wsNow
+        ? '<div class="p">' + esc(wsNow) + '</div>'
+          + '<button class="pick-btn" data-ws="1">更换工作区</button>'
+        : '<div class="p">还没绑定工作区，先选一个仓库目录</div>'
+          + '<button class="pick-btn" data-ws="1">选择工作区</button>')
+    + '</div></section>';
+
   inspEl.innerHTML = ''
+    + wsPanel
     + '<section class="panel"><h3>Agent 状态<span class="n">'
     +   (busyCount ? busyCount + ' 个在忙' : '全部空闲') + '</span></h3>'
     +   '<div class="agents">' + agentRows + '</div></section>'
@@ -2023,6 +2307,9 @@ function renderInspector(){
   });
   inspEl.querySelectorAll('.ctrl button[data-act]').forEach(btn => {
     btn.onclick = () => sendControl(btn.dataset.act);
+  });
+  inspEl.querySelectorAll('[data-ws]').forEach(btn => {
+    btn.onclick = () => openPicker();
   });
 }
 
@@ -2169,11 +2456,283 @@ async function bindWorkspace(){
   } else if(data.ok){
     showWsStatus(true, '已绑定：' + (data.workspace || raw)
       + (data.name && data.name !== data.workspace ? '（' + data.name + '）' : ''));
+    rememberWorkspace(data.workspace || raw);
     await load();
   } else {
     showWsStatus(false, data.error || '这个路径不可用');
   }
   wsBtn.disabled = false;
+}
+
+/* ---------- 工作区选择：目录索引 + 体检 + 确认 ---------- */
+const pickerEl = $('picker'), pickList = $('pick-list'), pickCrumbs = $('pick-crumbs');
+const pickDrivesEl = $('pick-drives'), pickPathEl = $('pick-path');
+const pickHealthEl = $('pick-health'), pickOk = $('pick-ok'), pickUp = $('picker-up');
+const pickCloseBtn = $('picker-close');
+const LAST_WS_KEY = 'team-last-workspace';
+
+const pick = {open: false, view: '', parent: '', selPath: '', sel: null, entries: [],
+              index: -1, drives: [], home: '', seq: 0};
+
+function lastWorkspacePath(){
+  try{ return String(localStorage.getItem(LAST_WS_KEY) || ''); }catch(e){ return ''; }
+}
+function rememberWorkspace(path){
+  try{ if(path) localStorage.setItem(LAST_WS_KEY, path); }catch(e){}
+}
+const samePath = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+
+async function apiBrowse(path){
+  const q = new URLSearchParams();
+  if(path) q.set('path', path);
+  try{
+    const res = await fetch('/api/browse?' + q.toString(),
+      {cache: 'no-store', credentials: 'same-origin'});
+    if(res.status === 401){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return null; }
+    const data = await res.json().catch(() => null);
+    if(!data){ return {ok: false, error: '服务端返回异常'}; }
+    if(!data.ok && !data.error) data.error = '读不了这个目录';
+    return data;
+  }catch(e){ return {ok: false, error: '网络异常，请重试'}; }
+}
+
+/* 默认停在「上次用过的路径」或主目录，不从盘符根开始让人自己找 */
+function pickerStartPath(){
+  return st.workspace || lastWorkspacePath() || pick.home || '';
+}
+
+async function openPicker(start){
+  if(!pickerEl) return;
+  pickerEl.hidden = false;
+  pick.open = true;
+  document.body.classList.add('picking');
+  pick.index = -1;
+  pick.selPath = '';
+  pick.sel = null;
+  const from = start || pickerStartPath();
+  if(from){
+    await browseTo(from);
+  } else {
+    const root = await apiBrowse('');       // 不知道停哪儿时先问主目录，别从盘符根开始
+    if(root && root.ok && root.home){ pick.home = root.home; await browseTo(root.home); }
+    else await browseTo('');
+  }
+  if(pick.open && pickList) pickList.focus();
+}
+
+function closePicker(){
+  if(!pick.open) return;
+  pickerEl.hidden = true;
+  pick.open = false;
+  document.body.classList.remove('picking');
+  pick.seq += 1;                       // 关了就丢掉还在路上的响应
+}
+
+async function browseTo(path){
+  const seq = ++pick.seq;
+  const data = await apiBrowse(path);
+  if(seq !== pick.seq || !pick.open) return;
+  if(!data) return;                    // 401 已经弹了解锁卡
+  if(!data.ok){
+    pickHealthEl.className = 'pick-health bad';
+    pickHealthEl.textContent = (data.path ? data.path + '：' : '') + (data.error || '读不了这个目录');
+    return;
+  }
+  pick.view = data.path || '';
+  pick.parent = data.parent || '';
+  pick.home = data.home || pick.home;
+  pick.drives = data.drives || [];
+  pick.entries = data.entries || [];
+  pick.index = -1;
+  if(pick.view){ pick.selPath = pick.view; pick.sel = data.selected || null; }
+  else { pick.selPath = ''; pick.sel = null; }
+  renderPicker(data);
+}
+
+function renderPicker(data){
+  renderCrumbs(pick.view);
+  renderDrives(pick.view);
+  if(pickUp) pickUp.disabled = !pick.parent;
+
+  if(!pick.entries.length){
+    const tip = pick.view
+      ? '这个目录下面没有子目录<br>要选它就直接点右下角「确认使用这个工作区」'
+      : '没有可用的盘符';
+    pickList.innerHTML = '<div class="pick-empty">' + tip + '</div>';
+  } else {
+    pickList.innerHTML = pick.entries.map((e, i) => {
+      const noisy = e.noise ? ' noise' : '';
+      const icon = e.is_git ? '📦' : '📁';
+      return '<div class="pick-row' + noisy + '" data-i="' + i + '" role="option"'
+        + ' tabindex="-1" aria-selected="false" title="' + esc(e.path) + '">'
+        + '<span class="ic">' + icon + '</span>'
+        + '<span class="nm">' + esc(e.name) + '</span>'
+        + '<span class="hh">' + esc(e.hint || '') + '</span>'
+        + '<button class="use" data-use="' + i + '" title="只选中，不进入">选它</button></div>';
+    }).join('');
+    if(data.truncated) pickList.insertAdjacentHTML('beforeend',
+      '<div class="pick-more">目录太多，只显示前 ' + pick.entries.length
+      + ' 条（共 ' + data.dir_count + ' 个）</div>');
+    pickList.querySelectorAll('.pick-row').forEach(row => {
+      const i = Number(row.dataset.i);
+      row.onclick = () => pickEnter(i);
+      row.ondblclick = ev => { ev.preventDefault(); pickSelect(i); };
+    });
+    pickList.querySelectorAll('button[data-use]').forEach(btn => {
+      btn.onclick = ev => { ev.stopPropagation(); pickSelect(Number(btn.dataset.use)); };
+    });
+  }
+  renderPickFoot();
+}
+
+function renderCrumbs(path){
+  if(!pickCrumbs) return;
+  if(!path){ pickCrumbs.innerHTML = '<span class="sep">先选一个盘符或目录</span>'; return; }
+  const parts = String(path).split(/[\\/]+/).filter(Boolean);
+  let html = '', acc = '';
+  if(/^[A-Za-z]:/.test(path)){
+    const drive = parts[0] + '\\';
+    acc = drive;
+    html = '<button data-p="' + esc(drive) + '">' + esc(drive) + '</button>';
+    parts.slice(1).forEach(seg => {
+      acc = acc.replace(/[\\/]+$/, '') + '\\' + seg;
+      html += '<span class="sep">›</span><button data-p="' + esc(acc) + '">' + esc(seg) + '</button>';
+    });
+  } else {
+    html = '<button data-p="/">/</button>';
+    acc = '/';
+    parts.forEach(seg => {
+      acc = acc.replace(/\/+$/, '') + '/' + seg;
+      html += '<span class="sep">›</span><button data-p="' + esc(acc) + '">' + esc(seg) + '</button>';
+    });
+  }
+  pickCrumbs.innerHTML = html;
+  pickCrumbs.querySelectorAll('button[data-p]').forEach(btn => {
+    btn.onclick = () => browseTo(btn.dataset.p);
+  });
+}
+
+function renderDrives(path){
+  if(!pickDrivesEl) return;
+  const cur = String(path || '').slice(0, 2).toUpperCase();
+  pickDrivesEl.innerHTML = (pick.drives || []).map(d => {
+    const on = String(d).slice(0, 2).toUpperCase() === cur ? ' on' : '';
+    return '<button class="pick-btn' + on + '" data-d="' + esc(d) + '">' + esc(d) + '</button>';
+  }).join('');
+  pickDrivesEl.querySelectorAll('button[data-d]').forEach(btn => {
+    btn.onclick = () => browseTo(btn.dataset.d);
+  });
+}
+
+/* 体检行：✔ git 仓库 main · 8 个文件 · 可写 / ✘ 目录不存在 */
+function renderPickFoot(message){
+  if(!pickHealthEl) return;
+  pickPathEl.textContent = pick.selPath || '还没选目录';
+  const sel = pick.sel;
+  const reasons = [];
+  let text = '', cls = 'pick-health';
+  if(message){
+    text = message; cls += ' bad';
+  } else if(!sel || !sel.exists){
+    text = '✘ 目录不存在，换一个位置'; cls += ' bad';
+    reasons.push('目录不存在');
+  } else {
+    const bits = [];
+    if(sel.is_git){
+      bits.push('✔ git 仓库' + (sel.git_branch ? ' ' + sel.git_branch : ''));
+    } else {
+      bits.push('✘ 不是 git 仓库');
+      reasons.push('不是 git 仓库：先在这个目录 git init，或换一个仓库');
+    }
+    bits.push((sel.file_count || 0) + ' 个文件');
+    bits.push(sel.writable ? '可写' : '不可写');
+    if(!sel.writable) reasons.push('目录不可写，换一个位置');
+    if(sel.has_tasks) bits.push('已有任务账本');
+    text = bits.join(' · ');
+    cls += reasons.length ? ' bad' : ' ok';
+  }
+  pickHealthEl.className = cls;
+  pickHealthEl.textContent = text;
+  const can = !!(sel && sel.exists && sel.is_git && sel.writable) && !message;
+  pickOk.disabled = !can;
+  pickOk.title = can ? '绑定这个目录作为工作区' : (reasons.join('；') || '先选一个可用的仓库目录');
+}
+
+function paintRowPick(){
+  pickList.querySelectorAll('.pick-row').forEach(el => {
+    const on = Number(el.dataset.i) === pick.index;
+    el.classList.toggle('cur', on);
+    el.setAttribute('aria-selected', on ? 'true' : 'false');
+    if(on) el.focus({preventScroll: true});
+  });
+}
+
+async function pickEnter(i){
+  const entry = pick.entries[i];
+  if(!entry) return;
+  pick.index = i;
+  paintRowPick();
+  await browseTo(entry.path);
+  pickList.focus();
+}
+
+async function pickSelect(i){
+  const entry = pick.entries[i];
+  if(!entry) return;
+  pick.index = i;
+  paintRowPick();
+  pick.selPath = entry.path;
+  pick.sel = {exists: true, is_git: !!entry.is_git, git_branch: '',
+    file_count: entry.file_count || 0, entry_count: entry.entry_count || 0,
+    writable: entry.writable !== false, has_tasks: false};
+  renderPickFoot();
+  const data = await apiBrowse(entry.path);        // 补分支/账本这些只有体检才给的
+  if(!pick.open || !samePath(pick.selPath, entry.path)) return;
+  if(data && data.ok && data.selected){ pick.sel = data.selected; renderPickFoot(); }
+}
+
+async function pickConfirm(){
+  if(pickOk.disabled || !pick.selPath) return;
+  const path = pick.selPath;
+  pickOk.disabled = true;
+  pickOk.textContent = '绑定中…';
+  const data = await apiPost('/api/workspace', {path: path});
+  pickOk.textContent = '确认使用这个工作区';
+  if(data && data.ok){
+    rememberWorkspace(data.workspace || path);
+    closePicker();
+    showWsStatus(true, '已绑定：' + (data.workspace || path));
+    toast('工作区已绑定：' + (data.workspace || path));
+    await load();
+    return;
+  }
+  renderPickFoot((data && data.error) || '绑定失败，换一个仓库试试');
+}
+
+function pickerKeys(ev){
+  if(!pick.open) return;
+  if(ev.key === 'Escape'){ ev.preventDefault(); closePicker(); return; }
+  if(ev.key === 'ArrowDown' || ev.key === 'ArrowUp'){
+    if(!pick.entries.length) return;
+    ev.preventDefault();
+    pick.index = ev.key === 'ArrowDown'
+      ? Math.min(pick.entries.length - 1, pick.index + 1)
+      : Math.max(0, pick.index - 1);
+    paintRowPick();
+    const row = pickList.querySelector('.pick-row[data-i="' + pick.index + '"]');
+    if(row && row.scrollIntoView) row.scrollIntoView({block: 'nearest'});
+    return;
+  }
+  if(ev.key === 'Enter'){
+    if(ev.target === pickOk) return;                 // 按钮自己会响应
+    ev.preventDefault();
+    if(pick.index >= 0) pickEnter(pick.index);
+    return;
+  }
+  if(ev.key === 'Backspace'){
+    ev.preventDefault();
+    if(pick.parent) browseTo(pick.parent);
+  }
 }
 
 function toast(text){
@@ -2265,8 +2824,15 @@ function closeModal(){ modal.hidden = true; modalBody.textContent = ''; }
 $('new-chat').onclick = newSession;
 wsBtn.onclick = bindWorkspace;
 wsInput.addEventListener('keydown', e => {
+  if(pick.open) return;                      // 对话框开着时回车归对话框
   if(e.key === 'Enter'){ e.preventDefault(); bindWorkspace(); }
 });
+const wsBrowseBtn = $('ws-browse');
+if(wsBrowseBtn) wsBrowseBtn.onclick = () => openPicker();
+if(pickUp) pickUp.onclick = () => { if(pick.parent) browseTo(pick.parent); };
+if(pickCloseBtn) pickCloseBtn.onclick = closePicker;
+if(pickOk) pickOk.onclick = pickConfirm;
+if(pickerEl) pickerEl.addEventListener('click', ev => { if(ev.target === pickerEl) closePicker(); });
 sendBtn.onclick = send;
 input.addEventListener('input', autosize);
 input.addEventListener('keydown', e => {
@@ -2275,6 +2841,7 @@ input.addEventListener('keydown', e => {
 $('modal-close').onclick = closeModal;
 modal.addEventListener('click', e => { if(e.target === modal) closeModal(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape' && !modal.hidden) closeModal(); });
+document.addEventListener('keydown', pickerKeys);
 
 let lastClock = 0;
 function tick(){
@@ -2662,6 +3229,10 @@ class Handler(BaseHTTPRequestHandler):
         def one(name: str) -> str:
             return (qs.get(name) or [""])[0]
 
+        if parsed.path == "/api/browse":
+            payload, code = _browse_payload(one("path"))
+            self._json(payload, code)
+            return
         if parsed.path == "/api/state":
             self._touch()
             self._json(_state_payload(one("session"), one("after"), one("task"), one("limit")))
