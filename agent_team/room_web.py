@@ -2404,7 +2404,7 @@ body.fx-on .fx-tap{
 <script>
 // __FX_JS_BEGIN__
 /* ======== HUD 特效层（源文件 .tmp/fx/fx.js） ======== */
-﻿/* ============================================================================
+/* ============================================================================
    fx.js — 战术 HUD 特效层（零依赖 vanilla，只有 canvas 2D + CSS）
    ----------------------------------------------------------------------------
    机制来源（react-bits 原组件都是 React/WebGL，这里只复刻观感，不搬代码）：
@@ -2435,9 +2435,6 @@ body.fx-on .fx-tap{
   var TAU = Math.PI * 2;
   var FRAME_MS = 1000 / 30;      // canvas 帧间隔（30fps 上限）
   var DPR_CAP = 2;
-  var SCAN_W = 140;              // 扫描带宽（CSS px）
-  var SCAN_STD_MS = 12000;       // std：12s 一轮
-  var SCAN_BUSY_MS = 4000;       // busy：4s 一轮
   var POLL_MS = 600;             // getState 轮询
   var SPARK_LIFE = 300;          // 迸溅 300ms 淡出
   var SPARK_CAP = 160;
@@ -2445,8 +2442,8 @@ body.fx-on .fx-tap{
 
   var LEVELS = {
     off: null,
-    std: { gap: 32, particles: 28, link: 104, spark: 8,  perspective: false, dispersion: false },
-    max: { gap: 24, particles: 64, link: 116, spark: 14, perspective: true,  dispersion: true  }
+    std: { gap: 32, particles: 28, link: 104, spark: 8,  perspective: false },
+    max: { gap: 24, particles: 64, link: 116, spark: 14, perspective: true  }
   };
 
   /* ------------------------------- 状态 ---------------------------------- */
@@ -2464,7 +2461,6 @@ body.fx-on .fx-tap{
   var particles = [];
   var sparks = [];
   var parallax = { x: 0, y: 0, tx: 0, ty: 0 };
-  var clock = { phase: 0.2 };
   var loop = { on: false, raf: 0, prev: 0, frames: 0, drawn: 0 };
   var sparkDirty = false;
   var pollId = 0;
@@ -2692,44 +2688,8 @@ body.fx-on .fx-tap{
   }
 
   /* ------------------------------ 环境场绘制 ----------------------------- */
-  function drawScan(ctx, w, h, phase) {
-    var alive = st.engineAlive !== false;
-    var busy = alive && st.busy === true;
-    var peak = alive ? (busy ? 0.12 : 0.09) : 0.045;
-    var ang = -24 * Math.PI / 180;
-    var span = Math.max(w, h) * 1.8;
-    var x = -span * 0.5 + span * phase;
-    var half = SCAN_W * 0.5;
-
-    ctx.save();
-    ctx.translate(w * 0.5, h * 0.5);
-    ctx.rotate(ang);
-
-    var g = ctx.createLinearGradient(x - half * 1.9, 0, x + half, 0);
-    g.addColorStop(0, rgba(colors.a, 0));
-    g.addColorStop(0.42, rgba(colors.a, peak * 0.14));
-    g.addColorStop(0.78, rgba(colors.a, peak * 0.5));
-    g.addColorStop(0.96, rgba(colors.a, peak));
-    g.addColorStop(1, rgba(colors.a, peak * 0.9));
-    ctx.fillStyle = g;
-    ctx.fillRect(x - half * 1.9, -span, half * 2.9, span * 2);
-
-    /* max 档：扫描带边缘轻微色散（两条错位的窄带，不加 filter） */
-    if (cfg.dispersion && alive) {
-      var d1 = ctx.createLinearGradient(x + half - 6, 0, x + half + 2, 0);
-      d1.addColorStop(0, rgba(colors.b, 0));
-      d1.addColorStop(1, rgba(colors.b, peak * 0.28));
-      ctx.fillStyle = d1;
-      ctx.fillRect(x + half - 6, -span, 8, span * 2);
-
-      var d2 = ctx.createLinearGradient(x - half * 1.9, 0, x - half * 1.9 + 10, 0);
-      d2.addColorStop(0, rgba(colors.a, peak * 0.2));
-      d2.addColorStop(1, rgba(colors.a, 0));
-      ctx.fillStyle = d2;
-      ctx.fillRect(x - half * 1.9, -span, 10, span * 2);
-    }
-    ctx.restore();
-  }
+  /* 注：原本这里有一条全屏斜向扫描带（react-bits 的 Scanner 观感），用户看过之后要求去掉——
+     整屏扫过去太抢眼。点阵、粒子连线、视差、底部透视网格保留。 */
 
   function drawFloor(ctx, w, h, px, py) {
     var alive = st.engineAlive !== false;
@@ -2857,7 +2817,6 @@ body.fx-on .fx-tap{
     }
 
     /* 3) 斜向扫描带（std 12s / busy 4s 一轮；离线冻结成静态） */
-    drawScan(ctx, w, h, clock.phase);
 
     /* 4) max 档：底部透视网格 */
     if (cfg.perspective) drawFloor(ctx, w, h, px, py);
@@ -2943,11 +2902,6 @@ body.fx-on .fx-tap{
   }
 
   function step(dt, ts) {
-    if (!reduced && st.engineAlive !== false) {
-      var period = (st.busy ? SCAN_BUSY_MS : SCAN_STD_MS) / 1000;
-      clock.phase = (clock.phase + dt / period) % 1;
-      if (clock.phase < 0) clock.phase += 1;
-    }
     var k = Math.min(1, dt * 6);
     parallax.x += (parallax.tx - parallax.x) * k;
     parallax.y += (parallax.ty - parallax.y) * k;
@@ -3269,7 +3223,6 @@ body.fx-on .fx-tap{
         w: view.w,
         h: view.h,
         dpr: view.dpr,
-        scanPhase: clock.phase
       };
     },
 
