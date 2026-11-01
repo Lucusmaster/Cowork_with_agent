@@ -462,7 +462,11 @@ class InstallDesktopTests(unittest.TestCase):
             self.assertEqual(code, 0)
             command = run.call_args.args[0]
             self.assertIn("-ProjectPath", command)
-            self.assertIn(tmp, command)
+            # 临时目录在 CI 上可能是 8.3 短名（RUNNER~1），CLI 会把路径 resolve 成长名：
+            # 比对真实路径，别拿字符串硬套。
+            passed = command[command.index("-ProjectPath") + 1]
+            self.assertEqual(os.path.normcase(os.path.realpath(passed)),
+                             os.path.normcase(os.path.realpath(tmp)))
 
 
 if __name__ == "__main__":
