@@ -280,16 +280,55 @@ class IconAssetTests(unittest.TestCase):
 
     SIZES = (16, 24, 32, 48, 64, 128, 256)
 
+    def setUp(self) -> None:
+        # 生成到临时目录：测试不许改写仓库里已提交的二进制。不同机器上 Pillow 版本产出的
+        # 字节不一定一样，写回仓库就会让 assets/ 显示"被改过"（协作台在另一台机器上就踩到了）。
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def ico(self) -> Path:
+        return self.out / "agent-team.ico"
+
+    def png(self) -> Path:
+        return self.out / "agent-team.png"
+
     def _regen(self) -> None:
-        proc = subprocess.run([sys.executable, str(REPO / "tools" / "make_icon.py")],
+        proc = subprocess.run([sys.executable, str(REPO / "bin" / "make_icon.py"),
+                               "--out", str(self.out)],
                               capture_output=True, encoding="utf-8", errors="replace",
                               cwd=str(REPO), creationflags=NO_WINDOW)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
-    def test_script_regenerates_both_files(self) -> None:
-        self._regen()
+    def test_repo_ships_the_icons(self) -> None:
+        """仓库里带上成品：装快捷方式的人不该被要求先装 Pillow 再生成。"""
         self.assertTrue((REPO / "assets" / "agent-team.ico").is_file())
         self.assertTrue((REPO / "assets" / "agent-team.png").is_file())
+
+    def test_generator_is_not_gitignored(self) -> None:
+        """0.9.21 的坑：脚本放在被 `.gitignore` 忽略的 `tools/` 里，说"随仓库发布"其实没进仓库。
+
+        查的是"没被忽略"而不是"已跟踪"——新文件还没 `git add` 时也该是这个结论。
+        """
+        script = REPO / "bin" / "make_icon.py"
+        self.assertTrue(script.is_file(), "生成脚本不在 bin/ 下")
+        try:
+            proc = subprocess.run(["git", "check-ignore", "-v", str(script.relative_to(REPO))],
+                                  capture_output=True, encoding="utf-8", errors="replace",
+                                  cwd=str(REPO), creationflags=NO_WINDOW)
+        except OSError:
+            self.skipTest("没有 git")
+        if proc.returncode not in (0, 1):
+            self.skipTest("这里不是 git 工作区")
+        self.assertEqual(proc.returncode, 1,
+                         f"生成脚本被忽略了（{proc.stdout.strip()}）：换到没被忽略的目录")
+
+    def test_script_regenerates_both_files(self) -> None:
+        self._regen()
+        self.assertTrue(self.ico().is_file())
+        self.assertTrue(self.png().is_file())
 
     def test_ico_carries_every_size(self) -> None:
         try:
@@ -297,7 +336,7 @@ class IconAssetTests(unittest.TestCase):
         except ImportError:
             self.skipTest("没装 Pillow")
         self._regen()
-        with Image.open(REPO / "assets" / "agent-team.ico") as im:
+        with Image.open(self.ico()) as im:
             sizes = {tuple(size) for size in im.info.get("sizes", [])}
         for size in self.SIZES:
             self.assertIn((size, size), sizes, f"ico 里缺 {size}x{size}")
@@ -308,7 +347,7 @@ class IconAssetTests(unittest.TestCase):
         except ImportError:
             self.skipTest("没装 Pillow")
         self._regen()
-        with Image.open(REPO / "assets" / "agent-team.png") as im:
+        with Image.open(self.png()) as im:
             self.assertEqual(im.size, (256, 256))
             self.assertEqual(im.mode, "RGBA")
 
@@ -319,7 +358,7 @@ class IconAssetTests(unittest.TestCase):
         except ImportError:
             self.skipTest("没装 Pillow")
         self._regen()
-        with Image.open(REPO / "assets" / "agent-team.ico") as im:
+        with Image.open(self.ico()) as im:
             im.size = (16, 16)
             pixels = list(im.convert("RGBA").getdata())
         self.assertFalse([p for p in pixels if p[:3] == (255, 255, 255)],
@@ -336,7 +375,7 @@ class IconAssetTests(unittest.TestCase):
         import struct
 
         self._regen()
-        data = (REPO / "assets" / "agent-team.ico").read_bytes()
+        data = self.ico().read_bytes()
         _res, _typ, count = struct.unpack_from("<HHH", data, 0)
         self.assertEqual(count, 7)
         offset = 6
@@ -370,7 +409,7 @@ class IconAssetTests(unittest.TestCase):
         extract.restype = ctypes.c_long
         for large, small in ((48, 16), (32, 16)):
             big, tiny = wintypes.HICON(), wintypes.HICON()
-            code = extract(str(REPO / "assets" / "agent-team.ico"), 0, 0,
+            code = extract(str(self.ico()), 0, 0,
                            ctypes.byref(big), ctypes.byref(tiny), large | (small << 16))
             try:
                 self.assertEqual(code, 0, f"{large}/{small} 取图标失败：0x{code & 0xFFFFFFFF:08x}")

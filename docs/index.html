@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>协作台 agent-team：把需求扔进群里，五个 Agent 接力做完</title>
+<meta name="description" content="跑在你自己电脑上的多 Agent 协作台：DeepSeek 拆任务，Codex 改代码，另一个模型只读复核，验收只认退出码。">
+<meta property="og:title" content="协作台 agent-team">
+<meta property="og:description" content="把需求扔进群里，五个 Agent 接力做完。验收只认退出码。">
+<link rel="icon" href="agent-team.png">
+<style>
+:root{
+  --void:#070a10; --deck:#0d121a; --deck2:#131a24; --rule:#1e2733;
+  --ink:#dbe2ea; --mute:#8f9bab;
+  --cyan:#22e0ff; --magenta:#ff3ea5;
+  --user:#58a6ff; --coord:#a371f7; --plan:#39c5cf; --exec:#3fb950; --test:#f0883e; --review:#d29922;
+  --sans:"PingFang SC","HarmonyOS Sans SC","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;
+  --mono:"Cascadia Mono","JetBrains Mono",Consolas,"SF Mono",monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--void);color:var(--ink);font:16px/1.75 var(--sans);-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(#ffffff0a 1px,transparent 1px);background-size:24px 24px}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--cyan);outline-offset:3px;border-radius:4px}
+.wrap{width:min(1120px,100% - 40px);margin:0 auto}
+code,.mono{font-family:var(--mono)}
+
+/* 顶栏：只有名字和一个出口 */
+.top{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;text-decoration:none;letter-spacing:.02em}
+.brand img{width:28px;height:28px}
+.brand small{font-weight:400;color:var(--mute);font-family:var(--mono);font-size:13px}
+.gh{font-size:14px;color:var(--mute);text-decoration:none;border:1px solid var(--rule);padding:6px 14px;border-radius:999px}
+.gh:hover{color:var(--ink);border-color:var(--cyan)}
+
+/* 首屏：左边说清楚，右边演一遍 */
+.hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:56px;align-items:center;
+  padding:48px 0 96px}
+h1{font-size:clamp(34px,4.6vw,56px);line-height:1.18;font-weight:800;letter-spacing:-.01em}
+h1 .line{display:block}
+.lede{margin-top:24px;color:var(--mute);font-size:17px;max-width:30em}
+.lede b{color:var(--ink);font-weight:600}
+.cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:36px}
+.btn{display:inline-flex;align-items:center;gap:8px;height:46px;padding:0 22px;border-radius:12px;
+  font:600 15px var(--sans);text-decoration:none;cursor:pointer;border:1px solid var(--rule);
+  background:var(--deck);color:var(--ink);transition:border-color .14s,background .14s}
+.btn:hover{border-color:var(--cyan)}
+.btn.primary{background:var(--ink);color:var(--void);border-color:var(--ink)}
+.btn.primary:hover{background:#fff}
+.install{margin-top:20px;display:flex;align-items:center;gap:10px;max-width:100%;
+  font:13px var(--mono);color:var(--mute);background:var(--deck);border:1px solid var(--rule);
+  border-radius:10px;padding:10px 12px 10px 14px}
+.install code{flex:1;min-width:0;overflow-x:auto;white-space:nowrap;color:var(--ink);scrollbar-width:none}
+.install code::-webkit-scrollbar{display:none}
+.install code::before{content:"$ ";color:var(--exec)}
+.copy{flex:none;border:1px solid var(--rule);background:var(--deck2);color:var(--mute);font:12px var(--sans);
+  padding:4px 10px;border-radius:6px;cursor:pointer}
+.copy:hover{color:var(--ink)}
+/* 群聊回放：首屏唯一的大动作。消息逐条出现，一颗光点沿左侧导轨从发言人跳到下一个发言人 */
+.chat{position:relative;background:var(--deck);border:1px solid var(--rule);border-radius:18px;
+  box-shadow:0 0 0 1px #22e0ff14,0 30px 80px -30px #22e0ff40,0 20px 60px -40px #ff3ea560;overflow:hidden}
+.chat::before{content:"";position:absolute;inset:0 0 auto;height:2px;
+  background:linear-gradient(90deg,transparent,var(--cyan) 30%,var(--magenta) 70%,transparent);opacity:.7}
+.chat-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--rule);
+  font-size:13px;color:var(--mute)}
+.chat-head strong{color:var(--ink);font-weight:600}
+.live{display:inline-flex;align-items:center;gap:6px;margin-left:auto;font-size:12px}
+.live i{width:7px;height:7px;border-radius:50%;background:var(--exec);box-shadow:0 0 8px var(--exec)}
+.replay{border:1px solid var(--rule);background:none;color:var(--mute);font:12px var(--sans);
+  padding:3px 10px;border-radius:999px;cursor:pointer}
+.replay:hover{color:var(--ink);border-color:var(--cyan)}
+.feed{position:relative;padding:18px 18px 20px;min-height:500px;overflow:visible;
+  display:flex;flex-direction:column;gap:14px}
+.rail{position:absolute;left:33px;top:18px;bottom:20px;width:2px;background:var(--rule)}
+.baton{position:absolute;left:28px;top:0;width:12px;height:12px;border-radius:50%;opacity:0;
+  background:var(--c,var(--cyan));box-shadow:0 0 0 4px #ffffff10,0 0 18px var(--c,var(--cyan));
+  transition:top .55s cubic-bezier(.6,0,.2,1),background .3s,box-shadow .3s,opacity .3s;z-index:2}
+.m{display:flex;gap:12px;align-items:flex-start;opacity:0;transform:translateY(6px);
+  transition:opacity .35s,transform .35s}
+.m.show{opacity:1;transform:none}
+.m .av{flex:none;width:32px;height:32px;border-radius:10px;display:grid;place-items:center;
+  font-size:14px;font-weight:700;color:#0b0f15;background:var(--c);position:relative;z-index:1}
+.m .who{font-size:12px;color:var(--c);font-weight:600}
+.m .who span{color:var(--mute);font-weight:400;margin-left:6px}
+.m p{margin-top:3px;font-size:14px;line-height:1.6;background:var(--deck2);border:1px solid var(--rule);
+  border-radius:4px 12px 12px 12px;padding:8px 12px}
+.m.me{flex-direction:row-reverse;text-align:right}
+.m.me p{background:#14263c;border-color:#26456b;border-radius:12px 4px 12px 12px;text-align:left}
+.m .ok{font-family:var(--mono);font-size:12px;color:var(--exec);display:inline-block;margin-top:6px;
+  border:1px solid #3fb95055;background:#3fb95012;border-radius:6px;padding:1px 8px}
+.typing{display:flex;gap:4px;padding:4px 0 0 44px;height:14px;opacity:0;transition:opacity .2s}
+.typing.on{opacity:1}
+.typing b{width:6px;height:6px;border-radius:50%;background:var(--c,var(--mute));animation:dot 1s infinite}
+.typing b:nth-child(2){animation-delay:.15s}.typing b:nth-child(3){animation-delay:.3s}
+@keyframes dot{50%{opacity:.25;transform:translateY(-3px)}}
+
+/* 下面的部分都很安静：一条规矩一行字，不做卡片墙 */
+section{padding:88px 0;border-top:1px solid var(--rule)}
+h2{font-size:clamp(26px,3vw,36px);line-height:1.3;font-weight:800;max-width:22em}
+.sub{margin-top:14px;color:var(--mute);max-width:36em}
+/* 接力赛道：顺序是真的（需求就是按这个顺序流过去的），所以有序号 */
+.track{position:relative;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:24px;margin-top:56px}
+.track::before{content:"";position:absolute;left:6px;right:6px;top:6px;height:2px;
+  background:linear-gradient(90deg,var(--coord),var(--plan),var(--exec),var(--test),var(--review))}
+.stn{position:relative;padding-top:30px}
+.stn::before{content:"";position:absolute;left:0;top:0;width:14px;height:14px;border-radius:50%;
+  background:var(--void);border:2px solid var(--c);box-shadow:0 0 12px var(--c)}
+.stn h3{font-size:18px;font-weight:700;color:var(--c);display:flex;align-items:baseline;gap:8px}
+.stn h3 small{font:12px var(--mono);color:var(--mute);font-weight:400}
+.stn .does{margin-top:8px;font-size:14px}
+.stn .not{margin-top:6px;font-size:13px;color:var(--mute)}
+.stn .not::before{content:"不做：";color:#f85149cc}
+
+/* 证据：真实文件长什么样就放什么样 */
+.proof{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin-top:48px}
+.term{background:#05080c;border:1px solid var(--rule);border-radius:12px;overflow:hidden}
+.term header{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--rule);
+  font:12px var(--mono);color:var(--mute)}
+.term header i{width:8px;height:8px;border-radius:50%;background:var(--c)}
+.term pre{padding:14px;font:12.5px/1.7 var(--mono);color:#b8c2cf;white-space:pre-wrap;word-break:break-word}
+.term .g{color:var(--exec)}.term .y{color:var(--review)}.term .r{color:#ff7b72}
+.term + p,.proof p{margin-top:12px;font-size:14px;color:var(--mute)}
+
+/* 换模型：左说明，右是工作台里那个菜单的样子 */
+.swap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,380px);gap:56px;align-items:center}
+.swap ul{list-style:none;margin-top:24px;display:grid;gap:10px;font-size:15px}
+.swap li code{font-size:13px;background:var(--deck2);border:1px solid var(--rule);padding:1px 7px;border-radius:6px}
+.menu{background:var(--deck2);border:1px solid #2a3340;border-radius:12px;padding:6px;
+  box-shadow:0 24px 60px -20px #000}
+.menu .mh{padding:6px 10px;font-size:12px;color:var(--mute)}
+.menu .mi{display:flex;justify-content:space-between;gap:12px;padding:8px 10px;border-radius:8px;font-size:14px}
+.menu .mi.on{background:#1a212b;color:var(--cyan)}
+.menu .mi span:last-child{font-size:12px;color:var(--mute)}
+.menu .mi.off{opacity:.5}
+
+/* 上手：三步是真的顺序 */
+.steps{list-style:none;margin-top:44px;display:grid;gap:14px;counter-reset:s;max-width:760px}
+.steps li{counter-increment:s;display:grid;grid-template-columns:40px minmax(0,1fr);gap:16px;align-items:start}
+.steps li::before{content:counter(s);width:32px;height:32px;border-radius:10px;display:grid;place-items:center;
+  font:700 14px var(--mono);color:var(--cyan);border:1px solid #22e0ff55;background:#22e0ff0d}
+.steps h3{font-size:16px;font-weight:600}
+.steps p{font-size:14px;color:var(--mute);margin-top:2px}
+.steps .install{margin-top:10px}
+.note{margin-top:40px;font-size:13px;color:var(--mute);max-width:44em}
+footer{border-top:1px solid var(--rule);padding:32px 0 48px;font-size:13px;color:var(--mute);
+  display:flex;flex-wrap:wrap;gap:12px 28px}
+
+@media (max-width:900px){
+  .hero,.swap{grid-template-columns:minmax(0,1fr);gap:40px}
+  .hero{padding-top:24px}
+  .track{grid-template-columns:minmax(0,1fr);gap:28px;padding-left:30px}
+  .track::before{left:6px;right:auto;top:6px;bottom:6px;width:2px;height:auto;
+    background:linear-gradient(180deg,var(--coord),var(--plan),var(--exec),var(--test),var(--review))}
+  .stn{padding-top:0}.stn::before{left:-30px}
+  .proof{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:480px){.m p{font-size:13px}.btn{flex:1 1 100%;justify-content:center}}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .m{opacity:1;transform:none;transition:none}
+  .baton,.typing{display:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+  <a class="brand" href="#"><img src="agent-team.png" alt="">协作台 <small>agent-team</small></a>
+  <a class="gh" href="https://github.com/Lucusmaster/Cowork_with_agent">GitHub 源码</a>
+</header>
+
+<main>
+<div class="hero">
+  <div>
+    <h1><span class="line">把需求扔进群里，</span><span class="line">五个 Agent 接力做完。</span></h1>
+    <p class="lede">DeepSeek 拆任务，Codex 改代码，另一个模型只读复核，Claude Code 也能上场。
+      它们在同一个群里说话，你不用在窗口之间复制粘贴。<b>算不算做完，只看验收命令的退出码</b>，不听谁的自述。
+      全部跑在你自己的电脑上。</p>
+    <div class="cta">
+      <a class="btn primary" href="#start">三步装好</a>
+      <a class="btn" href="https://github.com/Lucusmaster/Cowork_with_agent">在 GitHub 上看</a>
+    </div>
+    <div class="install"><code id="cmd-hero">git clone https://github.com/Lucusmaster/Cowork_with_agent.git &amp;&amp; cd Cowork_with_agent &amp;&amp; pip install -e .</code>
+      <button class="copy" data-copy="cmd-hero">复制</button></div>
+  </div>
+
+  <div class="chat" aria-label="一次真实协作的回放">
+    <div class="chat-head"><strong>给 textstats 加元音计数</strong><span>工作区 textstats</span>
+      <span class="live"><i></i>引擎在跑</span><button class="replay" id="replay">重播</button></div>
+    <div class="feed" id="feed">
+      <div class="rail" aria-hidden="true"></div><div class="baton" id="baton" aria-hidden="true"></div>
+      <div class="m me" style="--c:var(--user)"><div class="av">我</div><div>
+        <div class="who">你</div><p>给 textstats 加个 count_vowels，大小写都要算</p></div></div>
+      <div class="m" style="--c:var(--coord)"><div class="av">协</div><div>
+        <div class="who">协调者<span>理解需求</span></div><p>我理解成：新增一个函数统计元音，不动现有接口。拆卡。</p></div></div>
+      <div class="m" style="--c:var(--plan)"><div class="av">规</div><div>
+        <div class="who">规划者<span>写验收</span></div><p>1 张卡，3 条验收标准。只允许改 textstats.py 和 tests/。</p></div></div>
+      <div class="m" style="--c:var(--exec)"><div class="av">执</div><div>
+        <div class="who">执行者<span>Codex</span></div><p>textstats.py 加了 count_vowels，补了 3 个测试。</p></div></div>
+      <div class="m" style="--c:var(--test)"><div class="av">验</div><div>
+        <div class="who">验收员<span>沙箱外跑命令</span></div><p>python -m unittest discover：3 个全过。<br><span class="ok">exit 0</span></p></div></div>
+      <div class="m" style="--c:var(--review)"><div class="av">复</div><div>
+        <div class="who">复核员<span>换了个模型，只读</span></div><p>PASS。diff 只动了声明的两个路径，没有放宽断言。<br><span class="ok">PASS</span></p></div></div>
+      <div class="typing" id="typing" aria-hidden="true"><b></b><b></b><b></b></div>
+    </div>
+  </div>
+</div>
+<section id="relay">
+  <h2>每个角色只干一件事，越界会被当场标出来</h2>
+  <p class="sub">需求按这个顺序流过去。决定做什么的和动手做的不是同一个，判通过的和写代码的也不是同一个。</p>
+  <div class="track">
+    <div class="stn" style="--c:var(--coord)"><h3>协调者<small>1</small></h3>
+      <p class="does">读完整段群聊，决定要不要动手，最后汇总。</p><p class="not">改代码</p></div>
+    <div class="stn" style="--c:var(--plan)"><h3>规划者<small>2</small></h3>
+      <p class="does">拆成能验收的任务卡，写清验收命令和允许改的路径。</p><p class="not">碰代码</p></div>
+    <div class="stn" style="--c:var(--exec)"><h3>执行者<small>3</small></h3>
+      <p class="does">在你的项目里改文件，只改任务卡声明的范围。</p><p class="not">改验收标准</p></div>
+    <div class="stn" style="--c:var(--test)"><h3>验收员<small>4</small></h3>
+      <p class="does">在沙箱外跑验收命令，只认退出码。</p><p class="not">听执行者说"改好了"</p></div>
+    <div class="stn" style="--c:var(--review)"><h3>复核员<small>5</small></h3>
+      <p class="does">换一个模型只读看 diff，专挑假通过和越界。</p><p class="not">改任何文件</p></div>
+  </div>
+</section>
+
+<section id="proof">
+  <h2>"做完了"要有证据，证据都落在任务卡里</h2>
+  <p class="sub">每张卡一个目录：提示词、执行输出、验收日志、复核结论都在 <code>tasks/&lt;任务号&gt;/</code>，随时能翻回去看。</p>
+  <div class="proof">
+    <div><div class="term" style="--c:var(--test)"><header><i></i>verify-01.txt</header>
+<pre>test_count_vowels_basic ... ok
+test_count_vowels_empty ... ok
+test_count_vowels_case ... ok
+
+Ran 3 tests in 0.002s
+<span class="g">OK</span>
+<span class="g">exit=0</span></pre></div>
+      <p>退出码不是 0，就是没通过。流程走完了也不算。</p></div>
+    <div><div class="term" style="--c:var(--review)"><header><i></i>review-01.last.md</header>
+<pre>## 结论
+<span class="g">PASS</span>
+
+## 证据
+- 看了 textstats.py 和
+  tests/test_textstats.py 的 diff
+- 断言用的是固定样本，
+  没有 SkipTest</pre></div>
+      <p>复核判 NEEDS_FIX，意见原文会变成下一轮的返工要求。</p></div>
+    <div><div class="term" style="--c:var(--magenta)"><header><i></i>群聊 · 第 1 轮</header>
+<pre><span class="y">⚠ 第 1 轮有 1 个越界改动：</span>
+<span class="y">  setup.cfg</span>
+
+<span class="r">⚠ 复核者改动了工作区</span>
+<span class="r">  （只读沙箱本不该允许）</span></pre></div>
+      <p>改了声明范围外的文件，或者复核者动了文件，群里当场报警。</p></div>
+  </div>
+</section>
+
+<section id="models">
+  <div class="swap">
+    <div>
+      <h2>谁来当哪个角色，你点一下就能换</h2>
+      <p class="sub">右栏每个角色下面有个模型徽章。先选 Agent，再选模型，下一张卡就用新的。</p>
+      <ul>
+        <li>本机找不到某个 Agent，菜单会告诉你在终端跑什么，或者直接去问那个 Agent 它装在哪</li>
+        <li>群里也能换：<code>/model 复核 claude</code></li>
+        <li>命令行也能换：<code>agent-team model set 执行 luna</code></li>
+        <li>没装、跑不起来的不让选，免得白烧一轮</li>
+      </ul>
+    </div>
+    <div class="menu" aria-hidden="true">
+      <div class="mh">复核 · 现在 gpt-6-luna · 先选 Agent</div>
+      <div class="mi on"><span>Codex CLI ✓</span><span>可用</span></div>
+      <div class="mi"><span>Claude Code</span><span>可用 · 2.0.31</span></div>
+      <div class="mi off"><span>DeepSeek</span><span>本机没装 · 点这里找</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <h2>三步装好</h2>
+  <p class="sub">需要 Python 3.10 以上、git，和已经登录的 Codex CLI。</p>
+  <ol class="steps">
+    <li><div><h3>拿到代码</h3><div class="install"><code id="cmd-1">git clone https://github.com/Lucusmaster/Cowork_with_agent.git &amp;&amp; cd Cowork_with_agent &amp;&amp; pip install -e .</code><button class="copy" data-copy="cmd-1">复制</button></div></div></li>
+    <li><div><h3>体检，然后启动</h3><p>启动后会打印一个带一次性码的链接，用它打开群聊。</p>
+      <div class="install"><code id="cmd-2">agent-team doctor &amp;&amp; agent-team start</code><button class="copy" data-copy="cmd-2">复制</button></div></div></li>
+    <li><div><h3>让你电脑上的 Agent 学会用它</h3><p>装进 Claude Code、Codex CLI、DSH 的技能目录，它们会在合适的时候自己把活交过来。</p>
+      <div class="install"><code id="cmd-3">agent-team install-skills</code><button class="copy" data-copy="cmd-3">复制</button></div></div></li>
+  </ol>
+  <p class="note">网页只绑 127.0.0.1，每个请求都要带令牌。想挂在公网上，先补 HTTPS 和反向代理。</p>
+</section>
+</main>
+</div>
+<div class="wrap"><footer>
+  <span>MIT 许可证</span>
+  <a href="https://github.com/Lucusmaster/Cowork_with_agent">源码</a>
+  <a href="https://github.com/Lucusmaster/Cowork_with_agent/blob/main/docs/ARCHITECTURE.md">架构说明</a>
+  <a href="https://github.com/Lucusmaster/Cowork_with_agent/blob/main/docs/MCP.md">让别的 Agent 调它（MCP）</a>
+</footer></div>
+<script>
+(() => {
+  const feed = document.getElementById('feed');
+  const baton = document.getElementById('baton');
+  const typing = document.getElementById('typing');
+  const msgs = Array.from(feed.querySelectorAll('.m'));
+  const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let timers = [];
+  const later = (fn, ms) => timers.push(setTimeout(fn, ms));
+
+  function moveBaton(m){
+    const av = m.querySelector('.av');
+    baton.style.setProperty('--c', getComputedStyle(m).getPropertyValue('--c'));
+    // av.offsetTop 恒为 0：消息上的 transform 会让 .m 变成 containing block。
+    // 用 m.offsetTop（相对 .feed 的 padding box），光点才能跟着发言人往下走。
+    baton.style.top = (m.offsetTop + av.offsetHeight / 2 - 6) + 'px';
+    baton.style.opacity = 1;
+  }
+  function play(){
+    timers.forEach(clearTimeout); timers = [];
+    msgs.forEach(m => m.classList.remove('show'));
+    baton.style.opacity = 0; typing.classList.remove('on');
+    if(still){ msgs.forEach(m => m.classList.add('show')); return; }
+    let at = 300;
+    msgs.forEach((m, i) => {
+      if(i > 0){
+        later(() => {
+          typing.style.setProperty('--c', getComputedStyle(m).getPropertyValue('--c'));
+          feed.insertBefore(typing, m);
+          typing.classList.add('on');
+        }, at);
+        at += 700;
+      }
+      later(() => {
+        typing.classList.remove('on');
+        m.classList.add('show');
+        if(i > 0) moveBaton(m);
+      }, at);
+      at += i === 0 ? 650 : 900;
+    });
+  }
+  document.getElementById('replay').addEventListener('click', play);
+  // 滚到眼前才开始演，只自动演一次
+  const io = new IntersectionObserver(es => {
+    if(es.some(e => e.isIntersecting)){ io.disconnect(); play(); }
+  }, {threshold: .2});
+  io.observe(feed);
+
+  document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
+    const text = document.getElementById(btn.dataset.copy).textContent;
+    try { await navigator.clipboard.writeText(text); }
+    catch(e){ const r = document.createRange(); r.selectNodeContents(document.getElementById(btn.dataset.copy));
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+    btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = '复制'; }, 1600);
+  }));
+})();
+</script>
+</body>
+</html>

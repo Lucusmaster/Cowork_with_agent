@@ -59,6 +59,13 @@ def find_codex() -> str:
     env = os.environ.get("CODEX_EXE", "").strip()
     if env and Path(env).is_file():
         candidates.append(env)
+    try:                                   # 换模型菜单里保存过的路径（room/agent_clis.json）
+        from . import agent_clis
+        saved, source = agent_clis.resolve_path("codex")
+        if saved and source == "已保存":
+            candidates.append(saved)
+    except Exception:  # noqa: BLE001 - 登记文件坏了就按老办法找
+        pass
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
         if base.is_dir():
@@ -113,6 +120,32 @@ def _session_tokens(started_ts: float, home: Path | None = None) -> int | None:
         return None
 
 
+def _route(model: str) -> str:
+    """模型 → 用哪个 CLI 跑。没写 cli、或者注册表读不了，都按 codex（老配置零改动）。"""
+    if not model:
+        return "codex"
+    try:
+        from . import models
+        spec = models.registry().get(model) or {}
+    except Exception:  # noqa: BLE001
+        return "codex"
+    return str(spec.get("cli") or "codex").strip() or "codex"
+
+
+def _no_adapter(cli: str, model: str, workspace: str | None, out_prefix: str | None) -> dict:
+    summary = f"{model} 要用 `{cli}` 跑，但协作台还没有这个 CLI 的执行适配，没有执行"
+    err = ""
+    if out_prefix:
+        err_path = Path(str(Path(out_prefix).resolve()) + ".err.txt")
+        err_path.parent.mkdir(parents=True, exist_ok=True)
+        err_path.write_text(summary, encoding="utf-8")
+        err = str(err_path)
+    return {"ok": False, "exit": 127, "timedout": False, "seconds": 0, "codex": "",
+            "workspace": str(Path(workspace or ROOT).resolve()), "last": "", "stdout": "",
+            "stderr": err, "summary": summary, "model": model, "reasoning_effort": "",
+            "tokens": None, "scratch_removed": 0, "agent": cli}
+
+
 def run_codex(
     prompt: str,
     workspace: str | None = None,
@@ -122,7 +155,18 @@ def run_codex(
     model: str = "",
     reasoning_effort: str = "",
 ) -> dict:
-    """跑一次 Codex，返回结果字典（不抛异常，失败用 ok=False 表达）。"""
+    """跑一次 Codex，返回结果字典（不抛异常，失败用 ok=False 表达）。
+
+    这里也是所有角色调模型的唯一入口：注册表里这个模型的 `cli` 是 claude，就转给
+    `claude_bridge`；是别的、协作台还没有执行适配的 CLI，就如实失败，不拿 codex 硬跑。
+    """
+    route = _route(model)
+    if route == "claude":
+        from .claude_bridge import run_claude
+        return run_claude(prompt, workspace=workspace, out_prefix=out_prefix, sandbox=sandbox,
+                          timeout=timeout, model=model, reasoning_effort=reasoning_effort)
+    if route != "codex":
+        return _no_adapter(route, model, workspace, out_prefix)
     ws = Path(workspace or ROOT).resolve()
     scratch = ws / ".tmp"
     scratch.mkdir(parents=True, exist_ok=True)

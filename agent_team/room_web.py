@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
 from . import models as MODELS  # noqa: E402
+from . import agent_clis as AGENT_CLIS  # noqa: E402
 from . import __version__  # noqa: E402
 
 
@@ -38,7 +39,7 @@ def _models_snapshot() -> dict:
     try:
         return MODELS.snapshot()
     except Exception:  # noqa: BLE001 - 模型注册表坏了不该拖垮界面
-        return {"roles": [], "registry": [], "clis": {}, "overrides": {}}
+        return {"roles": [], "registry": [], "agents": [], "clis": {}, "overrides": {}}
 
 
 def _room_note(text: str) -> None:
@@ -114,7 +115,7 @@ PRESENCE = {"last_seen": 0.0, "bye_at": 0.0, "ever": False, "deferred": False}
 AGENTS = {
     "user": {"name": "你", "role": "提需求 · 定边界", "color": "#58a6ff", "initial": "我"},
     "coordinator": {"name": "协调者", "role": "理解 · 计划 · 汇总", "color": "#a371f7", "initial": "协"},
-    "planner": {"name": "规划者", "role": "拆步骤 · 写验收", "color": "#58a6ff", "initial": "规"},
+    "planner": {"name": "规划者", "role": "拆步骤 · 写验收", "color": "#39c5cf", "initial": "规"},
     "executor": {"name": "执行者", "role": "写代码 · 跑命令", "color": "#3fb950", "initial": "执"},
     "tester": {"name": "验收员", "role": "跑测试 · 报失败", "color": "#f0883e", "initial": "验"},
     "reviewer": {"name": "复核员", "role": "只读审查", "color": "#d29922", "initial": "复"},
@@ -1750,6 +1751,23 @@ input,textarea{caret-color:var(--user)}
 .model-menu .mi .tag{color:var(--dim2);font-size:var(--fs-xs)}
 .model-menu .mi.on{color:var(--accent)}
 .model-menu .mh{padding:var(--sp-1) var(--sp-2);color:var(--dim2);font-size:var(--fs-xs)}
+.model-menu.wide{width:min(420px,calc(100vw - 16px));max-height:min(560px,calc(100vh - 16px))}
+.model-menu .mono{font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+.model-menu .mi .tag.warn,.model-menu .p.warn{color:var(--warn)}
+.model-menu .p.dim,.model-menu .pick.dim{color:var(--dim2)}
+.model-menu .mi.back{color:var(--dim)}
+.model-menu .setup{display:flex;flex-direction:column;gap:var(--sp-1);padding:0 var(--sp-2) var(--sp-2);
+  font-size:var(--fs-sm)}
+.model-menu .setup code{font-family:ui-monospace,Consolas,monospace;background:var(--panel3);
+  padding:0 4px;border-radius:var(--r-1)}
+.model-menu .ask{white-space:pre-wrap;margin:0;padding:var(--sp-1) var(--sp-2);background:var(--panel3);
+  border-radius:var(--r-1);font-size:var(--fs-xs);color:var(--dim)}
+.model-menu textarea{width:100%;box-sizing:border-box;resize:vertical;background:var(--bg);color:var(--fg);
+  border:var(--hair) solid var(--line2);border-radius:var(--r-1);padding:var(--sp-1);
+  font:var(--fs-xs) ui-monospace,Consolas,monospace}
+.model-menu textarea:focus-visible{outline:none;box-shadow:var(--ring)}
+.model-menu .setup .row{display:flex;gap:var(--sp-1);flex-wrap:wrap}
+.model-menu .pick{display:flex;align-items:flex-start;gap:var(--sp-1);font-size:var(--fs-xs);line-height:1.5}
 /* 空状态 */
 .sess-empty{padding:var(--sp-3) var(--sp-2);line-height:1.8}
 .side-foot{margin-top:auto;padding:var(--sp-2) var(--sp-3);
@@ -1814,6 +1832,17 @@ input,textarea{caret-color:var(--user)}
 .stream{flex:1;min-height:0;overflow-y:auto;
   padding:var(--sp-5) var(--sp-5) var(--sp-1)}
 .msg{display:flex;gap:var(--sp-3);max-width:860px;margin:0 auto var(--sp-4);width:100%}
+/* 交接：新消息到达时按发言人颜色扫一次、头像外扩一圈。只在特效开着时演，减少动态时不演 */
+body.fx-on .msg.arrive .bubble{position:relative;overflow:hidden}
+body.fx-on .msg.arrive .bubble::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(100deg,transparent 20%,color-mix(in srgb,var(--who) 26%,transparent) 50%,transparent 80%);
+  transform:translateX(-110%);animation:msg-sweep 900ms var(--ease) 1 forwards}
+body.fx-on .msg.arrive .av{animation:av-ring 900ms var(--ease) 1}
+@keyframes msg-sweep{to{transform:translateX(110%)}}
+@keyframes av-ring{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--who) 70%,transparent)}
+  100%{box-shadow:0 0 0 10px transparent}}
+@media (prefers-reduced-motion:reduce){body.fx-on .msg.arrive .bubble::after{display:none}
+  body.fx-on .msg.arrive .av{animation:none}}
 .msg .av{width:28px;height:28px;border-radius:var(--r-2);display:grid;place-items:center;
   font-weight:700;font-size:var(--fs-md);color:#06090f;flex:0 0 auto;margin-top:var(--sp-0)}
 .msg .body{min-width:0;max-width:min(680px,84%)}
@@ -3589,6 +3618,7 @@ function buildMsg(m){
   el.className = 'msg ' + role + (m.status === 'failed' ? ' failed' : '')
     + (streaming ? ' streaming' : '');
   el.dataset.id = String(m.id || '');
+  el.style.setProperty('--who', a.color || '#58a6ff');
 
   const isUser = role === 'user';
   const who = isUser ? '你' : (a.name || agentKey);
@@ -3846,6 +3876,8 @@ function renderMessages(list){
     if(!cur){
       const el = buildMsg(m);
       seen.set(id, {sig, el});
+      // 交接时刻：新来的 Agent 消息扫一道它自己的颜色。首屏把历史一次画出来时不演
+      if(!firstPaint && m.role !== 'user') el.classList.add('arrive');
       streamEl.appendChild(el);
     } else if(cur.sig !== sig){
       const el = buildMsg(m);
@@ -5097,51 +5129,206 @@ function closeArtMenu(){
   artMenuRef = '';
 }
 
-/* 换模型菜单：点 Agent 行里的模型徽章弹出来。
-   只列注册表里认识的型号；本机没装对应 CLI 的置灰并说明原因——
-   与其让人选完发现跑不起来，不如选的时候就说明白。 */
+/* 换模型菜单：点 Agent 行里的模型徽章弹出来。先选 Agent（Codex / Claude Code / …），再选它的模型。
+   Agent 本机找不到（或想补模型）就进设置页：给一条终端命令 + 一段可以直接问那个 Agent 的话，
+   用户把回答贴回来，服务端只做文本识别；点「保存并验证」才会真的跑一次 --version。
+   没装 / 跑不起来 / 协作台没有执行适配的，一律置灰并写明原因，不让人选完才发现跑不起来。 */
 let modelMenuRole = '';
+let modelMenuAgent = '';
+let modelMenuRect = null;
+let modelMenuParsed = null;
 function modelMenuEl(){ return $('model-menu'); }
-function openModelMenu(role, anchor){
+function modelAgents(){ return ((st.models || {}).agents) || []; }
+function modelAgent(id){ return modelAgents().find(a => a.id === id) || {}; }
+function modelRole(role){ return (((st.models || {}).roles) || []).find(r => r.role === role) || {}; }
+function placeModelMenu(){
   const menu = modelMenuEl();
-  if(!menu) return;
-  const models = st.models || {};
-  const rows = models.roles || [];
-  const reg = models.registry || [];
-  const me = rows.find(r => r.role === role) || {};
-  modelMenuRole = role;
-  const name = me.name || role;
-  let html = '<div class="mh">' + esc(name) + ' · 现在 ' + esc(me.model || '默认') + '</div>';
-  reg.forEach(m => {
-    const on = m.id === me.model;
-    const why = m.ready ? '' : '（本机没装 ' + (m.cli || '对应') + '）';
-    html += '<button class="mi ' + (on ? 'on' : '') + '" data-model="' + esc(m.id) + '"'
-      + (m.ready ? '' : ' disabled')
-      + ' title="' + esc((m.aliases || []).join(' / ') + (m.note ? ' · ' + m.note : '')) + '">'
-      + '<span>' + esc(m.id) + (on ? ' ✓' : '') + '</span>'
-      + '<span class="tag">' + esc(why || (m.cli || '')) + '</span></button>';
-  });
-  html += '<div class="menu-sep"></div>'
-    + '<button class="mi" data-model=""><span>恢复配置默认</span>'
-    + '<span class="tag">' + esc(me.source === '配置' ? '已是默认' : '') + '</span></button>';
-  menu.innerHTML = html;
-  menu.hidden = false;
-  const pad = 8;
-  const rect = anchor ? anchor.getBoundingClientRect() : {left: 0, bottom: 0};
+  if(!menu || menu.hidden) return;
+  const pad = 8, rect = modelMenuRect || {left: 0, bottom: 0, top: 0};
   const w = menu.offsetWidth, h = menu.offsetHeight;
   let x = rect.left, y = rect.bottom + 4;
   if(x + w + pad > window.innerWidth) x = Math.max(pad, window.innerWidth - w - pad);
   if(y + h + pad > window.innerHeight) y = Math.max(pad, rect.top - h - 4);
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
-  menu.querySelectorAll('.mi[data-model]').forEach(btn => {
-    btn.onclick = () => switchModel(role, btn.dataset.model);
+}
+function showModelMenu(html, wide){
+  const menu = modelMenuEl();
+  if(!menu) return;
+  menu.innerHTML = html;
+  menu.classList.toggle('wide', !!wide);
+  menu.hidden = false;
+  placeModelMenu();
+}
+function agentTag(a){
+  if(!a.found) return '本机没装 · 点这里找';
+  if(!a.runnable) return '已找到 · 协作台还不能用它执行';
+  if(a.checked && !a.works) return '跑不起来';
+  return a.version ? ('可用 · ' + a.version) : '已找到';
+}
+function openModelMenu(role, anchor){
+  modelMenuRole = role;
+  modelMenuAgent = '';
+  modelMenuRect = anchor ? anchor.getBoundingClientRect() : null;
+  renderModelAgents();
+}
+function renderModelAgents(){
+  const me = modelRole(modelMenuRole);
+  const reg = ((st.models || {}).registry) || [];
+  const cur = reg.find(m => m.id === me.model) || {};
+  const curCli = cur.cli || 'codex';
+  let html = '<div class="mh">' + esc(me.name || modelMenuRole) + ' · 现在 ' + esc(me.model || '默认')
+    + ' · 先选 Agent</div>';
+  modelAgents().forEach(a => {
+    const on = a.id === curCli && !!me.model;
+    const bad = !a.found || !a.runnable || (a.checked && !a.works);
+    html += '<button class="mi ' + (on ? 'on' : '') + '" data-agent="' + esc(a.id) + '"'
+      + ' title="' + esc(a.path || a.reason || '') + '">'
+      + '<span>' + esc(a.label) + (on ? ' ✓' : '') + ' ›</span>'
+      + '<span class="tag' + (bad ? ' warn' : '') + '">' + esc(agentTag(a)) + '</span></button>';
   });
+  html += '<div class="menu-sep"></div>'
+    + '<button class="mi" data-model=""><span>恢复配置默认</span>'
+    + '<span class="tag">' + esc(me.source === '配置' ? '已是默认' : '') + '</span></button>';
+  showModelMenu(html, false);
+}
+async function pickModelAgent(agent){
+  modelMenuAgent = agent;
+  const a = modelAgent(agent);
+  showModelMenu('<div class="mh">正在本机查找 ' + esc(a.label || agent) + '…</div>', false);
+  const data = await apiPost('/api/agent-cli/detect', {agent: agent});
+  if(data && data.models) st.models = data.models;
+  if(modelMenuEl().hidden || modelMenuAgent !== agent) return;   // 等的时候用户已经关了/换了
+  const row = (data && data.agent) || modelAgent(agent);
+  if(row.found && row.runnable && row.works) renderModelList(agent);
+  else renderAgentSetup(agent, row);
+}
+function renderModelList(agent){
+  const a = modelAgent(agent);
+  const me = modelRole(modelMenuRole);
+  const reg = (((st.models || {}).registry) || []).filter(m => (m.cli || 'codex') === agent);
+  let html = '<button class="mi back" data-back="agents"><span>‹ 选 Agent</span></button>'
+    + '<div class="mh">' + esc(a.label || agent) + ' · ' + esc(a.version || '') + '</div>'
+    + '<div class="mh mono">' + esc(a.path || '') + '</div>';
+  if(!reg.length){
+    html += '<div class="mh">还没有登记它的模型。点下面「补充模型」，按提示问它要模型 id。</div>';
+  }
+  reg.forEach(m => {
+    const on = m.id === me.model;
+    const why = m.ready ? '' : (m.why || '本机没装 ' + (m.cli || '对应 CLI'));
+    html += '<button class="mi ' + (on ? 'on' : '') + '" data-model="' + esc(m.id) + '"'
+      + (m.ready ? '' : ' disabled')
+      + ' title="' + esc(why || ((m.aliases || []).join(' / ') + (m.note ? ' · ' + m.note : ''))) + '">'
+      + '<span>' + esc(m.id) + (on ? ' ✓' : '') + '</span>'
+      + '<span class="tag">' + esc(why ? '不可用' : (m.note || '')) + '</span></button>';
+  });
+  html += '<div class="menu-sep"></div>'
+    + '<button class="mi" data-setup="1"><span>补充模型 / 换路径…</span></button>';
+  showModelMenu(html, false);
+}
+function renderAgentSetup(agent, row){
+  const a = row || modelAgent(agent);
+  const g = a.guide || {};
+  modelMenuAgent = agent;
+  modelMenuParsed = null;
+  const state = !a.found ? '本机没找到 ' + a.label + '（PATH 和常见安装目录都看过了）。'
+    : (a.reason ? a.reason : '找到了：' + a.path);
+  const html = '<button class="mi back" data-back="agents"><span>‹ 选 Agent</span></button>'
+    + '<div class="mh">' + esc(a.label || agent) + ' · 设置</div>'
+    + '<div class="setup">'
+    + '<div class="p' + (a.found && !a.reason ? '' : ' warn') + '">' + esc(state) + '</div>'
+    + '<div class="step">① 在终端里跑：<code>' + esc(g.command || '') + '</code></div>'
+    + '<div class="step">② 或者把下面这段话发给 ' + esc(a.label) + '，让它自己告诉你：</div>'
+    + '<pre class="ask" id="agent-ask">' + esc(g.ask || '') + '</pre>'
+    + '<button class="pick-btn" data-copy="1">复制这段话</button>'
+    + '<div class="step">③ 把终端输出或它的回答整段贴进来：</div>'
+    + '<textarea id="agent-paste" rows="5" spellcheck="false"'
+    + ' placeholder="例如：C:\\Users\\你\\AppData\\Roaming\\npm\\claude.cmd&#10;claude-sonnet-4-5"></textarea>'
+    + '<div class="row"><button class="pick-btn" data-parse="1">识别</button>'
+    + '<button class="pick-btn" data-redetect="1">重新检测</button></div>'
+    + '<div id="agent-parsed"></div>'
+    + '</div>';
+  showModelMenu(html, true);
+}
+async function copyAgentAsk(){
+  const text = ($('agent-ask') || {}).textContent || '';
+  try { await navigator.clipboard.writeText(text); toast('已复制，去问它吧'); }
+  catch(e) { window.prompt('复制这段话：', text); }
+}
+async function parseAgentPaste(){
+  const box = $('agent-parsed');
+  const text = ($('agent-paste') || {}).value || '';
+  if(!text.trim()){ toast('先把回答贴进来'); return; }
+  const data = await apiPost('/api/agent-cli/parse', {agent: modelMenuAgent, text: text});
+  if(!box) return;
+  if(!data || data.ok === false){ box.innerHTML = '<div class="p warn">' + esc((data && data.error) || '识别失败') + '</div>'; return; }
+  modelMenuParsed = data;
+  const a = modelAgent(modelMenuAgent);
+  const first = Math.max(0, (data.paths || []).findIndex(p => p.usable && p.exists));
+  let html = '<div class="mh">识别结果（勾选后保存）</div>';
+  if(a.found){
+    html += '<label class="pick"><input type="radio" name="agent-path" value="" '
+      + ((data.paths || []).length ? '' : 'checked') + '> 路径不变（' + esc(a.path) + '）</label>';
+  }
+  (data.paths || []).forEach((p, i) => {
+    const note = !p.usable ? '不能直接执行' : (!p.exists ? '本机没有这个文件' : '');
+    html += '<label class="pick' + (note ? ' dim' : '') + '"><input type="radio" name="agent-path" value="'
+      + esc(p.path) + '"' + (i === first && p.usable ? ' checked' : '') + (p.usable ? '' : ' disabled') + '> '
+      + '<span class="mono">' + esc(p.path) + '</span>' + (note ? ' · ' + esc(note) : '') + '</label>';
+  });
+  (data.models || []).forEach(m => {
+    html += '<label class="pick"><input type="checkbox" name="agent-model" value="' + esc(m) + '" checked> '
+      + '<span class="mono">' + esc(m) + '</span></label>';
+  });
+  if((data.other_models || []).length){
+    html += '<div class="p dim">这些看着是别家的模型，没收：' + esc(data.other_models.join('、')) + '</div>';
+  }
+  if((data.ignored_paths || []).length){
+    html += '<div class="p dim">这些是别的 Agent 的路径，没收：' + esc(data.ignored_paths.join('、')) + '</div>';
+  }
+  if(data.hint) html += '<div class="p warn">' + esc(data.hint) + '</div>';
+  const can = (data.paths || []).some(p => p.usable) || ((data.models || []).length && a.found);
+  html += '<div class="row"><button class="pick-btn" data-save="1"' + (can ? '' : ' disabled') + '>保存并验证</button></div>';
+  box.innerHTML = html;
+  placeModelMenu();
+}
+async function saveAgentCli(){
+  const menu = modelMenuEl();
+  const picked = menu.querySelector('input[name="agent-path"]:checked');
+  const models = Array.from(menu.querySelectorAll('input[name="agent-model"]:checked')).map(x => x.value);
+  const agent = modelMenuAgent;
+  const data = await apiPost('/api/agent-cli/save', {agent: agent, path: picked ? picked.value : '', models: models});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '保存失败'); return; }
+  toast(data.message || '已保存');
+  if(!menu.hidden && modelMenuAgent === agent){
+    const row = data.agent || modelAgent(agent);
+    if(row.runnable && row.works) renderModelList(agent);
+    else renderAgentSetup(agent, row);
+  }
 }
 function closeModelMenu(){
   const menu = modelMenuEl();
   if(menu) menu.hidden = true;
   modelMenuRole = '';
+  modelMenuAgent = '';
+  modelMenuParsed = null;
+}
+if(modelMenuEl()){
+  // 一个委托处理全部按钮：菜单内容每次都整块重画，逐个绑 onclick 容易漏
+  modelMenuEl().addEventListener('click', ev => {
+    const btn = ev.target.closest && ev.target.closest('button');
+    if(!btn || btn.disabled) return;
+    const role = modelMenuRole;
+    if(btn.dataset.agent) pickModelAgent(btn.dataset.agent);
+    else if(btn.dataset.back) renderModelAgents();
+    else if(btn.dataset.setup) renderAgentSetup(modelMenuAgent);
+    else if(btn.dataset.copy) copyAgentAsk();
+    else if(btn.dataset.parse) parseAgentPaste();
+    else if(btn.dataset.redetect) pickModelAgent(modelMenuAgent);
+    else if(btn.dataset.save) saveAgentCli();
+    else if(btn.dataset.model !== undefined) switchModel(role, btn.dataset.model);
+  });
 }
 async function switchModel(role, model){
   closeModelMenu();
@@ -5184,7 +5371,11 @@ document.addEventListener('click', ev => {
   const menu = artMenuEl();
   if(menu && !menu.hidden && !(ev.target.closest && ev.target.closest('#art-menu'))) closeArtMenu();
   const mm = modelMenuEl();
-  if(mm && !mm.hidden && !(ev.target.closest && ev.target.closest('#model-menu,.am[data-role]'))) closeModelMenu();
+  // 菜单内容点完会整块重画，被点的按钮这时已经脱离文档，closest 找不到 #model-menu；
+  // composedPath 记的是派发那一刻的路径，所以用它判断"点在菜单里面"
+  const path = ev.composedPath ? ev.composedPath() : [];
+  const inMenu = mm && (path.includes(mm) || (ev.target.closest && ev.target.closest('.am[data-role]')));
+  if(mm && !mm.hidden && !inMenu) closeModelMenu();
 });
 document.addEventListener('keydown', ev => {
   if(ev.key !== 'Escape') return;
@@ -5327,6 +5518,9 @@ async function startWorkbench(){
   if(!data){ showUnlock('需要访问令牌：把 room/web-token 的内容粘贴进来'); return; }
   unlockEl.hidden = true;
   document.body.classList.add('ready');
+  // 首屏那次 applyState 时 .app 还没显示（display:none），滚动是空操作；
+  // 显示出来补一次，长会话才不会停在最上面、把最新几条裁在下面。
+  scrollDown();
   fxBoot();
   // 空会话才看得到欢迎语：解码入场只在这时候演一次（有历史消息时 #welcome 已经被换掉了）
   const h1 = document.querySelector('#welcome h1');
@@ -5856,6 +6050,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/set-model":
             self._post_set_model(body)
             return
+        if parsed.path in ("/api/agent-cli/detect", "/api/agent-cli/parse", "/api/agent-cli/save"):
+            self._post_agent_cli(parsed.path.rsplit("/", 1)[-1], body)
+            return
         self._json({"ok": False, "error": "接口不存在"}, 404)
 
     # ---------- 产物：用默认程序打开 / 在资源管理器里定位 ----------
@@ -5879,6 +6076,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         _room_note(message)                 # 群里留一行，事后能看出是谁什么时候换的
         self._json({"ok": True, "message": message, "models": _models_snapshot()})
+
+    # ---------- /api/agent-cli/*：换模型菜单里的「找 CLI / 识别粘贴 / 保存」 ----------
+    def _post_agent_cli(self, action: str, body: dict) -> None:
+        """detect 会真的跑一次 `--version`，save 会写 room/agent_clis.json，所以都走 POST + 写守卫。
+        parse 只做文本提取，不执行任何东西。"""
+        agent = str((body or {}).get("agent") or "").strip()
+        if agent not in AGENT_CLIS.AGENTS:
+            self._json({"ok": False, "error": f"不认识的 Agent：{agent or '（空）'}"}, 400)
+            return
+        if action == "parse":
+            self._json({"ok": True, **AGENT_CLIS.parse_paste(agent, str(body.get("text") or ""))})
+            return
+        if action == "detect":
+            row = AGENT_CLIS.detect(agent)
+            self._json({"ok": True, "agent": row, "models": _models_snapshot()})
+            return
+        raw_models = body.get("models")
+        if raw_models is not None and not isinstance(raw_models, list):
+            self._json({"ok": False, "error": "models 要是列表"}, 400)
+            return
+        ok, message, row = AGENT_CLIS.save(agent, str(body.get("path") or ""), raw_models or [])
+        if ok:
+            _room_note(message)
+        self._json({"ok": ok, "message": message if ok else "", "error": "" if ok else message,
+                    "agent": row, "models": _models_snapshot()}, 200 if ok else 400)
 
     # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
     def _client_ip(self) -> str:

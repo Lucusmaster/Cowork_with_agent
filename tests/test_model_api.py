@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -67,8 +68,19 @@ class ModelApiCase(unittest.TestCase):
         self._which = mock.patch.object(models.shutil, "which",
                                         side_effect=lambda n: "/usr/bin/codex" if n == "codex" else None)
         self._which.start()
+        from agent_team import agent_clis
+        self._isolate = [mock.patch.object(agent_clis, "STORE", room_web.ROOM / "agent_clis.json"),
+                         mock.patch.object(agent_clis, "_common_candidates", return_value=[]),
+                         mock.patch.dict(agent_clis.os.environ, {}, clear=False)]
+        for p in self._isolate:
+            p.start()
+        for key in ("CODEX_EXE", "CLAUDE_EXE", "DEEPSEEK_EXE"):
+            agent_clis.os.environ.pop(key, None)
+        agent_clis._PROBES.clear()
 
     def tearDown(self) -> None:
+        for p in reversed(self._isolate):
+            p.stop()
         self._which.stop()
         self.server.shutdown()
         self.server.server_close()
@@ -170,6 +182,70 @@ class ModelsEndpointTests(ModelApiCase):
         self.assertTrue(data["models"]["roles"])
 
 
+class AgentCliEndpointTests(ModelApiCase):
+    """换模型菜单里的「检测 / 识别粘贴 / 保存」三个接口。"""
+
+    def fake_claude(self) -> Path:
+        from tests.test_agent_clis import make_fake_claude
+        folder = self.tmp / "bin"
+        folder.mkdir(exist_ok=True)
+        return make_fake_claude(folder)
+
+    def test_models_snapshot_lists_agents(self) -> None:
+        _, data = self.request("/api/models")
+        agents = {a["id"]: a for a in data["models"]["agents"]}
+        self.assertEqual(set(agents), {"codex", "claude", "deepseek"})
+        self.assertFalse(agents["claude"]["found"])
+        self.assertIn("ask", agents["claude"]["guide"])
+        self.assertIn("claude-opus-5-5", agents["claude"]["models"])
+
+    def test_parse_is_text_only_and_writes_nothing(self) -> None:
+        from agent_team import agent_clis
+        with mock.patch.object(agent_clis, "probe", side_effect=AssertionError("parse 不许执行")):
+            status, data = self.request("/api/agent-cli/parse", {
+                "agent": "claude", "text": "C:\\npm\\claude.cmd\nclaude-sonnet-4-5"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["models"], ["claude-sonnet-4-5"])
+        self.assertFalse((room_web.ROOM / "agent_clis.json").exists())
+
+    def test_save_then_switch_end_to_end(self) -> None:
+        exe = self.fake_claude()
+        status, data = self.request("/api/agent-cli/save", {
+            "agent": "claude", "path": str(exe), "models": ["claude-sonnet-4-5"]})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["agent"]["works"])
+        agents = {a["id"]: a for a in data["models"]["agents"]}
+        self.assertIn("claude-sonnet-4-5", agents["claude"]["models"])
+        status, data = self.request("/api/set-model", {"role": "复核", "model": "claude-sonnet-4-5"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(models.overrides(), {"reviewer": "claude-sonnet-4-5"})
+
+    def test_save_rejects_wrong_binary(self) -> None:
+        bad = self.tmp / "calc.exe"
+        bad.write_text("x", encoding="utf-8")
+        status, data = self.request("/api/agent-cli/save", {"agent": "claude", "path": str(bad)})
+        self.assertEqual(status, 400)
+        self.assertIn("不是 Claude Code 的命令", data["error"])
+
+    def test_detect_runs_version_once_found(self) -> None:
+        exe = self.fake_claude()
+        with mock.patch.dict(os.environ, {"CLAUDE_EXE": str(exe)}):
+            status, data = self.request("/api/agent-cli/detect", {"agent": "claude"})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["agent"]["works"])
+        self.assertIn("2.0.31", data["agent"]["version"])
+
+    def test_unknown_agent_and_bad_models_are_400(self) -> None:
+        status, _ = self.request("/api/agent-cli/detect", {"agent": "gemini"})
+        self.assertEqual(status, 400)
+        status, _ = self.request("/api/agent-cli/save", {"agent": "claude", "models": "x"})
+        self.assertEqual(status, 400)
+
+    def test_agent_cli_requires_auth(self) -> None:
+        status, _ = self.request("/api/agent-cli/save", {"agent": "claude", "path": "x"}, token="")
+        self.assertEqual(status, 401)
+
+
 class PageContractTests(unittest.TestCase):
     """页面里必须有模型徽章和菜单，否则右栏就是死的（纯字符串契约，不起服务）。"""
 
@@ -184,6 +260,31 @@ class PageContractTests(unittest.TestCase):
         self.assertIn("✓", src)
         self.assertIn("disabled", src)
         self.assertIn("本机没装", src, "没装 CLI 的型号要当场说明，而不是让用户选完失败")
+
+    def test_menu_is_agent_first_with_setup_fallback(self) -> None:
+        """先选 Agent 再选模型；找不到时有终端命令、问 Agent 的话、粘贴框、识别和保存。"""
+        src = room_web.PAGE
+        for needle in ("renderModelAgents", "pickModelAgent", "renderModelList", "renderAgentSetup",
+                       "/api/agent-cli/detect", "/api/agent-cli/parse", "/api/agent-cli/save",
+                       'id="agent-paste"', "复制这段话", "保存并验证", "composedPath"):
+            self.assertIn(needle, src, f"页面里缺 {needle}")
+
+    def test_inline_js_parses(self) -> None:
+        import re
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("没装 node")
+        js = "\n;\n".join(re.findall(r"<script>(.*?)</script>", room_web.PAGE, re.S))
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+            fh.write(js)
+        try:
+            proc = subprocess.run([node, "--check", fh.name], capture_output=True, text=True,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr[:800])
 
     def test_switch_goes_through_api_not_local_only(self) -> None:
         """只在内存里改 st.models 是不算数的——必须落盘到服务端。"""

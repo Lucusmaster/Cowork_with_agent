@@ -56,9 +56,13 @@ python -m agent_team.cli model set 执行 luna    # 切执行者（别名或 id�
 python -m agent_team.cli model reset 执行       # 回到配置默认
 ```
 
-群里也可以 `/model 执行 luna`、`切换模型 复核=terra`；右栏每个角色名下面的徽章能点。
-规矩：只认注册表里的型号（拼错直接拒）、没装对应 CLI 的型号不许切、**协调者不可切**
-（它用引擎自己的大脑模型，换要改配置 + 重启）。
+群里也可以 `/model 执行 luna`、`切换模型 复核=terra`；右栏每个角色名下面的徽章能点：
+先选 Agent（Codex CLI / Claude Code / DeepSeek）再选模型。本机找不到那个 Agent 时，菜单给出
+`where <命令>` 和一段可以直接问那个 Agent 的话，把回答贴回去「识别」→「保存并验证」
+（存 `room/agent_clis.json`）。
+规矩：只认注册表里的型号（拼错直接拒）；CLI 找不到、`--version` 跑不通、或协作台没有它的执行适配
+（DeepSeek 目前只能登记）都不许切；**协调者、验收者不可切**（协调者是引擎自己的大脑，验收不调模型）。
+Claude Code 当执行者时只能改文件、不能跑命令；当复核者时禁掉所有写工具。
 
 ## 从别的 Agent 指挥它（MCP）
 

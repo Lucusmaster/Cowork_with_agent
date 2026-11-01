@@ -19,7 +19,7 @@
 
 ### 修法
 
-`tools/make_icon.py` 自己拼 ICO（`_bmp_frame` / `_png_frame` / `write_ico`），
+`bin/make_icon.py` 自己拼 ICO（`_bmp_frame` / `_png_frame` / `write_ico`），
 128 及以下写成 BMP，256 用 PNG，不再走 Pillow 的 ICO 写入器。
 
 ### 验证
@@ -32,7 +32,7 @@
 
 桌面快捷方式原来借用 `shell32.dll,13`，就是那个谁都认识的默认图标。这一版有了自己的：
 
-- `tools/make_icon.py` 画出 `assets/agent-team.ico`（16/24/32/48/64/128/256 七档）
+- `bin/make_icon.py` 画出 `assets/agent-team.ico`（16/24/32/48/64/128/256 七档）
   和 `assets/agent-team.png`（256 预览，给人眼看的）；
 - 图案：深色圆角托盘 + 三个节点连成三角形，顶上那个节点里一个白点——大脑加两个干活的；
 - `install-shortcut.ps1` 加了 `-Icon`，`install-desktop` 看到图标就自动带上，

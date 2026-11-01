@@ -16,16 +16,21 @@
 - 注册表没写的型号会自动从配置里收录（老配置不改也能用，只是没有别名）。
 
 谁能切：`coordinator` 固定不可切——它是引擎自己的大脑模型，换它要重启引擎，
-不是同一套机制（这里如实标出来，而不是假装能切）。
+不是同一套机制（这里如实标出来，而不是假装能切）。`tester` 也不可切：验收跑的是本地命令，
+只认退出码，根本不调模型——给它一个模型菜单等于摆设。
+
+模型背后是哪个 CLI（codex / claude / …）由注册表的 `cli` 决定；找没找到、能不能跑交给
+`agent_clis`。用户在本机登记的模型（room/agent_clis.json）也算注册表的一部分。
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
+import shutil  # noqa: F401 - 测试用 models.shutil.which 打桩；agent_clis 共用同一个模块对象
 import tempfile
 from pathlib import Path
 
+from . import agent_clis
 from .paths import workbench_root
 
 ROOT = workbench_root()
@@ -48,9 +53,13 @@ ROLE_ALIASES = {
     "tester": "tester", "test": "tester", "verify": "tester", "验收": "tester", "验收者": "tester",
     "reviewer": "reviewer", "review": "reviewer", "复核": "reviewer", "复核者": "reviewer",
 }
-# 这些角色跑的是 codex exec，模型名能透传；coordinator 走引擎自己的 API。
-SWITCHABLE = {"planner", "executor", "tester", "reviewer"}
-UNSWITCHABLE_REASON = "协调者用的是引擎自己的大脑模型，换它要重启引擎（先改 config 再 restart）"
+# 这些角色真的会调模型、而且派发时读这里的结果（worker 规划 / team dispatch / team review）。
+SWITCHABLE = {"planner", "executor", "reviewer"}
+UNSWITCHABLE = {
+    "coordinator": "协调者用的是引擎自己的大脑模型，换它要重启引擎（先改 config 再 restart）",
+    "tester": "验收跑的是本地验收命令、只认退出码，不调用模型，没有可换的",
+}
+UNSWITCHABLE_REASON = UNSWITCHABLE["coordinator"]
 
 
 def _read_json(path: Path) -> dict:
@@ -93,6 +102,14 @@ def registry(cfg: dict | None = None) -> dict[str, dict]:
                 "aliases": [str(a) for a in (spec.get("aliases") or []) if str(a).strip()],
                 "note": str(spec.get("note") or ""),
             }
+    # 用户在本机登记的（换模型菜单里粘贴识别后保存的）
+    try:
+        for agent in agent_clis.AGENTS:
+            for mid in agent_clis.saved_models(agent):
+                if mid not in out:
+                    out[mid] = {"cli": agent, "backend": "", "aliases": [], "note": "本机登记"}
+    except Exception:  # noqa: BLE001 - 登记文件坏了不能让注册表跟着挂
+        pass
     # 自动收录：配置文件里凡是提到过的型号都算"认识"
     mentioned: list[str] = []
     for entry in _agent_entries(cfg):
@@ -173,7 +190,7 @@ def set_model(role: str, model: str) -> tuple[bool, str]:
     if role not in ROLES:
         return False, f"未知角色：{role}（可用：{'、'.join(ROLE_LABELS[r] for r in ROLES)}）"
     if not switchable(role):
-        return False, f"{ROLE_LABELS[role]}不能运行时切换：{UNSWITCHABLE_REASON}"
+        return False, f"{ROLE_LABELS[role]}不能运行时切换：{UNSWITCHABLE.get(role, UNSWITCHABLE_REASON)}"
 
     clean = str(model or "").strip()
     data = overrides()
@@ -240,16 +257,15 @@ def effort_for(role: str) -> str:
 
 def clis() -> dict[str, bool]:
     """各个 CLI 在不在本机（只做提示：注册表里有名字但没装 CLI，切过去也是白切）。"""
-    return {name: bool(shutil.which(name)) for name in ("codex", "deepseek", "claude")}
+    return {name: bool(agent_clis.resolve_path(name)[0]) for name in agent_clis.AGENTS}
 
 
 def cli_ready(model: str) -> tuple[bool, str]:
-    """这个模型现在真能跑吗：它要的 CLI 不在 PATH 上就别让切，说清楚缺什么。"""
+    """这个模型现在真能跑吗：CLI 找不到、跑不起来、或协作台没有它的执行适配，都别让切。"""
     spec = registry().get(model) or {}
     cli = str(spec.get("cli") or "codex").strip()
-    if cli and not shutil.which(cli):
-        return False, f"{model} 要用 `{cli}` 跑，本机没装这个命令（装上之后就能切）"
-    return True, ""
+    ok, why = agent_clis.ready(cli)
+    return (True, "") if ok else (False, f"{model}：{why}")
 
 
 def snapshot(task: dict | None = None) -> dict:
@@ -265,20 +281,27 @@ def snapshot(task: dict | None = None) -> dict:
             "model": model,
             "source": source,
             "switchable": switchable(role),
-            "reason": "" if switchable(role) else UNSWITCHABLE_REASON,
+            "reason": "" if switchable(role) else UNSWITCHABLE.get(role, UNSWITCHABLE_REASON),
             "cli": str(spec.get("cli") or ""),
             "known": bool(model) and model in reg,
             "ready": (not model) or cli_ready(model)[0],
         })
+    entries = []
+    for mid, spec in sorted(reg.items()):
+        ok, why = cli_ready(mid)
+        entries.append({"id": mid, "cli": spec.get("cli", ""), "backend": spec.get("backend", ""),
+                        "aliases": list(spec.get("aliases") or []), "note": spec.get("note", ""),
+                        "ready": ok, "why": why})
+    agents = []
+    for name in agent_clis.AGENTS:
+        row = agent_clis.status(name)
+        row["models"] = [e["id"] for e in entries if (e["cli"] or "codex") == name]
+        agents.append(row)
     return {
         "roles": rows,
-        "registry": [
-            {"id": mid, "cli": spec.get("cli", ""), "backend": spec.get("backend", ""),
-             "aliases": list(spec.get("aliases") or []), "note": spec.get("note", ""),
-             "ready": cli_ready(mid)[0]}
-            for mid, spec in sorted(reg.items())
-        ],
-        "clis": clis(),
+        "registry": entries,
+        "agents": agents,
+        "clis": {row["id"]: row["found"] for row in agents},
         "overrides": overrides(),
     }
 

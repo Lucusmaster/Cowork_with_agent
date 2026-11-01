@@ -326,14 +326,21 @@ def sanitize_plan(plan: dict) -> dict:
     }
 
 
+def _planner_model() -> tuple[str, str]:
+    """规划者用的模型：和右栏「规划」徽章同一条链（运行时切换 > 配置），都没写才用老默认。"""
+    model, _ = models.model_for("planner")
+    return (model or "gpt-6.1-terra"), (models.effort_for("planner") or "low")
+
+
 def plan_with_codex(request: str, workspace: Path) -> dict | None:
     prompt = PLANNER_PROMPT.replace("{request}", request).replace("{workspace}", str(workspace))
     out = ROOM / "planner"
     out.mkdir(parents=True, exist_ok=True)
     prefix = out / f"plan-{int(time.time())}"
+    model, effort = _planner_model()
     result = run_codex(
         prompt, workspace=str(workspace), out_prefix=str(prefix),
-        sandbox="read-only", timeout=300, model="gpt-6.1-terra", reasoning_effort="low",
+        sandbox="read-only", timeout=300, model=model, reasoning_effort=effort,
     )
     text = ""
     if result.get("last"):
@@ -659,9 +666,9 @@ def plan_continue_with_codex(request: str, context: str, workspace: Path) -> dic
     out = ROOM / "planner"
     out.mkdir(parents=True, exist_ok=True)
     prefix = out / f"plan-continue-{int(time.time())}"
+    model, effort = _planner_model()
     result = run_codex(prompt, workspace=str(workspace), out_prefix=str(prefix),
-                       sandbox="read-only", timeout=300, model="gpt-6.1-terra",
-                       reasoning_effort="low")
+                       sandbox="read-only", timeout=300, model=model, reasoning_effort=effort)
     text = ""
     if result.get("last"):
         text = Path(result["last"]).read_text(encoding="utf-8", errors="replace")

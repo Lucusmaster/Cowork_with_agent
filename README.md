@@ -305,7 +305,7 @@ agent-team install-desktop        # 装一次：桌面生成 agent-team.lnk（�
 agent-team install-desktop --app  # 另一个版本：agent-team-app.lnk，独立窗口、没有地址栏
 ```
 
-两个图标可以并存。图标是仓库里现画的（`python tools/make_icon.py` 可重跑），
+两个图标可以并存。图标是仓库里现画的（`python bin/make_icon.py` 可重跑），
 桌面显示的空白图标（缓存没过期）按 F5 刷一下就好。
 
 双击后会：没在跑就起服务 → 等到页面真能打开 → 用**一次性链接**开浏览器；
@@ -554,15 +554,22 @@ python bin/team.py report -t <ID>
 
 三个入口，改的都是同一个运行时覆盖文件 `room/model_overrides.json`，**下一张卡生效**：
 
-- 网页右栏：每个角色名下面有个模型小徽章，点它弹菜单选型号；
+- 网页右栏：每个角色名下面有个模型小徽章，点它**先选 Agent（Codex CLI / Claude Code / DeepSeek），再选这个 Agent 的模型**。
+  点 Agent 时会在本机找它的命令行（已保存路径 → `CODEX_EXE`/`CLAUDE_EXE` → PATH → 常见安装目录），找到就跑一次 `--version`；
+  找不到会给一条终端命令（`where claude`）和一段可以直接发给那个 Agent 的话，让它告诉你可执行文件路径和能用的模型 id，
+  把回答整段贴回来点「识别」，勾选后「保存并验证」。保存在 `room/agent_clis.json`（不进 git），登记的模型会出现在它的模型列表里；
 - 群里发：`/model 执行 luna`、`切换模型 复核=terra`、`/model list`、`/model 执行 reset`；
 - 命令行：`agent-team model`（看）、`agent-team model set 执行 luna`、`agent-team model reset 执行`。
 
 三条规矩（都是为了让"切错了"当场暴露，而不是跑完一轮才发现）：
 
 1. **只认注册表里的型号**。`config/team.json` 的 `model_registry` 定义可选型号和别名（`claude`/`ds`/`luna`…），拼错直接拒绝并列出可用项；
-2. **没装对应 CLI 的不许切**。注册表里写了 `claude-opus-5-5` 但本机没有 `claude` 命令 → 拒绝并说明，而不是切过去让下一张卡必然失败；
-3. **协调者不可切**。它用的是引擎自己的大脑模型，换要改配置并重启引擎，页面上标虚线、接口直接拒绝。
+2. **没装对应 CLI 的不许切**。注册表里写了 `claude-opus-5-5` 但本机找不到 `claude`、`--version` 跑不通、或者协作台还没有这个 CLI 的执行适配（目前 DeepSeek 只能登记、不能派发）→ 拒绝并说明，而不是切过去让下一张卡必然失败；
+3. **协调者、验收者不可切**。协调者用的是引擎自己的大脑模型，换要改配置并重启引擎；验收跑的是本地验收命令、只认退出码，不调用模型。页面上标虚线、接口直接拒绝。
+
+切到 Claude Code 后真的是 `claude -p` 在跑（`agent_team/claude_bridge.py`，提示词走 stdin）。它没有 Codex 那样的沙箱开关，权限这样收：
+复核者和规划者禁掉所有写工具和 Bash；执行者用 `acceptEdits` 只放行改文件、**不能跑命令**（放开命令要 `bypassPermissions`，那就没有边界了），
+所以 Claude 当执行者时不会自己跑测试——验收本来就由协作台在沙箱外跑。Claude CLI 没有推理档，`effort` 会被忽略。
 
 群里只认 `/model` 或「切换模型」这种**显式前缀**：一句「用 python 换实现方式」不会被当成切模型——把用户的正经需求误判成命令，比不支持这功能糟得多。
 

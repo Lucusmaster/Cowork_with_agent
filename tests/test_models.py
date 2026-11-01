@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_team import models
+from agent_team import agent_clis, models
 
 
 class ModelsCase(unittest.TestCase):
@@ -27,6 +27,15 @@ class ModelsCase(unittest.TestCase):
         self._saved = {"CONFIG": models.CONFIG, "OVERRIDES": models.OVERRIDES}
         models.CONFIG = self.config
         models.OVERRIDES = self.overrides
+        # 本机装没装 claude、登记过什么，都不能影响结果：只留 shutil.which 这一个入口给 only_codex 打桩
+        self._isolate = [mock.patch.object(agent_clis, "STORE", self.tmp / "room" / "agent_clis.json"),
+                         mock.patch.object(agent_clis, "_common_candidates", return_value=[]),
+                         mock.patch.dict(agent_clis.os.environ, {}, clear=False)]
+        for p in self._isolate:
+            p.start()
+        for key in ("CODEX_EXE", "CLAUDE_EXE", "DEEPSEEK_EXE"):
+            agent_clis.os.environ.pop(key, None)
+        agent_clis._PROBES.clear()
         self.write_config({
             "model_registry": {
                 "gpt-6.1-terra": {"cli": "codex", "aliases": ["terra"]},
@@ -45,6 +54,8 @@ class ModelsCase(unittest.TestCase):
         })
 
     def tearDown(self) -> None:
+        for p in reversed(self._isolate):
+            p.stop()
         models.CONFIG = self._saved["CONFIG"]
         models.OVERRIDES = self._saved["OVERRIDES"]
         self.tmpdir.cleanup()
