@@ -1,3 +1,33 @@
+## 0.9.22 — 图标不再是白纸（Pillow 的 ICO 写入器不能用）
+
+0.9.21 的图标装上桌面后显示成一张白纸——就是"无法识别的文件"那个样子。
+原因不是画错了像素，是**文件格式**：`Image.save(format="ICO", sizes=..., append_images=...)`
+把每一帧都压成了 PNG。PNG 帧只有 256 那一档 Windows 认；16..128 必须是 BMP
+（32 位 DIB + 1bpp 掩码）。Explorer 读不出来，就画成空白。
+
+### 证据
+
+直接调 shell 自己取图标的那条 API `SHDefExtractIconW`：
+
+| 文件 | 结果 |
+|---|---|
+| 旧（七帧全 PNG） | `hr=0x00000001`(S_FALSE)，大小图标句柄都是 0 |
+| 新（16..128 BMP + 256 PNG） | `hr=0x00000000`(S_OK)，句柄都在 |
+
+再用 `SHGetFileInfo` + `GetDIBits` 把桌面图标真画出来数颜色：托盘 `#121821`、
+节点 `#3FD3A6`、连线 `#2C6F5B` 都在——不是白板。
+
+### 修法
+
+`tools/make_icon.py` 自己拼 ICO（`_bmp_frame` / `_png_frame` / `write_ico`），
+128 及以下写成 BMP，256 用 PNG，不再走 Pillow 的 ICO 写入器。
+
+### 验证
+
+桌面启动器测试 35 → 37 项：16..128 必须是 BITMAPINFOHEADER、256 必须是 PNG；
+以及真的问 Windows 要 48/16、32/16 两套图标，都得是 S_OK 且拿到句柄。
+全套 556 项通过；`ruff check .` 干净。
+
 ## 0.9.21 — 自己的图标（不再借系统那个通用方块）
 
 桌面快捷方式原来借用 `shell32.dll,13`，就是那个谁都认识的默认图标。这一版有了自己的：

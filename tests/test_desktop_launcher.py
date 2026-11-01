@@ -327,6 +327,60 @@ class IconAssetTests(unittest.TestCase):
         self.assertTrue([p for p in pixels if p[:3] == (0x3F, 0xD3, 0xA6)],
                         "16px 上要能看到节点")
 
+    def test_small_frames_are_bmp_not_png(self) -> None:
+        """16..128 必须是 BMP 帧。
+
+        Pillow 的 ICO 写入器会把每一帧都压成 PNG，Windows 在 16..128 上读不出来，
+        桌面快捷方式就显示成一个白板（"像无法识别的文件"）。256 用 PNG 才是惯例。
+        """
+        import struct
+
+        self._regen()
+        data = (REPO / "assets" / "agent-team.ico").read_bytes()
+        _res, _typ, count = struct.unpack_from("<HHH", data, 0)
+        self.assertEqual(count, 7)
+        offset = 6
+        for _ in range(count):
+            width, _height, _colors, _reserved, _planes, _bpp, size, start = struct.unpack_from(
+                "<BBBBHHII", data, offset)
+            offset += 16
+            is_png = data[start:start + 8] == b"\x89PNG\r\n\x1a\n"
+            if width in (0, 256):
+                self.assertTrue(is_png, "256 这一档应该用 PNG")
+            else:
+                self.assertFalse(is_png, f"{width}px 这一档必须用 BMP，不能是 PNG")
+                header_size = struct.unpack_from("<I", data, start)[0]
+                self.assertEqual(header_size, 40, f"{width}px 帧头不是 BITMAPINFOHEADER")
+
+    @unittest.skipIf(os.name != "nt", "只有 Windows 有 shell 图标提取")
+    def test_windows_shell_can_extract_the_icon(self) -> None:
+        """直接问 Windows 要图标：这正是 Explorer 画桌面图标的那条路。
+
+        旧版把所有帧压成 PNG 时，这个调用返回 S_FALSE 且拿不到句柄——图标就成了白板。
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        self._regen()
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        extract = shell32.SHDefExtractIconW
+        extract.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.c_uint,
+                            ctypes.POINTER(wintypes.HICON), ctypes.POINTER(wintypes.HICON),
+                            ctypes.c_uint]
+        extract.restype = ctypes.c_long
+        for large, small in ((48, 16), (32, 16)):
+            big, tiny = wintypes.HICON(), wintypes.HICON()
+            code = extract(str(REPO / "assets" / "agent-team.ico"), 0, 0,
+                           ctypes.byref(big), ctypes.byref(tiny), large | (small << 16))
+            try:
+                self.assertEqual(code, 0, f"{large}/{small} 取图标失败：0x{code & 0xFFFFFFFF:08x}")
+                self.assertTrue(big.value, f"{large}/{small} 没拿到大图标句柄")
+                self.assertTrue(tiny.value, f"{large}/{small} 没拿到小图标句柄")
+            finally:
+                for handle in (big, tiny):
+                    if handle.value:
+                        ctypes.windll.user32.DestroyIcon(handle)
+
     @unittest.skipIf(os.name != "nt", "快捷方式只有 Windows 有")
     def test_shortcut_can_use_the_new_icon(self) -> None:
         ico = REPO / "assets" / "agent-team.ico"
