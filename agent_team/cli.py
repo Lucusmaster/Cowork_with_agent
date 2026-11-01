@@ -176,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true", help="已有文件直接覆盖，不备份")
     p.add_argument("--dry-run", action="store_true", help="只说会做什么，不动文件")
     p.add_argument("--mcp", action="store_true", help="只打印 MCP 配置片段")
+    p.add_argument("--where", action="store_true", help="只看会装到哪儿")
+
+    sub.add_parser("onboard", help="新装之后该做哪几步（装 skill、MCP、桌面图标）")
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not args.command:
@@ -220,7 +223,14 @@ def main(argv: list[str] | None = None) -> int:
             argv_skills.append("--dry-run")
         if args.mcp:
             argv_skills.append("--mcp")
+        if args.where:
+            argv_skills.append("--where")
         return skills_install.main(argv_skills)
+    if args.command == "onboard":
+        from . import skills_install
+
+        print(skills_install.onboard())
+        return 0
 
     parser.print_help()
     return 2

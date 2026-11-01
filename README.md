@@ -15,9 +15,38 @@
 你 ──▶ 群聊界面 ──▶ 大脑（读上下文、回话、拆卡）──▶ Codex 执行 ──▶ 只读复核 ──▶ 报告回到群里
 ```
 
-- 网页群聊：`agent-team start` 会打印带令牌的地址（默认 `http://127.0.0.1:8899`）
+- 网页群聊：`agent-team start` 会打印带一次性码的地址（默认 `http://127.0.0.1:8899/?k=...`）
 - 说人话就行，需求模糊也能接
 - 关掉网页即收工（有任务在跑时会等它跑完）
+
+## 刚下载下来，先做这几步
+
+```bash
+git clone https://github.com/Lucusmaster/Cowork_with_agent.git
+cd Cowork_with_agent
+pip install -e .                  # 或者不装，直接用 python -m agent_team.cli ...
+
+agent-team doctor                 # 1. 体检：Python、git、Codex CLI、端口
+agent-team start                  # 2. 起协作台，用打印出来的 ?k= 链接打开
+agent-team install-skills         # 3. 让你设备上的 agent 学会用它
+```
+
+**第 3 步最容易被忽略，但它最省事**：这个项目把"怎么用协作台"写成了 skill，
+正本就在仓库里（`skills/agent-team-collab/SKILL.md`），一条命令装到各家 agent 的加载位置：
+
+| 你设备上的 agent | 装到哪儿 | `install-skills` 是否覆盖 |
+| --- | --- | --- |
+| DeepSeek Harness / DSH | `~/.dsh/skills/agent-team-collab/SKILL.md` | ✅ |
+| Codex CLI | `~/.codex/skills/agent-team-collab/SKILL.md` | ✅ |
+| Claude Code | `~/.claude/skills/agent-team-collab/SKILL.md` | ✅ |
+| 豆包 / 其它 MCP 客户端 | 没有 skill 机制 | `install-skills --mcp` 打印现成配置 |
+
+装好之后，你在那些 agent 里说「用 agent-team 把这个需求做完」，它就知道该调什么、哪些坑不能踩。
+已有的同名 skill 不会被悄悄覆盖：先备份成 `SKILL.md.bak-<时间>` 再写。
+不确定会装到哪儿就先看：`agent-team install-skills --where`。
+
+第 4 步（可选）：`agent-team install-desktop` 在桌面生成图标，以后双击就开。
+装完之后想再看一遍这几步：`agent-team onboard`。
 
 ## 现在长这样：聊天式工作台
 
@@ -238,7 +267,7 @@ agent_team/           运行时包（引擎、协议、网页、桥）
 bin/                  兼容壳 + 系统启动脚本（.bat/.ps1/.sh）
 config/team.json      模型、超时、重试
 agents/               大脑与执行者的契约提示词
-tests/                回归测试（505 项）
+tests/                回归测试（530 项）
 docs/                 架构与路线图
 room/ tasks/          运行时账本与任务卡（不进产物仓库）
 ```

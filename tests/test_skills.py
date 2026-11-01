@@ -159,9 +159,93 @@ class InstallTests(unittest.TestCase):
                          "cwd 要是真路径，不能被转义成四重斜杠")
 
 
+class BundledCopyTests(unittest.TestCase):
+    """从 GitHub 下载 = 仓库里的 skills/；装成包的人只有 bundled/ 那份。两份必须一致。"""
+
+    def test_bundled_copy_matches_repo_copy(self) -> None:
+        mirrored = REPO / "agent_team" / "bundled" / "skills" / skills_install.SKILL_NAME / "SKILL.md"
+        self.assertTrue(mirrored.is_file(), f"包内副本缺失：{mirrored}（wheel 里就没有 skill 了）")
+        self.assertEqual(mirrored.read_text(encoding="utf-8"),
+                         SKILL.read_text(encoding="utf-8"),
+                         "两份不一致——改了正本记得同步 agent_team/bundled/skills/ 下那份")
+
+    def test_source_falls_back_to_bundled_when_repo_has_none(self) -> None:
+        """模拟"只装了包、没有仓库 skills/ 目录"：要回落到包内副本，而不是报找不到。"""
+        from agent_team import resources
+
+        saved = resources.ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            resources.ROOT = Path(tmp)
+            try:
+                found = skills_install.source_skill()
+            finally:
+                resources.ROOT = saved
+        self.assertTrue(found.is_file(), f"回落失败：{found}")
+        self.assertIn("bundled", str(found))
+
+
+class OnboardingTests(unittest.TestCase):
+    """下载这个项目的人不会自己知道有 skill 这回事，所以要把话说到脸上。"""
+
+    def test_onboard_mentions_every_entry_point(self) -> None:
+        text = skills_install.onboard(["dsh", "codex", "claude"])
+        for needle in ("install-skills", "--mcp", "install-desktop", "agent-team model"):
+            self.assertIn(needle, text, f"上手说明里缺 {needle}")
+        self.assertIn("dsh、codex、claude", text)
+
+    def test_onboard_without_detected_clients_says_so(self) -> None:
+        text = skills_install.onboard([])
+        self.assertIn("没检测到", text)
+
+    def test_first_run_hint_shows_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "room" / "onboarding.json"
+            import contextlib
+            import io
+
+            first = io.StringIO()
+            with contextlib.redirect_stdout(first):
+                shown_first = skills_install.maybe_show_onboarding(marker)
+            written = marker.is_file()
+            second = io.StringIO()
+            with contextlib.redirect_stdout(second):
+                shown_second = skills_install.maybe_show_onboarding(marker)
+        self.assertTrue(shown_first, "第一次启动应该提示")
+        self.assertTrue(written, "提示过后要留下标记文件，否则每次启动都啰嗦")
+        self.assertIn("install-skills", first.getvalue())
+        self.assertFalse(shown_second, "第二次不该再啰嗦")
+        self.assertEqual(second.getvalue(), "")
+
+    def test_cli_onboard_command_works(self) -> None:
+        proc = subprocess.run([sys.executable, "-m", "agent_team.cli", "onboard"],
+                              capture_output=True, encoding="utf-8", errors="replace",
+                              cwd=str(REPO), creationflags=NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("install-skills", proc.stdout)
+
+
+class ReadmeTests(unittest.TestCase):
+    """下载的人先看 README。那几行被手滑删掉，整个引导就断了。"""
+
+    def setUp(self) -> None:
+        self.readme = (REPO / "README.md").read_text(encoding="utf-8")
+
+    def test_readme_tells_downloaders_to_install_the_skill(self) -> None:
+        self.assertIn("刚下载下来", self.readme, "README 第一屏要有下载后的上手步骤")
+        self.assertIn("install-skills", self.readme)
+        self.assertIn("skills/agent-team-collab/SKILL.md", self.readme, "要指出正本在哪")
+        self.assertIn("--mcp", self.readme, "没有 skill 机制的客户端要有出路")
+
+    def test_readme_uses_the_one_time_link(self) -> None:
+        self.assertIn("?k=", self.readme, "裸地址只是解锁页，会让新人以为坏了")
+
+
 class CliEntryTests(unittest.TestCase):
     def test_cli_exposes_install_skills(self) -> None:
         self.assertIn("install-skills", known_subcommands())
+
+    def test_cli_exposes_onboard(self) -> None:
+        self.assertIn("onboard", known_subcommands())
 
     def test_cli_install_skills_help(self) -> None:
         proc = subprocess.run([sys.executable, "-m", "agent_team.cli", "install-skills", "--help"],

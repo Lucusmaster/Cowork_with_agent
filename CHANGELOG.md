@@ -1,3 +1,38 @@
+## 0.9.18 — 给"从 GitHub 下载的人"一条明路（不是只给我这台机器）
+
+0.9.17 把 skill 做出来了，但那条命令只有**我这台机器**知道。别人 clone 下来看到的是
+570 行 README，不会自己猜到"还要给自己设备上的 agent 装个 skill"。
+
+### README 第一屏就有"刚下载下来，先做这几步"
+
+`doctor` → `start`（用打印出来的 `?k=` 链接）→ `install-skills`，并给了一张表说明每个客户端
+装到哪个路径、豆包这类没有 skill 机制的走 `--mcp`。之后想看这几步：`agent-team onboard`。
+
+### 首次启动会主动说一次
+
+`agent-team start` 第一次跑完会打印上面这几步（写 `room/onboarding.json` 当标记，只啰嗦一次）。
+双击启动器的人也逃不掉——提示就印在他看得到的那一行。
+
+### skill 正本跟着包走
+
+`skills/agent-team-collab/SKILL.md` 是正本，另有一份镜像在 `agent_team/bundled/skills/` 下
+（`pyproject` 只打 `agent_team` 包，仓库根的 `skills/` 进不了 wheel）。取用时走
+`resources.resource()`：仓库优先、包内兜底。有测试盯着两份必须**逐字节一致**，
+改了正本忘了同步会直接挂。
+
+### 新增命令
+
+```bash
+agent-team onboard                  # 新装之后该做哪几步
+agent-team install-skills --where    # 只看会装到哪儿，不动文件
+```
+
+### 验证
+
+530 项测试全绿、ruff 干净。新增 7 项：包内副本一致、没有仓库时回落 bundled、
+上手说明覆盖四个入口、没检测到客户端时如实说、首次提示只出现一次、
+`onboard` 命令可跑、README 里必须留着这条引导（防止哪天被手滑删掉）。
+
 ## 0.9.17 — 把「怎么用协作台」做成可分发的 skill（一份正本，装到各家 agent）
 
 协作台是**项目**，但用它的 agent 各有各的加载方式：DSH 读 `~/.dsh/skills/<名>/SKILL.md`，

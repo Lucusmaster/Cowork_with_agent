@@ -191,6 +191,12 @@ def start(port: int) -> int:
         print(f"引擎已启动 (pid {new_pid})：发任务后约 1 秒内自动开工")
     print()
     print("打开上面的地址（链接只能用一次，打开后浏览器会记住；别外传），中间输入框发任务即可。")
+    try:
+        from . import skills_install
+
+        skills_install.maybe_show_onboarding()      # 首次运行提示一次怎么让别的 agent 学会用它
+    except Exception:                               # noqa: BLE001 - 提示失败不影响启动
+        pass
     return 0
 
 

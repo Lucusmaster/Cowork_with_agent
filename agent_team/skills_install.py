@@ -34,8 +34,14 @@ TARGETS = {
 
 
 def source_skill() -> Path:
-    """正本：仓库里的 skills/agent-team-collab/SKILL.md。"""
-    return workbench_root() / "skills" / SKILL_NAME / "SKILL.md"
+    """正本：仓库里的 `skills/agent-team-collab/SKILL.md`；装成 wheel 时回落到包内副本。
+
+    走 `resources.resource()`（仓库优先、包内兜底），和 config/agents 同一套规矩——
+    否则 `pip install` 的人拿到的包里没有 skills/，`install-skills` 会直接说"正本不存在"。
+    """
+    from .resources import resource
+
+    return resource("skills", SKILL_NAME, "SKILL.md")
 
 
 def target_dir(target: str, home: Path | None = None) -> Path:
@@ -145,6 +151,61 @@ def detect(home: Path | None = None) -> list[str]:
     return found
 
 
+def onboard(detected: list[str] | None = None, installed: list[dict] | None = None) -> str:
+    """首次上手要说的话：装 skill、给 MCP 片段、指向文档。
+
+    下载这个项目的人拿到的是包/仓库，agent 不会自己知道有这回事——所以这几步必须显式说。
+    """
+    found = detect() if detected is None else detected
+    lines = [
+        "下一步（装一次就够）：",
+        "",
+        "  1. 让本机上的 agent 学会用它：",
+        "       agent-team install-skills",
+        f"       会装到：{'、'.join(found) if found else '（没检测到 DSH / Codex / Claude Code 目录）'}",
+        "",
+        "  2. 没有 skill 机制的客户端（豆包等）用 MCP：",
+        "       agent-team install-skills --mcp      # 打印现成配置",
+        "       或直接：python -m agent_team.mcp_server",
+        "",
+        "  3. 想要双击图标启动（Windows）：",
+        "       agent-team install-desktop",
+        "",
+        "  4. 换某个角色的模型（不用改配置、不用重启）：",
+        "       agent-team model",
+        "",
+    ]
+    if installed:
+        changed = [r for r in installed if r.get("action") in ("created", "updated")]
+        if changed:
+            lines.insert(2, f"  已装 {len(changed)} 处 skill："
+                            + "、".join(r["target"] for r in changed))
+            lines.insert(3, "")
+    docs = workbench_root() / "docs" / "MCP.md"
+    if docs.is_file():
+        lines.append(f"说明：README.md、docs/MCP.md（{workbench_root()}）")
+    else:
+        lines.append("说明：仓库 README.md 与 docs/MCP.md"
+                     "（https://github.com/Lucusmaster/Cowork_with_agent）")
+    return "\n".join(lines)
+
+
+def maybe_show_onboarding(marker: Path | None = None) -> bool:
+    """服务第一次起来时提示一次，之后不再啰嗦（写 room/onboarding.json 当标记）。"""
+    marker = marker or (workbench_root() / "room" / "onboarding.json")
+    try:
+        if marker.exists():
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"shown_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                                     ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return False
+    print()
+    print(onboard())
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -156,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true", help="已有文件直接覆盖，不备份")
     ap.add_argument("--dry-run", action="store_true", help="只说会做什么，不动文件")
     ap.add_argument("--mcp", action="store_true", help="只打印 MCP 配置片段")
+    ap.add_argument("--where", action="store_true", help="只看会装到哪儿")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     for _stream in (sys.stdout, sys.stderr):
@@ -167,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
     home = Path(args.home) if args.home else None
     if args.mcp:
         print(mcp_snippet(detect(home)))
+        return 0
+    if args.where:
+        print(onboard(detect(home)))
+        print()
+        print(f"正本：{source_skill()}")
+        for target in TARGETS:
+            print(f"  {target:6} → {target_dir(target, home)}")
         return 0
 
     targets = [t.strip() for t in args.targets.split(",") if t.strip()] or None
