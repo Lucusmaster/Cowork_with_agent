@@ -163,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--desktop", default="", help="写到别的桌面目录（测试用）")
     p.add_argument("--force", action="store_true", help="覆盖已存在的快捷方式")
 
+    p = sub.add_parser("mcp", help="MCP 工具服务（stdio），给 Claude Code / Codex / 豆包等调用")
+    p.add_argument("--action", choices=["serve", "list", "call"], default="serve")
+    p.add_argument("--tool", default="", help="action=call 时指定工具")
+    p.add_argument("--args", default="{}", help="action=call 时的 JSON 参数")
+
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not args.command:
         parser.print_help()
@@ -191,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         return _model(args.action, args.role, args.model)
     if args.command == "install-desktop":
         return _install_desktop(args.workspace, args.force, args.desktop)
+    if args.command == "mcp":
+        return _run("mcp_server", ["--action", args.action, "--tool", args.tool,
+                                   "--args", args.args])
 
     parser.print_help()
     return 2

@@ -234,13 +234,26 @@ agent_team/           运行时包（引擎、协议、网页、桥）
   codex_bridge.py     调 Codex CLI 的唯一出口
   cli.py              统一命令入口
   launcher.py         双击启动器（已在跑就只开页面）
+  mcp_server.py       MCP 工具（给 Claude Code / Codex / 豆包 调）
 bin/                  兼容壳 + 系统启动脚本（.bat/.ps1/.sh）
 config/team.json      模型、超时、重试
 agents/               大脑与执行者的契约提示词
-tests/                回归测试（479 项）
+tests/                回归测试（505 项）
 docs/                 架构与路线图
 room/ tasks/          运行时账本与任务卡（不进产物仓库）
 ```
+
+## 让别的 Agent 指挥它（MCP）
+
+协作台暴露 5 个 MCP 工具，Claude Code / Codex / 豆包 / 任何支持 MCP 的客户端都能直接
+发任务、等结果：
+
+```bash
+claude mcp add agent-team -- python -m agent_team.mcp_server     # Claude Code
+agent-team mcp --action list                                     # 看有什么工具
+```
+
+工具清单与各家客户端配置见 [docs/MCP.md](docs/MCP.md)。
 
 ## 桌面启动（Windows）
 

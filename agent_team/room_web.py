@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
 from . import models as MODELS  # noqa: E402
+from . import __version__  # noqa: E402
 
 
 def _models_snapshot() -> dict:
@@ -5731,7 +5732,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/alive":
             self._touch()
-            self._json({"ok": True})
+            # 带上版本：外部工具（MCP / 脚本）能一眼看出对面跑的是哪一版
+            self._json({"ok": True, "version": __version__})
             return
         if parsed.path == "/api/control":
             paused, pending = _control_state()

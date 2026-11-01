@@ -1,3 +1,42 @@
+## 0.9.16 — MCP 工具：让 Claude Code / Codex / 豆包 直接指挥协作台
+
+5 个工具，标准 stdio JSON-RPC，纯标准库：
+
+| 工具 | 作用 |
+| --- | --- |
+| `team_status` | 在不在跑（`/api/alive`，免令牌）+ 最近几张卡 |
+| `team_launch` | 没在跑就起、在跑就不动；返回一次性链接 |
+| `team_task_create` | 把需求发进群，**等到真任务号**再返回 |
+| `team_task_wait` | 阻塞到终态，给结论/越界改动/复核是否动过文件/报告 |
+| `team_task_list` | 最近的卡 |
+
+接入见 [docs/MCP.md](docs/MCP.md)（Claude Code、Codex、通用 JSON、CLI 四种方式）。
+
+### 设计上做的取舍
+
+- **砍掉「生成协作建议文本」这类工具**：那是调用方模型自己就能写的东西。工具应该返回事实
+  （状态、任务号、结论），不该替模型说话；
+- **`team_task_create` 必须返回任务号**：`POST /api/post` 只回消息 id，卡是后台 worker 建的。
+  所以工具盯住新消息 + 任务列表，等到真 id 才返回；等不到就如实说「已收下、还在规划」，
+  而不是给个假 id 让调用方拿着去 `wait` 然后 404；
+- **令牌只走 `X-Team-Token`**：绝不拼进 URL（0.9.12 的硬约束）；
+- **`team_launch` 不重启**：已经在跑就只给新链接，重启会打断正在执行的任务；
+- **身份记在 `meta.client`**：任务卡的 `owner` 是执行者 `codex`，没有"谁提的需求"字段；
+  陌生名字还会被 `_agent_from` 折成 `coordinator`，所以 `agent` 固定 `user`、身份放 `meta`。
+
+### 顺手补的
+
+`GET /api/alive` 现在返回 `version`：外部工具能一眼看出对面是哪一版（之前 `team_status`
+只能显示"在线"，看不到版本）。
+
+### 验证
+
+- 26 项新测试（协议：initialize/tools/list/tools/call/未知方法/坏 JSON/EOF；语义：等出任务号、
+  等不到不编造、身份落 `meta`、终态结果、复核写盘可见、超时不算错误；安全：令牌不进 URL、
+  401 不吞、缺令牌给可操作提示）；
+- 真 MCP 子进程走完整会话（隔离 room + 隔离端口）：握手 → 5 个工具 → 真调
+  `team_status`/`team_task_wait`/`team_task_list` → 未知工具 `isError` → 离线状态 → EOF 退出码 0。
+
 ## 0.9.15 — Windows 桌面启动器（双击就开，已经在跑就不动）
 
 双击桌面的 agent-team 图标 → 协作台起来 → 浏览器打开**一次性链接**；
