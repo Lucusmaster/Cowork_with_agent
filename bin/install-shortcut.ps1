@@ -16,7 +16,9 @@
 param(
     [string]$ProjectPath = "",
     [string]$Desktop = "",
-    [switch]$Force
+    [string]$PythonW = "",
+    [switch]$Force,
+    [switch]$App
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,10 +29,20 @@ if ([string]::IsNullOrWhiteSpace($ProjectPath)) {
 }
 $ProjectPath = (Resolve-Path $ProjectPath).Path
 
+$IsApp = [bool]$App
 $Launcher = Join-Path $ProjectPath 'bin\agent-team-launcher.bat'
-if (-not (Test-Path $Launcher)) {
-    Write-Host "[ERROR] launcher not found: $Launcher" -ForegroundColor Red
-    exit 1
+if (-not $IsApp) {
+    if (-not (Test-Path $Launcher)) {
+        Write-Host "[ERROR] launcher not found: $Launcher" -ForegroundColor Red
+        exit 1
+    }
+} else {
+    # App mode: no console window at all, so target pythonw.exe (python.exe flashes a
+    # black box). The app window itself is opened by `launcher --app` (Edge/Chrome).
+    if ([string]::IsNullOrWhiteSpace($PythonW) -or -not (Test-Path $PythonW)) {
+        Write-Host "[ERROR] pythonw.exe not found - pass -PythonW <path>" -ForegroundColor Red
+        exit 1
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Desktop)) {
@@ -41,7 +53,8 @@ if (-not (Test-Path $Desktop)) {
     exit 1
 }
 
-$Shortcut = Join-Path $Desktop 'agent-team.lnk'
+$ShortcutName = if ($IsApp) { 'agent-team-app.lnk' } else { 'agent-team.lnk' }
+$Shortcut = Join-Path $Desktop $ShortcutName
 if ((Test-Path $Shortcut) -and (-not $Force)) {
     Write-Host "[INFO] shortcut already exists - pass -Force to overwrite: $Shortcut" -ForegroundColor Yellow
     exit 2
@@ -51,9 +64,15 @@ if ((Test-Path $Shortcut) -and (-not $Force)) {
 # the script by hand, with no cmd.exe /c quoting layer to get wrong.
 $Shell = New-Object -ComObject WScript.Shell
 $Link = $Shell.CreateShortcut($Shortcut)
-$Link.TargetPath = $Launcher
+if ($IsApp) {
+    $Link.TargetPath = $PythonW
+    $Link.Arguments = '-m agent_team.launcher --app'
+    $Link.Description = 'agent-team workbench (app window, no address bar)'
+} else {
+    $Link.TargetPath = $Launcher
+    $Link.Description = 'agent-team workbench'
+}
 $Link.WorkingDirectory = $ProjectPath
-$Link.Description = 'agent-team workbench'
 $Link.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
 $Link.WindowStyle = 1
 $Link.Save()
@@ -63,6 +82,11 @@ if (-not (Test-Path $Shortcut)) {
     exit 1
 }
 Write-Host "[OK] shortcut: $Shortcut" -ForegroundColor Green
-Write-Host "     target  : $Launcher"
-Write-Host "     double-click to start the workbench (opens a one-time link)"
+if ($IsApp) {
+    Write-Host "     target  : $PythonW -m agent_team.launcher --app"
+    Write-Host "     double-click to start the workbench in its own window"
+} else {
+    Write-Host "     target  : $Launcher"
+    Write-Host "     double-click to start the workbench (opens a one-time link)"
+}
 exit 0

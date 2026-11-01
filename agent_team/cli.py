@@ -37,11 +37,14 @@ def _repo_root():
     return Path(__file__).resolve().parent.parent
 
 
-def _install_desktop(workspace: str, force: bool, desktop: str = "") -> int:
+def _install_desktop(workspace: str, force: bool, desktop: str = "", app: bool = False) -> int:
     """在桌面创建「agent-team」快捷方式。
 
     真正动手的是 ``bin/install-shortcut.ps1``（WScript.Shell COM 是 Windows 上最稳的做法，
     也不需要额外的 pywin32 依赖）。这里只做三件事：校验工作区、找到脚本、把参数传进去。
+
+    ``app=True`` 生成的是**独立窗口版**：快捷方式调 ``pythonw -m agent_team.launcher --app``，
+    由 Edge/Chrome 的 ``--app=`` 打开一个没有地址栏的窗口；用 pythonw 才不会闪黑框。
     """
     import subprocess
     from pathlib import Path
@@ -55,15 +58,26 @@ def _install_desktop(workspace: str, force: bool, desktop: str = "") -> int:
 
     launcher = root / "bin" / "agent-team-launcher.bat"
     script = root / "bin" / "install-shortcut.ps1"
-    if not launcher.is_file() or not script.is_file():
+    needed = [script] if app else [launcher, script]
+    missing = [p for p in needed if not p.is_file()]
+    if missing:
         print("❌ 找不到启动器：")
-        print(f"   {launcher}（{'有' if launcher.is_file() else '缺'}）")
-        print(f"   {script}（{'有' if script.is_file() else '缺'}）")
+        for path in missing:
+            print(f"   {path}（缺）")
         return 1
 
     if sys.platform != "win32":
         print("❌ 桌面快捷方式只支持 Windows。其他系统直接跑 python -m agent_team.launcher")
         return 1
+
+    pythonw = ""
+    if app:
+        candidate = Path(sys.executable).with_name("pythonw.exe")
+        if not candidate.is_file():
+            print("❌ 找不到 pythonw.exe：App 版靠它避免弹黑框")
+            print("   用 python.exe 会在桌面上闪一个黑框；也可以不加 --app，用默认浏览器版")
+            return 1
+        pythonw = str(candidate)
 
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
            "-ProjectPath", str(target_ws)]
@@ -71,9 +85,11 @@ def _install_desktop(workspace: str, force: bool, desktop: str = "") -> int:
         cmd += ["-Desktop", str(Path(desktop).resolve())]
     if force:
         cmd.append("-Force")
+    if app:
+        cmd += ["-App", "-PythonW", pythonw]
 
     print(f"工作区：{target_ws}")
-    print(f"启动器：{launcher}")
+    print(f"启动目标：{pythonw + ' -m agent_team.launcher --app' if app else launcher}")
     try:
         result = subprocess.run(cmd, check=False, creationflags=quiet_flags())
     except OSError as exc:
@@ -164,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workspace", default="", help="工作区路径（不指定就用仓库根目录）")
     p.add_argument("--desktop", default="", help="写到别的桌面目录（测试用）")
     p.add_argument("--force", action="store_true", help="覆盖已存在的快捷方式")
+    p.add_argument("--app", action="store_true",
+                   help="独立窗口版（Edge/Chrome --app，没有地址栏，像桌面应用）")
 
     p = sub.add_parser("mcp", help="MCP 工具服务（stdio），给 Claude Code / Codex / 豆包等调用")
     p.add_argument("--action", choices=["serve", "list", "call"], default="serve")
@@ -207,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "model":
         return _model(args.action, args.role, args.model)
     if args.command == "install-desktop":
-        return _install_desktop(args.workspace, args.force, args.desktop)
+        return _install_desktop(args.workspace, args.force, args.desktop, args.app)
     if args.command == "mcp":
         return _run("mcp_server", ["--action", args.action, "--tool", args.tool,
                                    "--args", args.args])

@@ -112,6 +112,45 @@ class LauncherLogicTests(unittest.TestCase):
     def test_page_ready_false_on_closed_port(self) -> None:
         self.assertFalse(launcher.page_ready(1, timeout=0.3))
 
+    def test_app_mode_opens_a_window_without_address_bar(self) -> None:
+        """`--app`：交给 Edge/Chrome 的 `--app=`，不是再开一个浏览器标签页。"""
+        with mock.patch.object(launcher, "page_ready", return_value=True), \
+             mock.patch.object(launcher, "one_time_url", return_value="http://x/?k=1"), \
+             mock.patch.object(launcher, "app_browser", return_value=r"C:\Edge\msedge.exe"), \
+             mock.patch("agent_team.launcher.subprocess.Popen") as popen, \
+             mock.patch.object(launcher.webbrowser, "open") as opened:
+            code = launcher.main(["--app"])
+        self.assertEqual(code, 0)
+        opened.assert_not_called()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], r"C:\Edge\msedge.exe")
+        self.assertEqual(argv[1], "--app=http://x/?k=1")
+
+    def test_app_mode_falls_back_to_default_browser(self) -> None:
+        """没有 Edge/Chrome 也不能白开一次：退回默认浏览器，别让用户对着空气。"""
+        with mock.patch.object(launcher, "page_ready", return_value=True), \
+             mock.patch.object(launcher, "one_time_url", return_value="http://x/?k=1"), \
+             mock.patch.object(launcher, "app_browser", return_value=""), \
+             mock.patch.object(launcher.webbrowser, "open") as opened:
+            code = launcher.main(["--app"])
+        self.assertEqual(code, 0)
+        opened.assert_called_once_with("http://x/?k=1")
+
+    def test_no_browser_wins_over_app(self) -> None:
+        with mock.patch.object(launcher, "page_ready", return_value=True), \
+             mock.patch.object(launcher, "one_time_url", return_value="http://x/?k=1"), \
+             mock.patch.object(launcher, "app_browser", return_value=r"C:\Edge\msedge.exe"), \
+             mock.patch("agent_team.launcher.subprocess.Popen") as popen, \
+             mock.patch.object(launcher.webbrowser, "open") as opened:
+            self.assertEqual(launcher.main(["--app", "--no-browser"]), 0)
+        popen.assert_not_called()
+        opened.assert_not_called()
+
+    def test_app_browser_is_a_real_file_when_found(self) -> None:
+        found = launcher.app_browser()
+        if found:
+            self.assertTrue(Path(found).is_file(), f"找到的浏览器不存在：{found}")
+
 
 class BatContractTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -161,6 +200,36 @@ class Ps1ContractTests(unittest.TestCase):
         self.assertIn("[string]$Desktop", self.text)
         self.assertIn("[switch]$Force", self.text)
 
+    def test_ps1_supports_app_mode(self) -> None:
+        """App 版：指向 pythonw（不弹黑框）+ `-m agent_team.launcher --app`，另起一个 .lnk。"""
+        self.assertIn("[switch]$App", self.text)
+        self.assertIn("[string]$PythonW", self.text)
+        self.assertIn("agent-team-app.lnk", self.text)
+        self.assertIn("-m agent_team.launcher --app", self.text)
+
+    @unittest.skipIf(os.name != "nt", "快捷方式只有 Windows 有")
+    def test_creates_app_shortcut_targeting_pythonw(self) -> None:
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if not pythonw.is_file():
+            self.skipTest("这台机器没有 pythonw.exe")
+        with tempfile.TemporaryDirectory() as desktop:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(PS1),
+                 "-ProjectPath", str(REPO), "-Desktop", desktop, "-App",
+                 "-PythonW", str(pythonw), "-Force"],
+                capture_output=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lnk = Path(desktop) / "agent-team-app.lnk"
+            self.assertTrue(lnk.is_file(), f"快捷方式没生成：{lnk}")
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); "
+                 f"$s.TargetPath; $s.Arguments"],
+                capture_output=True, encoding="utf-8", errors="replace",
+                creationflags=NO_WINDOW).stdout
+            self.assertIn("pythonw.exe", out)
+            self.assertIn("--app", out)
+
     @unittest.skipIf(sys.platform != "win32", "PowerShell 只在 Windows 上验")
     def test_ps1_parses_on_powershell(self) -> None:
         """真的让 PowerShell 解析一遍：这是发现编码/引号问题最省事的方式。"""
@@ -207,6 +276,7 @@ class InstallDesktopTests(unittest.TestCase):
                               creationflags=NO_WINDOW)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--desktop", proc.stdout)
+        self.assertIn("--app", proc.stdout)
 
     def test_refuses_non_git_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

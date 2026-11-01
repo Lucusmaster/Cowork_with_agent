@@ -1,3 +1,35 @@
+## 0.9.20 — 桌面多一个「像应用一样的窗口」的快捷方式
+
+0.9.15 的桌面图标双击后打开的是**浏览器标签页**。这一版多给一个选择：独立窗口、没有地址栏，
+关掉就是关掉，更像一个桌面应用。
+
+### `install-desktop --app`
+
+```bash
+agent-team install-desktop --app   # 生成 agent-team-app.lnk（独立窗口版）
+agent-team install-desktop         # 还是老样子：agent-team.lnk（默认浏览器）
+```
+
+两个图标可以并存，互不覆盖（文件名不同）。
+
+### 为什么不能把 URL 写进快捷方式
+
+一次性引导码每次启动都会变（`?k=`，用掉就换新的），写死等于下次打开只剩解锁页。
+所以快捷方式指向 `pythonw -m agent_team.launcher --app`，由启动器在运行时取码，
+再交给 Edge/Chrome 的 `--app=` 开窗口。**必须是 pythonw**：换成 python.exe，双击会闪一个黑框。
+
+### 兜底
+
+- 找不到 Edge/Chrome → 退回默认浏览器（不会白开一次）；
+- 找不到 pythonw.exe → 直接报错说清楚，不偷偷改用 python.exe 弹黑框；
+- `--no-browser` 优先于 `--app`。
+
+### 验证
+
+桌面启动器测试 22 → 28 项（`--app` 走 `--app=` 而不是标签页、无浏览器时回退、`--no-browser` 优先、
+`.ps1` 的 `-App`/`-PythonW` 契约、真生成一个指向 pythonw 的 `.lnk`）；
+全套 548 项通过；`ruff check .` 干净。
+
 ## 0.9.19 — 给别的 Agent 一个「停」的按钮（而且不撒谎）
 
 0.9.16 的五个 MCP 工具能起任务、等结果，但停不掉：网页上有停止按钮，外部 agent 没有。

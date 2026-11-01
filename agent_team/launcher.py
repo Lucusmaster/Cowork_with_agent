@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -21,6 +24,7 @@ import urllib.request
 import webbrowser
 
 from .paths import workbench_root
+from .procs import quiet_flags
 
 for _stream in (sys.stdout, sys.stderr):      # 双击时输出走管道/控制台，中文别乱码
     try:
@@ -76,12 +80,58 @@ def start_server(port: int) -> int:
     return _run("start_all", ["--port", str(port)])
 
 
+# 能用 `--app=` 开独立窗口的浏览器：Windows 自带 Edge，装过 Chrome 的也能用。
+# 相对路径 + 安装根目录的环境变量，比写死盘符稳（x86 / x64 / 用户级安装各不同）。
+_APP_BROWSERS = (
+    (r"Microsoft\Edge\Application\msedge.exe",
+     "ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"),
+    (r"Google\Chrome\Application\chrome.exe",
+     "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"),
+)
+
+
+def app_browser() -> str:
+    """找一个能开独立窗口的浏览器（Edge/Chrome 内核）；找不到返回空串。"""
+    for rel, *envs in _APP_BROWSERS:
+        for env in envs:
+            base = os.environ.get(env) or ""
+            if base and os.path.isfile(os.path.join(base, rel)):
+                return os.path.join(base, rel)
+    for name in ("msedge", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def open_app_window(url: str) -> bool:
+    """用 `--app=` 开一个没有地址栏的窗口（像桌面应用）。开不出来返回 False。"""
+    exe = app_browser()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen([exe, f"--app={url}"], creationflags=quiet_flags(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def _open_default(url: str) -> None:
+    try:
+        webbrowser.open(url)
+    except Exception as exc:      # noqa: BLE001 - 打不开浏览器不算启动失败
+        print(f"（没能自动打开浏览器：{exc}，手动点上面的地址）")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="agent-team.launcher",
         description="双击用的启动器：没在跑就起，起来了就直接开页面（一次性链接）")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true", help="只起服务，不打开浏览器")
+    ap.add_argument("--app", action="store_true",
+                    help="用 Edge/Chrome 的独立窗口打开（没有地址栏，像桌面应用）")
     ap.add_argument("--timeout", type=float, default=READY_TIMEOUT)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -108,10 +158,12 @@ def main(argv: list[str] | None = None) -> int:
               "令牌可以到 room/web-token 里抄。")
     print(f"地址：{url}")
     if not args.no_browser:
-        try:
-            webbrowser.open(url)
-        except Exception as exc:      # noqa: BLE001 - 打不开浏览器不算启动失败
-            print(f"（没能自动打开浏览器：{exc}，手动点上面的地址）")
+        if args.app and open_app_window(url):
+            print("已用独立窗口打开（Edge/Chrome --app，没有地址栏）。", flush=True)
+        else:
+            if args.app:
+                print("没找到能用 --app 的浏览器，退回默认浏览器打开。", flush=True)
+            _open_default(url)
     return 0
 
 
