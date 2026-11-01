@@ -1,13 +1,13 @@
 # MCP 工具（给别的 Agent 调你的协作台）
 
-协作台不只会自己跑任务——它还暴露 5 个 MCP 工具，任何支持 MCP 的客户端
+协作台不只会自己跑任务——它还暴露 6 个 MCP 工具，任何支持 MCP 的客户端
 （Claude Code、Codex、豆包、DeepSeek Harness 等）都能直接让它干活：
 
 > 「让 agent-team 建一个计算器，跑完把结论给我。」
 
 传输是**标准 stdio JSON-RPC**，只用标准库实现（不引 MCP SDK，也不用额外的包）。
 
-## 五个工具
+## 六个工具
 
 | 工具 | 干什么 | 需要令牌 |
 | --- | --- | --- |
@@ -16,6 +16,7 @@
 | `team_task_create` | 把需求发进群，拆卡执行；**返回 task_id** | 是 |
 | `team_task_wait` | 阻塞到终态（passed/failed/exec-failed/stopped），给结论 | 是 |
 | `team_task_list` | 最近的卡 | 是 |
+| `team_task_stop` | 停掉一张卡：引擎在下一个步骤边界停下，记为 stopped（`POST /api/control`） | 是 |
 
 `team_task_create` 为什么不是「发完就返回消息 id」：`POST /api/post` 只回消息 id，
 任务卡是后台 worker 拆好后建的。所以这个工具会盯住新消息和任务列表，**等到真任务号**
@@ -79,11 +80,17 @@ agent-team mcp --action call --tool team_task_create \
 4. **调用方身份记在消息的 `meta.client` 上**，不在任务卡里。任务卡的 `owner` 是执行者
    （`codex`），没有"谁提的需求"这个字段；要留痕就看群消息。
 5. **`team_task_wait` 默认等 30 分钟**。长任务记得显式给 `timeout`，或者先
-   `team_task_create` 拿到 id、稍后再 `wait`。
+   `team_task_create` 拿到 id、稍后再 `wait`。**`wait` 没有副作用，可以重复调**：
+   客户端自己的调用超时（有的 60 秒就掐）比 1800 短时，传个小一点的 `timeout` 分批等，
+   被掐断了就再 `wait` 一次，不会丢任务。
+6. **`team_task_stop` 先验任务存在**再写指令（`/api/control` 不校验任务号，我们不跟着撒谎）：
+   任务号不存在直接报错、已经结束就如实说「已经是 passed/failed，没写指令」。
+   写下去的指令是**一条共享槽位**（`room/control.json`，后到的覆盖先到的），
+   所以别同时停两张卡。
 
 ## 自检
 
 ```bash
-python -m unittest tests.test_mcp_server -v      # 26 项
+python -m unittest tests.test_mcp_server -v      # 36 项
 python .tmp/probe17/mcp_e2e.py                   # 真起一个 MCP 子进程走完整握手
 ```

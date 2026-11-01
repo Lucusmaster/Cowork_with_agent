@@ -274,7 +274,7 @@ room/ tasks/          运行时账本与任务卡（不进产物仓库）
 
 ## 让别的 Agent 指挥它（MCP）
 
-协作台暴露 5 个 MCP 工具，Claude Code / Codex / 豆包 / 任何支持 MCP 的客户端都能直接
+协作台暴露 6 个 MCP 工具，Claude Code / Codex / 豆包 / 任何支持 MCP 的客户端都能直接
 发任务、等结果：
 
 ```bash

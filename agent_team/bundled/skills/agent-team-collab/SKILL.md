@@ -40,7 +40,8 @@ python -m agent_team.cli say --as deepseek --text "..."                    # 以
 ```
 
 - **别轮询**：等结果用 `wait`（或 `bin/await_task.py -t ... --timeout 1800`），一次阻塞到终态。
-  退出码：0 通过 / 2 未通过或中止 / 3 超时 / 4 任务不存在。
+  退出码：0 通过 / 2 未通过或中止 / 3 超时 / 4 任务不存在。`wait` 没有副作用，
+  你的调用超时比任务短就先拿个小 `timeout`，被掐断了再等一次。
 - **别频繁发"空"消息**：每发一条都会激活一次大脑，既慢又费钱。
 - **看状态**：`python -m agent_team.cli status`、`room/typing.json`（谁在想）、
   `room/session_state.json`（是否刚收工、为什么收工）。
@@ -61,8 +62,8 @@ python -m agent_team.cli model reset 执行       # 回到配置默认
 
 ## 从别的 Agent 指挥它（MCP）
 
-协作台暴露 5 个 MCP 工具（stdio JSON-RPC，纯标准库）：`team_status`、`team_launch`、
-`team_task_create`、`team_task_wait`、`team_task_list`。
+协作台暴露 6 个 MCP 工具（stdio JSON-RPC，纯标准库）：`team_status`、`team_launch`、
+`team_task_create`、`team_task_wait`、`team_task_list`、`team_task_stop`。
 
 ```bash
 claude mcp add agent-team -- python -m agent_team.mcp_server   # Claude Code
@@ -71,6 +72,8 @@ python -m agent_team.cli mcp --action call --tool team_status --args '{}'
 ```
 
 - `team_task_create` 会**等到真任务号**再返回；等不到就说"已收下、还在规划"，不会编假 id。
+- `team_task_stop` 停一张正在跑的卡：引擎在下一个步骤边界停，任务记 `stopped`。
+  任务号不存在会直接报错、已经结束会如实说「已经是 passed」，不会假装停成功。
 - 令牌只走 `X-Team-Token`（从 `room/web-token` 读），绝不进 URL。
 - 调用方身份记在消息的 `meta.client` 上；任务卡里没有"谁提的需求"这个字段。
 - 各客户端配置写法见项目里的 `docs/MCP.md`。

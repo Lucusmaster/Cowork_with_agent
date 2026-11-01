@@ -107,11 +107,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(self.mcp._handle_rpc(
             {"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
-    def test_tools_list_has_five_tools_with_schema(self) -> None:
+    def test_tools_list_has_six_tools_with_schema(self) -> None:
         out = self.mcp._handle_rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in out["result"]["tools"]}
         self.assertEqual(set(tools), {"team_status", "team_launch", "team_task_create",
-                                      "team_task_wait", "team_task_list"})
+                                      "team_task_wait", "team_task_list", "team_task_stop"})
         for tool in tools.values():
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertTrue(tool["description"])
@@ -294,6 +294,95 @@ class AuthTests(unittest.TestCase):
             room.close()
 
 
+class StopTaskTests(RoomTestCase):
+    """team_task_stop 走真服务：指令必须真的落进 room/control.json。
+
+    stop 会先确认任务存在，所以这里先放一张真卡；不存在的任务号必须报错，
+    绝不能写一条指向空气的停止指令、然后回一句"已停止"。
+    """
+
+    def _card(self, task_id: str, status: str = "running") -> Path:
+        directory = self.room.root / "tasks" / task_id
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "task.json").write_text(
+            json.dumps({"id": task_id, "status": status, "title": "停止测试"}),
+            encoding="utf-8")
+        return directory
+
+    def _control(self) -> dict:
+        path = self.room.root / "room" / "control.json"
+        if path.exists():
+            path.unlink()
+        return path
+
+    def test_stop_writes_control_instruction(self) -> None:
+        self._card("T-261101-120000")
+        control_file = self._control()
+        out = self.mcp.team_task_stop("T-261101-120000")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["task_id"], "T-261101-120000")
+        self.assertEqual(out["status"], "running")
+        data = json.loads(control_file.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("action"), "stop")
+        self.assertEqual(data.get("task"), "T-261101-120000")
+
+    def test_stop_via_rpc(self) -> None:
+        self._card("T-261101-120001")
+        self._control()
+        out = self.mcp._handle_rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                    "params": {"name": "team_task_stop",
+                                               "arguments": {"task_id": "T-261101-120001"}}})
+        self.assertNotIn("error", out)
+        self.assertFalse(out["result"].get("isError"), out["result"])
+
+    def test_stop_unknown_task_raises_and_writes_nothing(self) -> None:
+        control_file = self._control()
+        with self.assertRaises(self.mcp.ToolError) as ctx:
+            self.mcp.team_task_stop("T-261101-999999")
+        self.assertIn("没有这个任务", str(ctx.exception))
+        self.assertFalse(control_file.exists(), "不存在的任务不该留下停止指令")
+
+    def test_stop_on_finished_task_writes_nothing(self) -> None:
+        self._card("T-261101-120003", status="passed")
+        control_file = self._control()
+        out = self.mcp.team_task_stop("T-261101-120003")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out.get("already_finished"))
+        self.assertEqual(out["status"], "passed")
+        self.assertFalse(control_file.exists(), "已经结束的任务不需要停止指令")
+
+    def test_stop_on_task_id_with_ampersand(self) -> None:
+        """任务号带 `&` 也不能查错卡：不转义的话 `&x=2` 会被当成另一个查询参数。"""
+        self._card("T-1&x=2")
+        control_file = self._control()
+        out = self.mcp.team_task_stop("T-1&x=2")
+        self.assertTrue(out["ok"])
+        data = json.loads(control_file.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("task"), "T-1&x=2")
+
+    def test_stop_with_wrong_token_raises(self) -> None:
+        self._card("T-261101-120002")
+        token_file = self.room.root / "room" / "web-token"
+        saved = token_file.read_text(encoding="utf-8")
+        token_file.write_text("x" * 32, encoding="utf-8")
+        try:
+            with self.assertRaises(self.mcp.ToolError):
+                self.mcp.team_task_stop("T-261101-120002")
+        finally:
+            token_file.write_text(saved, encoding="utf-8")
+
+
+class TaskPathTests(unittest.TestCase):
+    """任务号是调用方模型给的，不可控：拼进 URL 前必须整段转义。"""
+
+    def test_task_path_encodes_unsafe_characters(self) -> None:
+        from agent_team.mcp_server import _task_path
+        self.assertEqual(_task_path("T-261101-120000"), "/api/task?id=T-261101-120000")
+        self.assertEqual(_task_path("T-1&x=2"), "/api/task?id=T-1%26x%3D2")
+        self.assertEqual(_task_path("a b"), "/api/task?id=a%20b")
+        self.assertEqual(_task_path("a#b"), "/api/task?id=a%23b")
+
+
 class CliTests(unittest.TestCase):
     def test_cli_lists_tools(self) -> None:
         proc = subprocess.run([sys.executable, "-m", "agent_team.cli", "mcp", "--action", "list"],
@@ -302,7 +391,7 @@ class CliTests(unittest.TestCase):
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for name in ("team_status", "team_launch", "team_task_create", "team_task_wait",
-                     "team_task_list"):
+                     "team_task_list", "team_task_stop"):
             self.assertIn(name, proc.stdout)
 
     def test_cli_call_returns_json(self) -> None:
@@ -323,6 +412,33 @@ class CliTests(unittest.TestCase):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("没有这个工具", proc.stdout)
+
+    def test_team_task_stop_tool_exists(self):
+        """team_task_stop 工具已注册，inputSchema 正确。"""
+        from agent_team.mcp_server import TOOLS
+        self.assertIn("team_task_stop", TOOLS)
+        spec = TOOLS["team_task_stop"]
+        self.assertIn("fn", spec)
+        self.assertIn("description", spec)
+        self.assertIn("inputSchema", spec)
+        schema = spec["inputSchema"]
+        self.assertIn("task_id", schema["properties"])
+        self.assertIn("task_id", schema["required"])
+
+    def test_team_task_stop_requires_task_id(self):
+        """team_task_stop 缺少 task_id 时报错。"""
+        from agent_team.mcp_server import team_task_stop, ToolError
+        with self.assertRaises(ToolError) as ctx:
+            team_task_stop("")
+        self.assertIn("缺少", str(ctx.exception))
+
+    def test_team_task_create_session_id_exposed(self):
+        """team_task_create 的 inputSchema 暴露了 session_id 参数。"""
+        from agent_team.mcp_server import TOOLS
+        schema = TOOLS["team_task_create"]["inputSchema"]
+        self.assertIn("session_id", schema["properties"])
+        # session_id 不是必须的
+        self.assertNotIn("session_id", schema.get("required", []))
 
 
 if __name__ == "__main__":

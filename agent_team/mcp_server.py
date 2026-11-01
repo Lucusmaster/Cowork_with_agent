@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 from .paths import workbench_root
 from . import __version__
@@ -53,6 +54,15 @@ class ToolError(Exception):
 # ---------------------------------------------------------------- HTTP 基础
 def _base(port: int | None = None) -> str:
     return f"http://127.0.0.1:{port or DEFAULT_PORT}"
+
+
+def _task_path(task_id: str) -> str:
+    """任务详情接口的路径。任务号来自调用方模型，是不可控字符串：必须整段转义。
+
+    不转义的话，`T-1&x=2` 会被拆成两个参数、查到的不是这张卡（静默查错），
+    带空格或 `#` 更直接让请求发不出去。任务号里合法的字符只有字母数字和 `-`。
+    """
+    return f"/api/task?id={quote(str(task_id), safe='')}"
 
 
 def _token() -> str:
@@ -183,7 +193,7 @@ def _newest_task_id(port: int | None) -> str:
 
 def _card_status(tid: str, port: int | None = None) -> str:
     try:
-        _, data = _request("GET", f"/api/task?id={tid}", port=port)
+        _, data = _request("GET", _task_path(tid), port=port)
         detail = data.get("task") if isinstance(data.get("task"), dict) else data
         return str(detail.get("status") or "")
     except ToolError:
@@ -267,7 +277,7 @@ def team_task_wait(task_id: str, port: int | None = None, timeout: float = 1800.
     deadline = time.monotonic() + max(0.0, timeout)
     last = ""
     while True:
-        status, data = _request("GET", f"/api/task?id={task_id}", port=port)
+        status, data = _request("GET", _task_path(task_id), port=port)
         if status == 404:
             raise ToolError(f"没有这个任务：{task_id}")
         detail = data.get("task") if isinstance(data.get("task"), dict) else data
@@ -314,6 +324,43 @@ def team_task_list(limit: int = 10, port: int | None = None) -> dict:
                        "updated_at": r.get("updated_at")} for r in rows]}
 
 
+def team_task_stop(task_id: str, port: int | None = None) -> dict:
+    """停止一个正在执行的任务。
+
+    调用 `POST /api/control {"action":"stop","task_id":"..."}` 向引擎发送停止指令，
+    引擎会在下一个步骤边界停下，任务记为 `stopped`。
+
+    先确认任务真的存在：`/api/control` 不校验任务号，写进去的指令如果指向不存在的卡，
+    就会一直躺在 `room/control.json` 里没人消费——那等于对调用方撒了个"已停止"的谎。
+    """
+    task_id = (task_id or "").strip()
+    if not task_id:
+        raise ToolError("缺少 task_id")
+
+    code, data = _request("GET", _task_path(task_id), port=port)
+    if code == 404:
+        raise ToolError(f"没有这个任务：{task_id}（先用 team_task_list 确认任务号）")
+    detail = data.get("task") if isinstance(data.get("task"), dict) else data
+    state = str(detail.get("status") or "")
+    if state in TERMINAL:
+        return {"ok": True, "task_id": task_id, "status": state, "already_finished": True,
+                "message": f"任务已经是 {state}，没有写停止指令"}
+
+    body = {"action": "stop", "task_id": task_id}
+    code, data = _request("POST", "/api/control", body, port=port)
+    if code != 200 or not data.get("ok"):
+        raise ToolError(f"停止任务失败：{data.get('error') or f'HTTP {code}'}")
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "action": "stop",
+        "status": state,
+        "message": "停止指令已发送，引擎会在下一个步骤边界停下",
+        "at": data.get("at"),
+    }
+
+
 TOOLS: dict[str, dict] = {
     "team_status": {
         "fn": team_status,
@@ -335,6 +382,7 @@ TOOLS: dict[str, dict] = {
         "inputSchema": {"type": "object", "properties": {
             "request": {"type": "string", "description": "需求原文"},
             "client": {"type": "string", "description": "调用方标识，会记在群消息上，默认 mcp"},
+            "session_id": {"type": "string", "description": "指定会话 ID（可选，不指定就用当前活动会话）"},
             "plan_timeout": {"type": "number", "description": "等任务号最多多少秒，默认 90"},
             "port": {"type": "integer"}}, "required": ["request"]},
     },
@@ -352,6 +400,13 @@ TOOLS: dict[str, dict] = {
         "inputSchema": {"type": "object", "properties": {
             "limit": {"type": "integer", "description": "条数，默认 10"},
             "port": {"type": "integer"}}},
+    },
+    "team_task_stop": {
+        "fn": team_task_stop,
+        "description": "停止一个正在执行的任务。引擎会在下一个步骤边界停下，任务记为 stopped。",
+        "inputSchema": {"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "任务号，如 T-261101-120000"},
+            "port": {"type": "integer"}}, "required": ["task_id"]},
     },
 }
 
