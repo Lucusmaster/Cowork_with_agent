@@ -41,6 +41,7 @@ TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在�
 from . import agents  # noqa: E402
 from . import analysis  # noqa: E402
 from . import control  # noqa: E402
+from . import models  # noqa: E402
 from . import procs  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
@@ -1261,8 +1262,34 @@ def reconcile_unfinished() -> list[str]:
     return fixed
 
 
+def handle_model_command(request: str) -> bool:
+    """群里说「/model 执行 claude」或「切换模型 执行=claude」就换模型。
+
+    **只认显式前缀**，绝不猜测自然语言：一句「用 python 换实现方式」被当成切模型，
+    会把正在跑的任务悄悄换掉执行者——那比不支持这个功能糟得多。
+    """
+    parsed = models.parse_command(request)
+    if parsed is None:
+        return False
+    action, role, model = parsed
+    if action == "list":
+        snap = models.snapshot()
+        lines = [f"{row['name']}：{row['model'] or '默认'}（{row['source']}）" for row in snap["roles"]]
+        ready = [item["id"] for item in snap["registry"] if item["ready"]]
+        say("模型清单：" + "；".join(lines)
+            + (f"。可切的型号：{'、'.join(ready)}" if ready else "。没有可切的型号")
+            + "。要改就发「/model 执行 <型号>」或「/model 执行 reset」。")
+        return True
+    ok, message = models.set_model(role, model if action == "set" else "")
+    say(message if ok else "换模型失败：" + message)
+    event(message, "brain", "ok" if ok else "bad", "deepseek")
+    return True
+
+
 def handle(request: str) -> None:
-    """一条用户消息进来：先判断是不是"继续"，其余全交给群聊大脑。"""
+    """一条用户消息进来：先看是不是换模型命令，再判断"继续"，其余全交给群聊大脑。"""
+    if handle_model_command(request):
+        return
     if is_continue_intent(request):
         handle_continue(request)
         return

@@ -471,8 +471,24 @@ python bin/team.py report -t <ID>
 | timeout | 900s |
 | sandbox | `workspace-write` |
 
-换模型或档位有三层，按优先级：`dispatch` 命令行参数 → 任务卡里的 `executor: {model, effort}`（`new --model/--effort` 写入）→ `config/team.json`；环境变量 `EXECUTOR_MODEL` / `EXECUTOR_EFFORT` 会覆盖配置文件里的默认值。
+换模型或档位有四层，按优先级：`dispatch` 命令行参数 → 任务卡里的 `executor: {model, effort}`（`new --model/--effort` 写入）→ **运行时切换**（见下）→ `config/team.json`；环境变量 `EXECUTOR_MODEL` / `EXECUTOR_EFFORT` 会覆盖配置文件里的默认值。
 每轮消耗的 tokens 会自动从 Codex 会话日志读回、写进 `task.json` 的 `rounds[].tokens`。
+
+### 运行时换模型（不用改配置、不用重启）
+
+三个入口，改的都是同一个运行时覆盖文件 `room/model_overrides.json`，**下一张卡生效**：
+
+- 网页右栏：每个角色名下面有个模型小徽章，点它弹菜单选型号；
+- 群里发：`/model 执行 luna`、`切换模型 复核=terra`、`/model list`、`/model 执行 reset`；
+- 命令行：`agent-team model`（看）、`agent-team model set 执行 luna`、`agent-team model reset 执行`。
+
+三条规矩（都是为了让"切错了"当场暴露，而不是跑完一轮才发现）：
+
+1. **只认注册表里的型号**。`config/team.json` 的 `model_registry` 定义可选型号和别名（`claude`/`ds`/`luna`…），拼错直接拒绝并列出可用项；
+2. **没装对应 CLI 的不许切**。注册表里写了 `claude-opus-5-5` 但本机没有 `claude` 命令 → 拒绝并说明，而不是切过去让下一张卡必然失败；
+3. **协调者不可切**。它用的是引擎自己的大脑模型，换要改配置并重启引擎，页面上标虚线、接口直接拒绝。
+
+群里只认 `/model` 或「切换模型」这种**显式前缀**：一句「用 python 换实现方式」不会被当成切模型——把用户的正经需求误判成命令，比不支持这功能糟得多。
 
 三次任务实测（任务量级不同，只能当参考，不是严格 A/B）：
 
@@ -488,5 +504,6 @@ python bin/team.py report -t <ID>
 
 - 单机、单工作区、串行执行；没有并发调度。
 - 单轮耗时取决于模型和推理档：不同模型的耗时差别很大，实测 85–230s 不等；超时默认 900s，长任务自己调 `--timeout`。
-- 执行者换模型：`config/team.json`、`dispatch --model <id>`、或 `EXECUTOR_MODEL` 环境变量。
+- 执行者换模型：网页右栏点徽章、群里 `/model 执行 <型号>`、`agent-team model set 执行 <型号>`、
+  `config/team.json`、`dispatch --model <id>`、或 `EXECUTOR_MODEL` 环境变量。
 - 这套协作**不依赖**特定 Agent 框架：核心是"共享工作区 + 无头 CLI + 验收闸门"，任何能跑命令行的 Agent 都能接进来。

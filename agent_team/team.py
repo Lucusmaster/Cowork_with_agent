@@ -35,6 +35,7 @@ TASKS = ROOT / "tasks"
 from .resources import resource  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
+from . import models  # noqa: E402
 
 STATUS_ORDER = {
     "planned": "已建卡",
@@ -350,8 +351,12 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
     cfg = load_executor_config()
     task_exec = task.get("executor") or {}
-    model = args.model or task_exec.get("model") or cfg["model"]
-    effort = args.effort or task_exec.get("effort") or cfg["reasoning_effort"]
+    # 优先级：命令行 --model > 卡上指定 > 运行时切换（room/model_overrides.json）> 配置文件 > 默认
+    model, model_source = models.model_for("executor", task)
+    if not args.model and task_exec.get("model"):
+        model_source = "卡"
+    model = args.model or model or cfg["model"]
+    effort = args.effort or task_exec.get("effort") or models.effort_for("executor") or cfg["reasoning_effort"]
     timeout = args.timeout or cfg["timeout"]
     sandbox = args.sandbox or cfg["sandbox"]
 
@@ -366,9 +371,11 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
     print(f"产物工作区: {task_workspace(task)}")
     print(f"协作账本:   {ROOT}")
-    room_event(f"开始第 {round_no} 轮执行 {tid}（{model or '默认模型'} / {effort or '默认档'}）",
+    room_event(f"开始第 {round_no} 轮执行 {tid}（{model or '默认模型'} / {effort or '默认档'}"
+               + (f" / {model_source}指定" if model_source and model_source != "配置" else "") + "）",
                tid, "dispatch", "run", "codex")
-    print(f"第 {round_no} 轮派发 → Codex（模型: {model or '默认'}，推理档: {effort or '默认'}，超时 {timeout}s）")
+    print(f"第 {round_no} 轮派发 → Codex（模型: {model or '默认'}（{model_source}），"
+          f"推理档: {effort or '默认'}，超时 {timeout}s）")
     result = run_codex(
         prompt,
         workspace=str(task_workspace(task)),
@@ -389,7 +396,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         "prompt": prompt_path.name,
         "result": Path(result["last"]).name if result["last"] else "",
         "summary": result["summary"],
-        "model": result.get("model", ""),
+        "model": result.get("model", "") or model,
+        "model_source": model_source,
         "effort": result.get("reasoning_effort", ""),
         "tokens": result.get("tokens"),
     })
@@ -754,8 +762,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     prompt_path.write_text(prompt, encoding="utf-8")
 
     cfg = load_reviewer_config()
-    model = args.model or cfg["model"]
-    effort = args.effort or cfg["reasoning_effort"]
+    model, model_source = models.model_for("reviewer", task)
+    model = args.model or model or cfg["model"]
+    effort = args.effort or models.effort_for("reviewer") or cfg["reasoning_effort"]
     timeout = args.timeout or cfg["timeout"]
     sandbox = _review_sandbox(args.sandbox or cfg["sandbox"], tid)
     before = workspace_fingerprint(ws)         # 审之前拍张照，审完对一次
@@ -905,7 +914,7 @@ def main() -> int:
 
     p = sub.add_parser("dispatch", help="把任务卡交给执行者")
     p.add_argument("-t", "--task", default=None)
-    p.add_argument("--model", default=None, help="覆盖执行者模型（默认读 config/team.json）")
+    p.add_argument("--model", default=None, help="覆盖执行者模型（默认按 卡 > 运行时切换 > config/team.json 解析）")
     p.add_argument("--effort", default=None, help="推理档 low/medium/high/xhigh/max")
     p.add_argument("--timeout", type=int, default=None)
     p.add_argument("--sandbox", default=None,

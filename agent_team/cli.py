@@ -9,6 +9,12 @@ import sys
 
 from . import __version__
 
+for _stream in (sys.stdout, sys.stderr):      # 中文输出在 Windows 控制台/管道里都别乱码
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 
 def _run(module: str, argv: list[str]) -> int:
     """把子命令转发给对应模块的 main()，参数原样透传。"""
@@ -21,6 +27,38 @@ def _run(module: str, argv: list[str]) -> int:
         return int(mod.main() or 0)
     finally:
         sys.argv = saved
+
+
+def _model(action: str, role: str, model: str) -> int:
+    """`agent-team model list|set|reset`：改的是运行时覆盖，不动配置文件。"""
+    from . import models
+
+    if action in ("set", "reset"):
+        if not role:
+            print("要改哪个角色？例如：agent-team model set 执行 claude")
+            return 2
+        target = "" if action == "reset" else model
+        ok, message = models.set_model(role, target)
+        print(message)
+        return 0 if ok else 2
+
+    snap = models.snapshot()
+    print("角色      当前模型            来源   可切")
+    for row in snap["roles"]:
+        print(f"{row['name']:4}  {row['model'] or '（默认）':18}  {row['source']:4}  "
+              f"{'是' if row['switchable'] else '否'}")
+    print()
+    print("已注册模型：")
+    for item in snap["registry"]:
+        ready = "" if item["ready"] else f"  ← 没装 {item['cli']}"
+        aliases = f"  别名: {', '.join(item['aliases'])}" if item["aliases"] else ""
+        print(f"  {item['id']:22} {item['cli']:9}{aliases}{ready}")
+    if snap["overrides"]:
+        print()
+        print("临时覆盖（room/model_overrides.json）：", snap["overrides"])
+    print()
+    print("用法：agent-team model set 执行 claude   /   agent-team model reset 执行")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,6 +96,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-t", "--task", required=True)
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("model", help="看/切换各角色的模型（下一张卡生效）")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "set", "reset"], help="默认 list")
+    p.add_argument("role", nargs="?", default="", help="角色：执行/复核/规划/验收")
+    p.add_argument("model", nargs="?", default="", help="模型 id 或别名（如 claude、luna）")
+
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not args.command:
         parser.print_help()
@@ -82,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run("room", ["tail", "-n", str(args.n)])
     if args.command == "wait":
         return _run("await_task", ["-t", args.task, "--timeout", str(args.timeout)])
+    if args.command == "model":
+        return _model(args.action, args.role, args.model)
 
     parser.print_help()
     return 2

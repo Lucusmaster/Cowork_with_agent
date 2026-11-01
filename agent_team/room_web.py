@@ -29,6 +29,27 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
+from . import models as MODELS  # noqa: E402
+
+
+def _models_snapshot() -> dict:
+    """右栏要的模型状态；出错也不能让整个 /api/state 挂掉。"""
+    try:
+        return MODELS.snapshot()
+    except Exception:  # noqa: BLE001 - 模型注册表坏了不该拖垮界面
+        return {"roles": [], "registry": [], "clis": {}, "overrides": {}}
+
+
+def _room_note(text: str) -> None:
+    """往当前会话记一条系统事件（换模型这类动作要留痕）；没有会话就算了。"""
+    try:
+        sid = str(STORE.active().get("id") or "")
+        if not sid or not str(text).strip():
+            return
+        STORE.append(sid, role="system", agent="system", content=str(text),
+                     artifacts=[], status="complete", meta={"phase": "model"}, kind="event")
+    except Exception:  # noqa: BLE001 - 记不上一条事件不该让切换本身失败
+        pass
 
 try:
     from . import room
@@ -1399,6 +1420,7 @@ def _state_payload(session_id: str = "", after_id: str = "", task_id: str = "",
         "messages": messages,
         "messages_limit": page_limit,
         "agents": _agents_state(task, typing, messages),
+        "models": _models_snapshot(),          # 每个角色当前用的模型 + 可切列表
         "typing": typing,
         "task": task,
         "changes": changes,
@@ -1705,6 +1727,28 @@ input,textarea{caret-color:var(--user)}
   font-size:var(--fs-sm);padding:var(--sp-1) var(--sp-2);text-align:left}
 .art-menu .mi:hover{background:var(--panel3)}
 .art-menu .mi[disabled]{opacity:.45}
+/* 右栏 Agent 行里的模型徽章：小、可点、不喧宾夺主 */
+.amrow{display:flex;align-items:center;gap:var(--sp-1);margin-top:2px}
+.agent-row .am{background:none;border:var(--hair) solid var(--line2);border-radius:999px;
+  color:var(--dim);font-size:var(--fs-xs);padding:0 var(--sp-1);line-height:1.6;
+  max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-row .am:hover{color:var(--fg);border-color:var(--accent);background:var(--panel3)}
+.agent-row .am.fixed{border-style:dashed;cursor:default}
+.agent-row .am.fixed:hover{border-color:var(--line2);background:none;color:var(--dim)}
+.agent-row .ams{color:var(--dim2);font-size:var(--fs-xs)}
+/* 换模型菜单：跟产物菜单同一套观感，多一行"当前"勾选 */
+.model-menu{position:fixed;z-index:89;min-width:210px;max-height:320px;overflow:auto;
+  background:var(--panel2);border:var(--hair) solid var(--line2);border-radius:var(--r-2);
+  box-shadow:0 var(--sp-2) 24px #00000080;padding:var(--sp-1)}
+.model-menu[hidden]{display:none}
+.model-menu .mi{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);
+  width:100%;background:none;border:0;border-radius:var(--r-1);color:var(--fg);
+  font-size:var(--fs-sm);padding:var(--sp-1) var(--sp-2);text-align:left}
+.model-menu .mi:hover{background:var(--panel3)}
+.model-menu .mi[disabled]{opacity:.4;cursor:not-allowed}
+.model-menu .mi .tag{color:var(--dim2);font-size:var(--fs-xs)}
+.model-menu .mi.on{color:var(--accent)}
+.model-menu .mh{padding:var(--sp-1) var(--sp-2);color:var(--dim2);font-size:var(--fs-xs)}
 /* 空状态 */
 .sess-empty{padding:var(--sp-3) var(--sp-2);line-height:1.8}
 .side-foot{margin-top:auto;padding:var(--sp-2) var(--sp-3);
@@ -2500,6 +2544,7 @@ body.fx-on .fx-tap{
   <div class="menu-sep"></div>
   <button class="mi" data-act="copy" role="menuitem" tabindex="-1">复制完整路径</button>
 </div>
+<div class="model-menu" id="model-menu" role="menu" aria-label="换模型" hidden></div>
 
 <div class="confirm" id="confirm" hidden role="dialog" aria-modal="true"
      aria-labelledby="confirm-title">
@@ -4267,13 +4312,26 @@ function renderInspector(){
   const changes = st.changes || {};
   const busyCount = ROLES.filter(r => agents[r] === 'working').length;
 
+  const models = st.models || {};
+  const modelRows = {};
+  (models.roles || []).forEach(row => { modelRows[row.role] = row; });
+
   const agentRows = ROLES.map(r => {
     const a = agentOf(r);
     const busy = agents[r] === 'working';
+    const m = modelRows[r] || {};
+    // 模型挂在角色名下面：一眼看到"这个角色现在是谁在干"，点一下能换
+    const modelLabel = m.model || '默认';
+    const badge = m.switchable
+      ? '<button class="am" data-role="' + esc(r) + '" title="点击换模型（'
+        + esc(m.source || '配置') + '）">' + esc(modelLabel) + '</button>'
+      : '<span class="am fixed" title="' + esc(m.reason || '') + '">' + esc(modelLabel) + '</span>';
     return '<div class="agent-row ' + (busy ? 'busy' : '') + '">'
       + '<span class="dot"></span>'
       + '<div><div class="an" style="color:' + esc(a.color) + '">' + esc(a.name) + '</div>'
-      + '<div class="ar">' + esc(a.role) + '</div></div>'
+      + '<div class="ar">' + esc(a.role) + '</div>'
+      + '<div class="amrow">' + badge
+      + '<span class="ams">' + esc(m.source || '') + '</span></div></div>'
       + '<span class="as">' + (busy ? '工作中' : '空闲') + '</span></div>';
   }).join('');
 
@@ -4415,6 +4473,9 @@ function renderInspector(){
     +   ' 个文件</span></h3>' + outsideHtml + filesHtml + diffHtml + '</section>';
 
   wireArtChips(inspEl);
+  inspEl.querySelectorAll('.am[data-role]').forEach(btn => {
+    btn.onclick = (ev) => { ev.stopPropagation(); openModelMenu(btn.dataset.role, btn); };
+  });
   inspEl.querySelectorAll('.ctrl button[data-act]').forEach(btn => {
     btn.onclick = () => sendControl(btn.dataset.act);
   });
@@ -5034,6 +5095,64 @@ function closeArtMenu(){
   if(menu) menu.hidden = true;
   artMenuRef = '';
 }
+
+/* 换模型菜单：点 Agent 行里的模型徽章弹出来。
+   只列注册表里认识的型号；本机没装对应 CLI 的置灰并说明原因——
+   与其让人选完发现跑不起来，不如选的时候就说明白。 */
+let modelMenuRole = '';
+function modelMenuEl(){ return $('model-menu'); }
+function openModelMenu(role, anchor){
+  const menu = modelMenuEl();
+  if(!menu) return;
+  const models = st.models || {};
+  const rows = models.roles || [];
+  const reg = models.registry || [];
+  const me = rows.find(r => r.role === role) || {};
+  modelMenuRole = role;
+  const name = me.name || role;
+  let html = '<div class="mh">' + esc(name) + ' · 现在 ' + esc(me.model || '默认') + '</div>';
+  reg.forEach(m => {
+    const on = m.id === me.model;
+    const why = m.ready ? '' : '（本机没装 ' + (m.cli || '对应') + '）';
+    html += '<button class="mi ' + (on ? 'on' : '') + '" data-model="' + esc(m.id) + '"'
+      + (m.ready ? '' : ' disabled')
+      + ' title="' + esc((m.aliases || []).join(' / ') + (m.note ? ' · ' + m.note : '')) + '">'
+      + '<span>' + esc(m.id) + (on ? ' ✓' : '') + '</span>'
+      + '<span class="tag">' + esc(why || (m.cli || '')) + '</span></button>';
+  });
+  html += '<div class="menu-sep"></div>'
+    + '<button class="mi" data-model=""><span>恢复配置默认</span>'
+    + '<span class="tag">' + esc(me.source === '配置' ? '已是默认' : '') + '</span></button>';
+  menu.innerHTML = html;
+  menu.hidden = false;
+  const pad = 8;
+  const rect = anchor ? anchor.getBoundingClientRect() : {left: 0, bottom: 0};
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  let x = rect.left, y = rect.bottom + 4;
+  if(x + w + pad > window.innerWidth) x = Math.max(pad, window.innerWidth - w - pad);
+  if(y + h + pad > window.innerHeight) y = Math.max(pad, rect.top - h - 4);
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  menu.querySelectorAll('.mi[data-model]').forEach(btn => {
+    btn.onclick = () => switchModel(role, btn.dataset.model);
+  });
+}
+function closeModelMenu(){
+  const menu = modelMenuEl();
+  if(menu) menu.hidden = true;
+  modelMenuRole = '';
+}
+async function switchModel(role, model){
+  closeModelMenu();
+  const data = await apiPost('/api/set-model', {role: role, model: model});
+  if(data && data.ok){
+    toast(data.message || '模型已切换');
+    if(data.models) st.models = data.models;
+    renderInspector();
+  } else {
+    toast((data && data.error) || '切换失败');
+  }
+}
 async function artAction(act){
   const ref = artMenuRef;
   closeArtMenu();
@@ -5063,13 +5182,21 @@ if(artMenuEl()){
 document.addEventListener('click', ev => {
   const menu = artMenuEl();
   if(menu && !menu.hidden && !(ev.target.closest && ev.target.closest('#art-menu'))) closeArtMenu();
+  const mm = modelMenuEl();
+  if(mm && !mm.hidden && !(ev.target.closest && ev.target.closest('#model-menu,.am[data-role]'))) closeModelMenu();
 });
 document.addEventListener('keydown', ev => {
+  if(ev.key !== 'Escape') return;
+  const mm = modelMenuEl();
+  if(mm && !mm.hidden){ ev.preventDefault(); ev.stopImmediatePropagation(); closeModelMenu(); return; }
   const menu = artMenuEl();
   if(!menu || menu.hidden) return;
-  if(ev.key === 'Escape'){ ev.preventDefault(); ev.stopImmediatePropagation(); closeArtMenu(); }
+  ev.preventDefault(); ev.stopImmediatePropagation(); closeArtMenu();
 });
-window.addEventListener('resize', () => { if(artMenuEl() && !artMenuEl().hidden) closeArtMenu(); });
+window.addEventListener('resize', () => {
+  if(artMenuEl() && !artMenuEl().hidden) closeArtMenu();
+  if(modelMenuEl() && !modelMenuEl().hidden) closeModelMenu();
+});
 
 $('new-chat').onclick = newSession;
 wsBtn.onclick = bindWorkspace;
@@ -5598,6 +5725,10 @@ class Handler(BaseHTTPRequestHandler):
             self._touch()
             self._json(_state_payload(one("session"), one("after"), one("task"), one("limit")))
             return
+        if parsed.path == "/api/models":
+            self._touch()
+            self._json({"ok": True, "models": _models_snapshot()})
+            return
         if parsed.path == "/api/alive":
             self._touch()
             self._json({"ok": True})
@@ -5720,6 +5851,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/artifact/reveal":
             self._post_artifact_action(body, "reveal")
             return
+        if parsed.path == "/api/set-model":
+            self._post_set_model(body)
+            return
         self._json({"ok": False, "error": "接口不存在"}, 404)
 
     # ---------- 产物：用默认程序打开 / 在资源管理器里定位 ----------
@@ -5732,6 +5866,17 @@ class Handler(BaseHTTPRequestHandler):
         ok, message = _open_in_system(str(target), action)
         self._json({"ok": ok, "error": "" if ok else message, "path": str(target)},
                    200 if ok else 500)
+
+    # ---------- /api/set-model：右栏点一下就换模型 ----------
+    def _post_set_model(self, body: dict) -> None:
+        role = str((body or {}).get("role") or "").strip()
+        model = str((body or {}).get("model") or "").strip()
+        ok, message = MODELS.set_model(role, model)
+        if not ok:
+            self._json({"ok": False, "error": message, "models": _models_snapshot()}, 400)
+            return
+        _room_note(message)                 # 群里留一行，事后能看出是谁什么时候换的
+        self._json({"ok": True, "message": message, "models": _models_snapshot()})
 
     # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
     def _client_ip(self) -> str:

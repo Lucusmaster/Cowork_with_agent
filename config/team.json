@@ -1,4 +1,33 @@
 {
+  "model_registry": {
+    "gpt-6.1-terra": {
+      "cli": "codex",
+      "backend": "openai",
+      "aliases": ["terra", "gpt6"]
+    },
+    "gpt-6-luna": {
+      "cli": "codex",
+      "backend": "openai",
+      "aliases": ["luna"]
+    },
+    "gpt-6.1-sol": {
+      "cli": "codex",
+      "backend": "openai",
+      "aliases": ["sol"]
+    },
+    "deepseek-v4.1-flash": {
+      "cli": "deepseek",
+      "backend": "deepseek",
+      "aliases": ["deepseek", "ds"],
+      "note": "需要本机装 deepseek CLI"
+    },
+    "claude-opus-5-5": {
+      "cli": "claude",
+      "backend": "anthropic",
+      "aliases": ["claude", "opus"],
+      "note": "需要本机装 claude CLI"
+    }
+  },
   "executor": {
     "model": "gpt-6.1-terra",
     "reasoning_effort": "low",
