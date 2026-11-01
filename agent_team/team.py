@@ -55,12 +55,56 @@ DEFAULT_EXECUTOR = {
 }
 
 # 复核者默认档位：故意用另一个模型，换视角、也省额度。
+# **sandbox 固定 read-only，改配置也降级**（见 _review_sandbox）：复核能改代码，
+# 就等于"决策与执行分离"这个架构塌了——靠自觉不行，得靠技术上做不到。
 DEFAULT_REVIEWER = {
     "model": "gpt-6-luna",
     "reasoning_effort": "low",
     "timeout": 600,
     "sandbox": "read-only",
 }
+REVIEW_SANDBOX = "read-only"
+
+
+def _review_sandbox(requested: str | None, tid: str = "") -> str:
+    """复核者只读是硬约束：请求可写也强制降级，并且留痕（不静默改）。
+
+    以前这里是 `args.sandbox or cfg["sandbox"]`——默认只读，但配置或命令行一改就能写。
+    那等于把安全建立在"没人会改配置"上。现在这条分支只认一个答案。
+    """
+    want = str(requested or "").strip()
+    if not want or want == REVIEW_SANDBOX:
+        return REVIEW_SANDBOX
+    room_event(f"复核请求了可写沙箱（{want}），已强制降为只读", tid, "review", "bad", "reviewer")
+    print(f"⚠ 复核者只能只读：请求 {want} → 强制 {REVIEW_SANDBOX}")
+    return REVIEW_SANDBOX
+
+
+def workspace_fingerprint(ws: Path) -> dict[str, str]:
+    """工作区改动文件的指纹（路径 → 大小:mtime），用来抓"复核者动了手"。
+
+    沙箱是技术保证，这里再加一道事后对账：即使哪天沙箱失效或配置被改，
+    审完一比对就知道文件被谁动过，不至于静默通过。
+    """
+    prints: dict[str, str] = {}
+    try:
+        names = changed_files(ws)
+    except (OSError, SystemExit, subprocess.SubprocessError):
+        return prints
+    for name in names:
+        try:
+            stat = (ws / name).stat()
+        except OSError:
+            prints[name] = "gone"
+            continue
+        prints[name] = f"{stat.st_size}:{stat.st_mtime_ns}"
+    return prints
+
+
+def _diff_fingerprint(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """两份指纹比一比：新冒出来的、被改过的、被删掉的都算「动过手」。"""
+    names = set(before) | set(after)
+    return sorted(name for name in names if before.get(name) != after.get(name))
 
 
 def _load_role_config(role: str, defaults: dict) -> dict:
@@ -713,7 +757,8 @@ def cmd_review(args: argparse.Namespace) -> int:
     model = args.model or cfg["model"]
     effort = args.effort or cfg["reasoning_effort"]
     timeout = args.timeout or cfg["timeout"]
-    sandbox = args.sandbox or cfg["sandbox"]
+    sandbox = _review_sandbox(args.sandbox or cfg["sandbox"], tid)
+    before = workspace_fingerprint(ws)         # 审之前拍张照，审完对一次
 
     room_event(f"开始复核 {tid}（{model} / 只读）", tid, "review", "run", "reviewer")
     attempts = [model] + [m for m in (cfg.get("fallback_models") or []) if m and m != model]
@@ -747,6 +792,13 @@ def cmd_review(args: argparse.Namespace) -> int:
     if not passed and task.get("status") in ("passed", "executed"):
         task["status"] = "failed"
 
+    touched = _diff_fingerprint(before, workspace_fingerprint(ws))
+    if touched:
+        task["review_wrote"] = touched
+        room_event("⚠ 复核者改动了工作区（只读沙箱本不该允许）："
+                   + "、".join(touched[:5]), tid, "review", "bad", "reviewer")
+        print(f"⚠ 复核者动了工作区：{', '.join(touched)}")
+
     task.setdefault("reviews", []).append({
         "n": round_no,
         "at": now_iso(),
@@ -756,6 +808,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         "model": result.get("model", ""),
         "tokens": result.get("tokens"),
         "file": Path(result["last"]).name if result["last"] else "",
+        "sandbox": sandbox,
+        "wrote": touched,
     })
     task["updated_at"] = now_iso()
     save_task(task)
@@ -867,7 +921,8 @@ def main() -> int:
     p.add_argument("--model", default=None, help="覆盖复核者模型（默认 gpt-6-luna）")
     p.add_argument("--effort", default=None)
     p.add_argument("--timeout", type=int, default=None)
-    p.add_argument("--sandbox", default=None, choices=["read-only", "workspace-write"])
+    p.add_argument("--sandbox", default=None, choices=["read-only", "workspace-write"],
+                   help="复核**固定只读**：写别的会被强制降级并记一条告警（留着是为了审计谁想开）")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("status", help="任务总览")
