@@ -26,7 +26,7 @@ Issues = "https://github.com/Lucusmaster/Cowork_with_agent/issues"
 agent-team = "agent_team.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "pillow>=10"]
 
 [tool.setuptools]
 packages = ["agent_team"]

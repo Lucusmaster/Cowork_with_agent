@@ -296,6 +296,10 @@ class IconAssetTests(unittest.TestCase):
         return self.out / "agent-team.png"
 
     def _regen(self) -> None:
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("没装 Pillow：python -m pip install -e .[dev]")
         proc = subprocess.run([sys.executable, str(REPO / "bin" / "make_icon.py"),
                                "--out", str(self.out)],
                               capture_output=True, encoding="utf-8", errors="replace",
