@@ -173,7 +173,10 @@ class PageContractProductsTests(unittest.TestCase):
 
 class OpenInSystemTests(unittest.TestCase):
     def test_reveal_spawns_explorer_with_quiet_flags(self) -> None:
-        with mock.patch.object(room_web.subprocess, "Popen") as popen:
+        # reveal 分支只在 os.name == "nt" 下才会起 explorer；在 Linux 上跑 CI 时
+        # 不 mock 就会落到「只有 Windows 支持」的早退分支，断言必失败。
+        with mock.patch.object(room_web.os, "name", "nt"), \
+             mock.patch.object(room_web.subprocess, "Popen") as popen:
             ok, why = room_web._open_in_system(r"C:\w\a.html", "reveal")
         self.assertTrue(ok, why)
         args, kwargs = popen.call_args
