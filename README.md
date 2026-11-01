@@ -233,12 +233,29 @@ agent_team/           运行时包（引擎、协议、网页、桥）
   room_web.py         聊天式工作台（三栏、工作区选择器、artifact 预览）
   codex_bridge.py     调 Codex CLI 的唯一出口
   cli.py              统一命令入口
-bin/                  兼容壳 + 系统启动脚本（ps1/sh）
+  launcher.py         双击启动器（已在跑就只开页面）
+bin/                  兼容壳 + 系统启动脚本（.bat/.ps1/.sh）
 config/team.json      模型、超时、重试
 agents/               大脑与执行者的契约提示词
-tests/                回归测试（212 项）
+tests/                回归测试（479 项）
 docs/                 架构与路线图
 room/ tasks/          运行时账本与任务卡（不进产物仓库）
+```
+
+## 桌面启动（Windows）
+
+双击桌面的 **agent-team** 图标就能用，不用记命令：
+
+```powershell
+agent-team install-desktop      # 装一次：桌面生成 agent-team.lnk
+```
+
+双击后会：没在跑就起服务 → 等到页面真能打开 → 用**一次性链接**开浏览器；
+已经在跑就只打开页面、不重启（重启会打断正在执行的任务）。想从命令行等价调用：
+
+```powershell
+python -m agent_team.launcher                # 缺省 8899
+python -m agent_team.launcher --port 8900
 ```
 
 ## 文档

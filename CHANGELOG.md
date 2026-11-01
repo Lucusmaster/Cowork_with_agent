@@ -1,3 +1,38 @@
+## 0.9.15 — Windows 桌面启动器（双击就开，已经在跑就不动）
+
+双击桌面的 agent-team 图标 → 协作台起来 → 浏览器打开**一次性链接**；
+已经在跑就只打开页面，**不重启**（重启会打断正在执行的任务）。
+
+```powershell
+agent-team install-desktop        # 桌面生成 agent-team.lnk
+python -m agent_team.launcher     # 不想装快捷方式时，命令行等价用法
+```
+
+### 为什么逻辑在 Python 里、脚本只有 20 行
+
+cmd 的引号/错误码/代码页太容易写错，而且写在 .bat 里没法测。所以：
+
+- `bin/agent-team-launcher.bat` 只做 `cd /d %~dp0..` + 转交 `python -m agent_team.launcher`；
+- `agent_team/launcher.py` 负责判断：`GET /` 已 200 → 只取新码开页面；否则起服务并轮询
+  `GET /` 直到真能打开（≤30s，不是睡固定几秒赌）；端口被别的程序占着就直接说清楚、不硬起；
+- 两个脚本**纯 ASCII**：cmd.exe 按控制台代码页读 .bat、PowerShell 5.1 把无 BOM 的 UTF-8 当 ANSI 读，
+  中文分别会让命令写坏、让 .ps1 报 `The string is missing the terminator`。中文提示全由 Python 输出；
+- 快捷方式 `TargetPath` **直接指向 .bat**，不绕 `cmd.exe /c "..."`（少一层引号嵌套）。
+
+### 顺手修掉的外部方案三处硬伤
+
+外部方案给的启动器"能提交"但**双击必失败**：`cli start --workspace`（这个参数不存在，
+argparse 报错、服务根本没起）、探活打不存在的 `/api/status`、打开裸地址（0.9.12 起是解锁页
+而不是界面）。它那 6 个 pytest 风格"测试"在本项目的 `unittest discover` 里一条都不会被收集。
+
+### 验证
+
+- 23 项新测试：launcher 六种分支（已在跑/没在跑/起不来/超时/端口被占/`--no-browser`）、
+  .bat 与 .ps1 的内容契约（纯 ASCII、不对不存在的参数和接口）、真调 PowerShell 解析 .ps1、
+  真建 `.lnk` 并核对 `TargetPath` 与"已存在不覆盖";
+- 隔离 `AGENT_TEAM_HOME` + 端口 8895 跑完整双击链路：首启 rc=0 并给出 `?k=` 链接，
+  链接第一次 302、第二次 401，二次启动识别"已在跑"不重启，服务仍 200。
+
 ## 0.9.14 — 角色↔模型可以运行时切换（网页点一下 / 群里说一句 / 命令行）
 
 原来是**静态配置**：模型写死在 `config/team.json`，而且有两处（`agents[]` 和
