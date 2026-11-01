@@ -1,6 +1,6 @@
 # agent-team · a team of coding agents in one group chat
 
-[中文说明](README.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
+[中文说明](README.md) · [Install](docs/INSTALL.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
 
 [![CI](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -53,9 +53,11 @@ Messages carry **references, not logs**:
 ```
 
 Failures are failures: a non-zero acceptance command, an out-of-scope edit, or a `NEEDS_FIX` review marks the message red with the reason and records `outcome=failure` — the flow finishing never fakes success.
-## Quick start
+## Quick start after cloning
 
-Requires Python ≥ 3.10, git, and a logged-in Codex CLI (`codex login`).
+Read the [installation guide](docs/INSTALL.md) first. It lists the required tools, platform-specific setup, optional development dependencies, and doctor output.
+
+Requires Python ≥ 3.10, git, and a logged-in Codex CLI (`codex login`). Node.js is only needed for JavaScript/TypeScript workspaces. Pillow is only needed for development and icon generation.
 
 ```powershell
 python -m agent_team.cli doctor        # check environment

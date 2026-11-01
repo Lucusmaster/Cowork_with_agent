@@ -1,6 +1,6 @@
 # 协作台 · agent-team
 
-[English](README.en.md) · [架构](docs/ARCHITECTURE.md) · [路线图](docs/ROADMAP.md)
+[English](README.en.md) · [安装](docs/INSTALL.md) · [架构](docs/ARCHITECTURE.md) · [路线图](docs/ROADMAP.md)
 
 [![CI](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Lucusmaster/Cowork_with_agent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -19,17 +19,27 @@
 - 说人话就行，需求模糊也能接
 - 关掉网页即收工（有任务在跑时会等它跑完）
 
-## 刚下载下来，先做这几步
+## 刚从 GitHub 下载下来
+
+先看[安装与首次启动](docs/INSTALL.md)。它列出了必需环境、Windows/macOS/Linux 命令、开发依赖和常见体检结果。
+
+最短路径是：
 
 ```bash
 git clone https://github.com/Lucusmaster/Cowork_with_agent.git
 cd Cowork_with_agent
-pip install -e .                  # 或者不装，直接用 python -m agent_team.cli ...
+python -m venv .venv
+# Windows: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -e .
+codex login
 
-agent-team doctor                 # 1. 体检：Python、git、Codex CLI、端口
-agent-team start                  # 2. 起协作台，用打印出来的 ?k= 链接打开
+agent-team doctor                 # 1. 体检环境
+agent-team start                  # 2. 启动，用打印出来的 ?k= 链接打开
 agent-team install-skills         # 3. 让你设备上的 agent 学会用它
 ```
+
+最低要求是 Python 3.10+、Git、Codex CLI 和 Codex 登录态；Node.js 只在处理 JS/TS 项目时需要。普通使用不需要 Pillow，贡献代码或生成桌面图标时执行 `python -m pip install -e ".[dev]"`。
 
 **第 3 步最容易被忽略，但它最省事**：这个项目把"怎么用协作台"写成了 skill，
 正本就在仓库里（`skills/agent-team-collab/SKILL.md`），一条命令装到各家 agent 的加载位置：
