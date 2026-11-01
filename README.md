@@ -301,14 +301,19 @@ agent-team install-skills --mcp    # 没有 skill 机制的客户端：打印 MC
 双击桌面的 **agent-team** 图标就能用，不用记命令：
 
 ```powershell
-agent-team install-desktop      # 装一次：桌面生成 agent-team.lnk
+agent-team install-desktop        # 装一次：桌面生成 agent-team.lnk（浏览器标签页）
+agent-team install-desktop --app  # 另一个版本：agent-team-app.lnk，独立窗口、没有地址栏
 ```
+
+两个图标可以并存。图标是仓库里现画的（`python tools/make_icon.py` 可重跑），
+桌面显示的空白图标（缓存没过期）按 F5 刷一下就好。
 
 双击后会：没在跑就起服务 → 等到页面真能打开 → 用**一次性链接**开浏览器；
 已经在跑就只打开页面、不重启（重启会打断正在执行的任务）。想从命令行等价调用：
 
 ```powershell
 python -m agent_team.launcher                # 缺省 8899
+python -m agent_team.launcher --app          # 独立窗口打开
 python -m agent_team.launcher --port 8900
 ```
 

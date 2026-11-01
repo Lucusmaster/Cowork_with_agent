@@ -85,6 +85,9 @@ def _install_desktop(workspace: str, force: bool, desktop: str = "", app: bool =
         cmd += ["-Desktop", str(Path(desktop).resolve())]
     if force:
         cmd.append("-Force")
+    icon = root / "assets" / "agent-team.ico"
+    if icon.is_file():
+        cmd += ["-Icon", str(icon)]
     if app:
         cmd += ["-App", "-PythonW", pythonw]
 

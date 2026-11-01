@@ -17,6 +17,7 @@ param(
     [string]$ProjectPath = "",
     [string]$Desktop = "",
     [string]$PythonW = "",
+    [string]$Icon = "",
     [switch]$Force,
     [switch]$App
 )
@@ -73,7 +74,13 @@ if ($IsApp) {
     $Link.Description = 'agent-team workbench'
 }
 $Link.WorkingDirectory = $ProjectPath
-$Link.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
+# Use our own icon when it exists; fall back to the system one so the shortcut
+# never renders as a blank white square.
+if ([string]::IsNullOrWhiteSpace($Icon) -or -not (Test-Path $Icon)) {
+    $Link.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
+} else {
+    $Link.IconLocation = (Resolve-Path $Icon).Path
+}
 $Link.WindowStyle = 1
 $Link.Save()
 

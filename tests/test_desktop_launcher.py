@@ -200,6 +200,12 @@ class Ps1ContractTests(unittest.TestCase):
         self.assertIn("[string]$Desktop", self.text)
         self.assertIn("[switch]$Force", self.text)
 
+    def test_ps1_supports_icon_override(self) -> None:
+        """图标：传了就用传的，没传退回系统图标——别让快捷方式变白方块。"""
+        self.assertIn("[string]$Icon", self.text)
+        self.assertIn("$Link.IconLocation = (Resolve-Path $Icon).Path", self.text)
+        self.assertIn("shell32.dll,13", self.text, "没有图标时必须还有系统图标兜底")
+
     def test_ps1_supports_app_mode(self) -> None:
         """App 版：指向 pythonw（不弹黑框）+ `-m agent_team.launcher --app`，另起一个 .lnk。"""
         self.assertIn("[switch]$App", self.text)
@@ -267,6 +273,79 @@ class Ps1ContractTests(unittest.TestCase):
             again = subprocess.run([*args], capture_output=True, encoding="utf-8",
                                    errors="replace", creationflags=NO_WINDOW)
             self.assertEqual(again.returncode, 2, "已存在时应返回 2，提示加 -Force")
+
+
+class IconAssetTests(unittest.TestCase):
+    """应用图标：脚本能重跑、ico 尺寸齐全、png 是给人眼看的预览。"""
+
+    SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+    def _regen(self) -> None:
+        proc = subprocess.run([sys.executable, str(REPO / "tools" / "make_icon.py")],
+                              capture_output=True, encoding="utf-8", errors="replace",
+                              cwd=str(REPO), creationflags=NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_script_regenerates_both_files(self) -> None:
+        self._regen()
+        self.assertTrue((REPO / "assets" / "agent-team.ico").is_file())
+        self.assertTrue((REPO / "assets" / "agent-team.png").is_file())
+
+    def test_ico_carries_every_size(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("没装 Pillow")
+        self._regen()
+        with Image.open(REPO / "assets" / "agent-team.ico") as im:
+            sizes = {tuple(size) for size in im.info.get("sizes", [])}
+        for size in self.SIZES:
+            self.assertIn((size, size), sizes, f"ico 里缺 {size}x{size}")
+
+    def test_png_is_a_256_preview(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("没装 Pillow")
+        self._regen()
+        with Image.open(REPO / "assets" / "agent-team.png") as im:
+            self.assertEqual(im.size, (256, 256))
+            self.assertEqual(im.mode, "RGBA")
+
+    def test_tiny_size_drops_the_core_and_links(self) -> None:
+        """16 这一档只留三个点：白点和连线在小网格上只会糊成一团。"""
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("没装 Pillow")
+        self._regen()
+        with Image.open(REPO / "assets" / "agent-team.ico") as im:
+            im.size = (16, 16)
+            pixels = list(im.convert("RGBA").getdata())
+        self.assertFalse([p for p in pixels if p[:3] == (255, 255, 255)],
+                         "16px 上不该再有白点")
+        self.assertTrue([p for p in pixels if p[:3] == (0x3F, 0xD3, 0xA6)],
+                        "16px 上要能看到节点")
+
+    @unittest.skipIf(os.name != "nt", "快捷方式只有 Windows 有")
+    def test_shortcut_can_use_the_new_icon(self) -> None:
+        ico = REPO / "assets" / "agent-team.ico"
+        if not ico.is_file():
+            self.skipTest("图标还没生成")
+        with tempfile.TemporaryDirectory() as desktop:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(PS1),
+                 "-ProjectPath", str(REPO), "-Desktop", desktop, "-Icon", str(ico), "-Force"],
+                capture_output=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lnk = Path(desktop) / "agent-team.lnk"
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); "
+                 f"$s.IconLocation"],
+                capture_output=True, encoding="utf-8", errors="replace",
+                creationflags=NO_WINDOW).stdout
+            self.assertIn("agent-team.ico", out)
 
 
 class InstallDesktopTests(unittest.TestCase):
