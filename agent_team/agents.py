@@ -102,7 +102,11 @@ def _latest(directory: Path, pattern: str) -> Path | None:
 
 
 def _artifact_paths(tid: str, role: str) -> list[str]:
-    """把这一步留下的证据文件变成消息里的 artifact 引用（仓库相对路径）。"""
+    """把这一步留下的证据文件变成消息里的 artifact 引用（仓库相对路径）。
+
+    执行者/验收者这一步额外带上**产物工作区里真正生成的文件**（``workspace:<相对路径>``）：
+    用户要的是「产出后发一个蓝色文件名，点开就能看」，光给 tasks/ 里的日志不算产物。
+    """
     directory = ROOT / "tasks" / tid
     if not directory.is_dir():
         return []
@@ -113,11 +117,26 @@ def _artifact_paths(tid: str, role: str) -> list[str]:
         "reviewer": ["review-*.last.md", "verdict-*.md"],
     }.get(role, [])
     out: list[str] = []
+    if role in ("executor", "tester"):
+        for ref in _workspace_product_refs(tid, limit=8):
+            if ref not in out:
+                out.append(ref)
     for pattern in patterns:
         latest = _latest(directory, pattern)
         if latest is not None:
             out.append(str(latest.relative_to(ROOT)).replace("\\", "/"))
     return out
+
+
+def _workspace_product_refs(tid: str, limit: int = 8) -> list[str]:
+    """这张卡在工作区里产出的文件引用（``workspace:`` 前缀）；读不到就当没有。"""
+    try:
+        from . import team as team_mod
+        task = team_mod.load_task(tid)
+        products = team_mod.workspace_products(task)
+    except Exception:  # noqa: BLE001
+        return []
+    return [str(item["ref"]) for item in products[:limit] if item.get("ref")]
 
 
 def _call_team(command: str, tid: str, timeout: int) -> tuple[int, str]:

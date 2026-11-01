@@ -197,6 +197,8 @@ def run_codex(
         last_path.write_text(last, encoding="utf-8")
 
     summary = next((ln.strip() for ln in last.splitlines() if ln.strip()), "")
+    # 收掉沙箱留下的空临时目录，别把工作区搞成"一堆不知名的东西"
+    scratch_removed = prune_scratch(ws)
     return {
         "ok": rc == 0 and not timedout,
         "exit": rc,
@@ -211,7 +213,47 @@ def run_codex(
         "model": model or "（Codex 默认）",
         "reasoning_effort": reasoning_effort or "（模型默认）",
         "tokens": _session_tokens(started, home),
+        "scratch_removed": scratch_removed,
     }
+
+
+def prune_scratch(workspace: str | Path | None) -> int:
+    """收掉 Codex 沙箱在工作区里留下的空临时目录，返回删掉的目录数。
+
+    为了让沙箱里的临时文件能写（见下面 ``TEMP`` 那段），临时目录被指到
+    ``<工作区>/.tmp``。Codex 每跑一条命令就在里面建一个 ``.tmpXXXXXX`` 空目录，
+    跑完不回收入——一次任务能堆几十个，用户打开工作区就是"一堆不知名的东西"。
+
+    只删**空目录**，一个文件都不碰（产物绝不会被误删）；``.tmp`` 自己也空了就一并删掉。
+    没给工作区就直接返回 0——不猜、更不顺手清自己的仓库。
+    """
+    if not workspace:
+        return 0
+    try:
+        scratch = Path(workspace) / ".tmp"
+    except (TypeError, ValueError):
+        return 0
+    if not scratch.is_dir():
+        return 0
+    removed = 0
+    try:
+        children = list(scratch.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        try:
+            if not child.is_dir() or any(child.iterdir()):
+                continue
+            child.rmdir()
+            removed += 1
+        except OSError:      # 正被别的进程占着：留着，下一轮再收
+            continue
+    try:
+        if not any(scratch.iterdir()):
+            scratch.rmdir()
+    except OSError:
+        pass
+    return removed
 
 
 def main() -> int:

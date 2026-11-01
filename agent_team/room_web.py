@@ -1072,6 +1072,69 @@ def _git_snapshot(workspace: str) -> dict:
     return data
 
 
+def _is_product_path(name: str) -> bool:
+    """这条改动算不算「产物」。账本目录和缓存垃圾不算（它们不是用户要的东西）。"""
+    rel = str(name or "").replace("\\", "/").lstrip("./")
+    if not rel:
+        return False
+    if rel.startswith(("tasks/", "room/", "config/", "agents/", "bin/", ".tmp/", ".codex-home/")):
+        return False
+    parts = rel.split("/")
+    if any(part in ("__pycache__", ".git", "node_modules", ".pytest_cache", ".mypy_cache") for part in parts):
+        return False
+    return not rel.endswith((".pyc", ".pyo", ".pyd", ".log", ".tmp", ".swp"))
+
+
+def _task_products(task: dict) -> list[dict]:
+    """这张卡在工作区里真正产出的文件：``[{path, ref, in_scope}]``。
+
+    ``ref`` 用 ``workspace:`` 前缀（``_resolve_artifact`` 认这个格式），
+    标出是不是落在任务卡声明的 scope 内——越界的只是提醒，不拦。
+    """
+    workspace = str(task.get("workspace") or _project_workspace() or "")
+    if not workspace:
+        return []
+    scope = [str(item).strip().replace("\\", "/").rstrip("/")
+             for item in (task.get("scope") or [])]
+    scope = [item for item in scope if item]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for name in _git_snapshot(workspace)["files"]:
+        rel = str(name).replace("\\", "/").strip().strip('"')
+        if rel in seen or not _is_product_path(rel):
+            continue
+        seen.add(rel)
+        in_scope = (not scope) or any(rel == item or rel.startswith(item + "/") for item in scope)
+        out.append({"path": rel, "ref": f"workspace:{rel}", "in_scope": in_scope})
+    return out[:40]
+
+
+def _open_in_system(path: str, action: str) -> tuple[bool, str]:
+    """把产物交给系统：``open`` = 用默认程序打开，``reveal`` = 资源管理器里选中它。
+
+    只接 ``_resolve_artifact`` 已经放行的路径（工作区内 / 仓库内的文件），不额外开洞。
+    """
+    if action == "reveal":
+        if os.name != "nt":
+            return False, "只有 Windows 上支持在资源管理器里定位"
+        try:
+            # explorer 一定返回 1，不判退出码；quiet_flags 免得弹黑框
+            subprocess.Popen(["explorer", "/select,", path], creationflags=quiet_flags())
+            return True, ""
+        except OSError as exc:
+            return False, f"打不开资源管理器：{exc}"
+    try:
+        if os.name == "nt":
+            os.startfile(path)          # noqa: S606 - 用户主动点的「用默认程序打开」
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], creationflags=quiet_flags())
+        else:
+            subprocess.Popen(["xdg-open", path], creationflags=quiet_flags())
+        return True, ""
+    except OSError as exc:
+        return False, f"打不开：{exc}"
+
+
 def _task_detail(tid: str) -> dict | None:
     tid = (tid or "").strip()
     if not tid or "/" in tid or "\\" in tid or tid in (".", ".."):
@@ -1097,7 +1160,9 @@ def _task_detail(tid: str) -> dict | None:
 
     verify_file = newest("verify-*.txt")
     review_file = newest("review-*.last.md")
-    artifacts = []
+    # 产物（工作区里真生成的文件）排在证据前面：用户找的是产物，不是我们的日志
+    products = _task_products(task)
+    artifacts = [{"path": p["ref"], "kind": "product", "in_scope": p["in_scope"]} for p in products]
     for pattern, kind in (("plan.md", "plan"), ("exec-*.last.md", "exec"),
                           ("verify-*.txt", "verify"), ("review-*.last.md", "review"),
                           ("report.md", "report")):
@@ -1121,6 +1186,7 @@ def _task_detail(tid: str) -> dict | None:
         "verify_tail": _tail(verify_file) if verify_file else "",
         "review_text": _tail(review_file, 26) if review_file else "",
         "artifacts": artifacts,
+        "products": products,
         "diff_stat": "",
     }
     detail["diff_stat"] = _git_snapshot(workspace)["diff_stat"]
@@ -1589,6 +1655,16 @@ input,textarea{caret-color:var(--user)}
 .sess-menu .mi.danger{color:var(--bad)}
 .sess-menu .mi.danger:hover{background:#f8514914;color:#ffb4ad}
 .menu-sep{height:var(--hair);background:var(--line2);margin:var(--sp-1) 0}
+/* 产物右键菜单：跟会话菜单同一套观感，只是挂在文件名上 */
+.art-menu{position:fixed;z-index:88;min-width:186px;background:var(--panel2);
+  border:var(--hair) solid var(--line2);border-radius:var(--r-2);
+  box-shadow:0 var(--sp-2) 24px #00000080;padding:var(--sp-1)}
+.art-menu[hidden]{display:none}
+.art-menu .mi{display:flex;align-items:center;gap:var(--sp-1);width:100%;
+  background:none;border:0;border-radius:var(--r-1);color:var(--fg);
+  font-size:var(--fs-sm);padding:var(--sp-1) var(--sp-2);text-align:left}
+.art-menu .mi:hover{background:var(--panel3)}
+.art-menu .mi[disabled]{opacity:.45}
 /* 空状态 */
 .sess-empty{padding:var(--sp-3) var(--sp-2);line-height:1.8}
 .side-foot{margin-top:auto;padding:var(--sp-2) var(--sp-3);
@@ -1646,6 +1722,10 @@ input,textarea{caret-color:var(--user)}
 .insp-ws .p{font-family:"Cascadia Mono",Consolas,monospace;font-size:var(--fs-xs);
   color:var(--dim);word-break:break-all;line-height:1.5}
 .insp-ws .pick-btn{margin-top:var(--sp-2)}
+/* 「清单外」提醒：只提醒，不拦（用户要的是标出来，不是拒绝干活） */
+.insp-warn{margin:0 0 var(--sp-2);padding:var(--sp-2);border-radius:var(--r-1);
+  border:var(--hair) solid #d2992255;background:#d2992212;
+  font-size:var(--fs-xs);line-height:1.6;color:#e5c07b;word-break:break-all}
 .stream{flex:1;min-height:0;overflow-y:auto;
   padding:var(--sp-5) var(--sp-5) var(--sp-1)}
 .msg{display:flex;gap:var(--sp-3);max-width:860px;margin:0 auto var(--sp-4);width:100%}
@@ -1685,11 +1765,20 @@ input,textarea{caret-color:var(--user)}
 .notice:before,.notice:after{content:"";height:var(--hair);background:var(--line);flex:1}
 .notice span{max-width:72%;text-align:center;white-space:pre-wrap;word-break:break-word}
 .artifacts{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-2)}
-.art{border:var(--hair) solid var(--line2);background:var(--panel);border-radius:var(--r-1);
-  padding:var(--sp-1) var(--sp-2);font-size:var(--fs-sm);color:#9fb6cf;
-  display:inline-flex;gap:var(--sp-1);align-items:center;max-width:100%}
-.art:hover{border-color:#3d5a7d;color:#cfe4ff}
+/* 产物 = 蓝色的文件名（像 Codex 那样）：单击打开、右击出菜单。
+   不再做成灰盒子按钮——盒子里看不出哪个是产物、哪个是日志。 */
+.art{border:0;background:none;border-radius:var(--r-1);
+  padding:0 var(--sp-1) 0 0;font-size:var(--fs-sm);color:#6cb6ff;
+  display:inline-flex;gap:5px;align-items:center;max-width:100%;cursor:pointer}
+.art:hover{color:#a5d6ff;text-decoration:underline;text-underline-offset:2px}
+.art:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+.art .ico{color:inherit;opacity:.9;flex:0 0 auto}
 .art .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:230px}
+/* 清单外（任务没声明要改的）产物：换成警示色 + 小标签，提醒但不禁掉 */
+.art[data-scope="out"]{color:var(--warn)}
+.art[data-scope="out"]:hover{color:#ffd479}
+.art .tag{flex:0 0 auto;font-size:10px;padding:0 4px;border-radius:var(--r-pill);
+  background:#d2992222;color:var(--warn);line-height:15px}
 .typing{max-width:860px;margin:0 auto var(--sp-4);display:flex;align-items:center;
   gap:var(--sp-2);color:#8aa0b8;font-size:var(--fs-sm)}
 .typing .dots{display:inline-flex;gap:var(--sp-1)}
@@ -2363,6 +2452,13 @@ body.fx-on .fx-tap{
   <button class="mi" id="menu-archive" role="menuitem" tabindex="-1">归档</button>
   <div class="menu-sep"></div>
   <button class="mi danger" id="menu-delete" role="menuitem" tabindex="-1">删除</button>
+</div>
+<div class="art-menu" id="art-menu" role="menu" aria-label="产物操作" hidden>
+  <button class="mi" data-act="preview" role="menuitem" tabindex="-1">打开（预览）</button>
+  <button class="mi" data-act="open" role="menuitem" tabindex="-1">用默认程序打开</button>
+  <button class="mi" data-act="reveal" role="menuitem" tabindex="-1">在资源管理器里显示</button>
+  <div class="menu-sep"></div>
+  <button class="mi" data-act="copy" role="menuitem" tabindex="-1">复制完整路径</button>
 </div>
 
 <div class="confirm" id="confirm" hidden role="dialog" aria-modal="true"
@@ -3431,15 +3527,7 @@ function buildMsg(m){
   if(arts.length){
     const host = document.createElement('div');
     host.className = 'artifacts';
-    arts.forEach(path => {
-      const btn = document.createElement('button');
-      btn.className = 'art';
-      btn.title = path;
-      btn.innerHTML = '<span><svg class="ico" aria-hidden="true"><use href="#i-file"/></svg></span>'
-    + '<span class="nm">' + esc(baseName(path)) + '</span>';
-      btn.onclick = () => openArtifact(path);
-      host.appendChild(btn);
-    });
+    fillArtifacts(host, arts);
     body.appendChild(host);
   }
   if(m.status === 'failed'){
@@ -4151,13 +4239,17 @@ function renderInspector(){
 
   let taskBlock = '<div class="empty">还没有任务卡<br>发一条需求就会自动建卡</div>';
   if(task){
-    const arts = Array.isArray(task.artifacts) ? task.artifacts : [];
-    const artHtml = arts.length
-      ? '<div class="artifacts">' + arts.map(a =>
-          '<button class="art" data-art="' + esc(a.path) + '">'
-          + '<svg class="ico" aria-hidden="true"><use href="#i-file"/></svg> '
-          + esc(baseName(a.path))
-          + '</button>').join('') + '</div>'
+    // 产物排在最前（workspace: 引用），证据文件跟在后面
+    const products = Array.isArray(task.products) ? task.products : [];
+    const arts = (Array.isArray(task.artifacts) ? task.artifacts : []).map(a => a.path || a);
+    const refs = [];
+    products.forEach(p => { if(p && p.ref && refs.indexOf(p.ref) < 0) refs.push(p.ref); });
+    arts.forEach(a => { if(a && refs.indexOf(a) < 0) refs.push(a); });
+    const artHtml = refs.length
+      ? '<div class="artifacts">' + refs.map(ref => {
+          const hit = products.find(p => p && p.ref === ref);
+          return chipHtml(ref, hit ? hit.in_scope !== false : true);
+        }).join('') + '</div>'
       : '';
     taskBlock = '<div class="task-card">'
       + '<div class="tid">' + esc(task.id || '') + '</div>'
@@ -4238,9 +4330,19 @@ function renderInspector(){
     : '<div class="empty">' + esc(changes.last_verify || '还没有验收记录') + '</div>';
 
   const files = Array.isArray(changes.files) ? changes.files : [];
+  const prods = Array.isArray(task && task.products) ? task.products : [];
+  /* 改动列表也做成蓝色文件名：点开就能看，右击能定位到文件夹——不然只能看到一串路径发呆 */
   const filesHtml = files.length
-    ? '<ul class="files">' + files.map(f => '<li>' + esc(f) + '</li>').join('') + '</ul>'
+    ? '<div class="artifacts">' + files.map(name => {
+        const hit = prods.find(p => p && (p.path === name || p.ref === 'workspace:' + name));
+        return chipHtml('workspace:' + name, hit ? hit.in_scope !== false : true);
+      }).join('') + '</div>'
     : '<div class="empty" style="padding:4px 0 8px">没有未提交改动</div>';
+  const outside = prods.filter(p => p && p.in_scope === false);
+  const outsideHtml = outside.length
+    ? '<div class="insp-warn">任务卡没声明要改这几个文件，但它们确实被改了：'
+      + outside.map(p => esc(p.path)).join('、') + '</div>'
+    : '';
   const diffHtml = changes.diff_stat
     ? '<pre class="block">' + esc(changes.diff_stat) + '</pre>' : '';
 
@@ -4270,11 +4372,9 @@ function renderInspector(){
     +   '<div class="ctrl-hint">' + esc(ctrlHint) + '</div></section>'
     + '<section class="panel"><h3>测试结果</h3>' + verify + '</section>'
     + '<section class="panel"><h3>代码改动<span class="n">' + files.length
-    +   ' 个文件</span></h3>' + filesHtml + diffHtml + '</section>';
+    +   ' 个文件</span></h3>' + outsideHtml + filesHtml + diffHtml + '</section>';
 
-  inspEl.querySelectorAll('.art[data-art]').forEach(btn => {
-    btn.onclick = () => openArtifact(btn.dataset.art);
-  });
+  wireArtChips(inspEl);
   inspEl.querySelectorAll('.ctrl button[data-act]').forEach(btn => {
     btn.onclick = () => sendControl(btn.dataset.act);
   });
@@ -4810,6 +4910,126 @@ async function openArtifact(path){
 }
 
 function closeModal(){ modal.hidden = true; modalBody.textContent = ''; }
+
+/* ---------- 产物：蓝色文件名（单击打开 / 右击出菜单） ---------- */
+/* 引用格式两种：`workspace:<工作区相对路径>`（真正产出的文件）、`tasks/<id>/xxx.md`（证据）。
+   显示一律只给文件名，完整路径放 title 和右键菜单里。 */
+function refLabel(ref){
+  const raw = String(ref || '');
+  const rel = raw.startsWith('workspace:') ? raw.slice('workspace:'.length) : raw;
+  return baseName(rel);
+}
+function refIsProduct(ref){ return String(ref || '').startsWith('workspace:'); }
+function productScope(ref){
+  const products = (st.task && Array.isArray(st.task.products)) ? st.task.products : [];
+  const hit = products.find(p => p && p.ref === ref);
+  return hit ? hit.in_scope !== false : true;      // 找不到就当清单内，别乱标
+}
+/* 造一个蓝色文件名。opts: {inScope} 不传就按当前任务卡查 */
+function artifactChip(ref, opts){
+  const o = opts || {};
+  const inScope = (o.inScope === undefined) ? productScope(ref) : o.inScope;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'art';
+  btn.dataset.art = ref;
+  btn.title = (refIsProduct(ref) ? '产物：' : '证据：') + String(ref).replace(/^workspace:/, '')
+    + '\n单击打开，右击更多';
+  if(!inScope) btn.dataset.scope = 'out';
+  btn.innerHTML = '<svg class="ico" aria-hidden="true"><use href="#i-file"/></svg>'
+    + '<span class="nm">' + esc(refLabel(ref)) + '</span>'
+    + (inScope ? '' : '<span class="tag">清单外</span>');
+  btn.onclick = ev => { ev.preventDefault(); openArtifact(ref); };
+  btn.oncontextmenu = ev => { ev.preventDefault(); openArtMenu(ref, ev); };
+  return btn;
+}
+function fillArtifacts(host, refs, opts){
+  if(!host) return;
+  host.innerHTML = '';
+  (refs || []).forEach(ref => host.appendChild(artifactChip(ref, opts)));
+}
+/* 同一套外观的 HTML 版本（右栏用 innerHTML 拼，图省事） */
+function chipHtml(ref, inScope){
+  const okScope = inScope !== false;
+  return '<button type="button" class="art" data-art="' + esc(ref) + '"'
+    + (okScope ? '' : ' data-scope="out"')
+    + ' title="' + esc((refIsProduct(ref) ? '产物：' : '证据：') + String(ref).replace(/^workspace:/, ''))
+    + '">'
+    + '<svg class="ico" aria-hidden="true"><use href="#i-file"/></svg>'
+    + '<span class="nm">' + esc(refLabel(ref)) + '</span>'
+    + (okScope ? '' : '<span class="tag">清单外</span>')
+    + '</button>';
+}
+/* 给容器里所有蓝色文件名接上单击/右击（innerHTML 拼出来的那些） */
+function wireArtChips(root){
+  if(!root) return;
+  root.querySelectorAll('.art[data-art]').forEach(btn => {
+    if(btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.onclick = ev => { ev.preventDefault(); openArtifact(btn.dataset.art); };
+    btn.oncontextmenu = ev => { ev.preventDefault(); openArtMenu(btn.dataset.art, ev); };
+  });
+}
+
+/* 产物右键菜单：位置跟鼠标，贴边时翻到左边/上边 */
+let artMenuRef = '';
+function artMenuEl(){ return $('art-menu'); }
+function openArtMenu(ref, ev){
+  const menu = artMenuEl();
+  if(!menu) return;
+  artMenuRef = ref;
+  menu.hidden = false;
+  const pad = 8;
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  let x = ev.clientX, y = ev.clientY;
+  if(x + w + pad > window.innerWidth) x = Math.max(pad, window.innerWidth - w - pad);
+  if(y + h + pad > window.innerHeight) y = Math.max(pad, window.innerHeight - h - pad);
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  const first = menu.querySelector('.mi');
+  if(first) first.focus({preventScroll: true});
+}
+function closeArtMenu(){
+  const menu = artMenuEl();
+  if(menu) menu.hidden = true;
+  artMenuRef = '';
+}
+async function artAction(act){
+  const ref = artMenuRef;
+  closeArtMenu();
+  if(!ref) return;
+  if(act === 'preview'){ openArtifact(ref); return; }
+  if(act === 'copy'){
+    const data = await apiGet('/api/artifact?path=' + encodeURIComponent(ref));
+    const full = (data && data.path) || String(ref).replace(/^workspace:/, '');
+    try {
+      await navigator.clipboard.writeText(full);
+      toast('已复制路径：' + full);
+    } catch(e) {
+      window.prompt('复制这个路径：', full);
+    }
+    return;
+  }
+  const data = await apiPost('/api/artifact/' + act, {path: ref});
+  if(!data || data.ok === false) toast((data && data.error) || '操作失败');
+  else toast(act === 'reveal' ? '已在资源管理器中定位' : '已用默认程序打开');
+}
+if(artMenuEl()){
+  artMenuEl().addEventListener('click', ev => {
+    const btn = ev.target.closest && ev.target.closest('.mi');
+    if(btn) artAction(btn.dataset.act);
+  });
+}
+document.addEventListener('click', ev => {
+  const menu = artMenuEl();
+  if(menu && !menu.hidden && !(ev.target.closest && ev.target.closest('#art-menu'))) closeArtMenu();
+});
+document.addEventListener('keydown', ev => {
+  const menu = artMenuEl();
+  if(!menu || menu.hidden) return;
+  if(ev.key === 'Escape'){ ev.preventDefault(); ev.stopImmediatePropagation(); closeArtMenu(); }
+});
+window.addEventListener('resize', () => { if(artMenuEl() && !artMenuEl().hidden) closeArtMenu(); });
 
 $('new-chat').onclick = newSession;
 wsBtn.onclick = bindWorkspace;
@@ -5447,7 +5667,24 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/session/rename":
             self._post_session_rename(body)
             return
+        if parsed.path == "/api/artifact/open":
+            self._post_artifact_action(body, "open")
+            return
+        if parsed.path == "/api/artifact/reveal":
+            self._post_artifact_action(body, "reveal")
+            return
         self._json({"ok": False, "error": "接口不存在"}, 404)
+
+    # ---------- 产物：用默认程序打开 / 在资源管理器里定位 ----------
+    def _post_artifact_action(self, body: dict, action: str) -> None:
+        ref = str((body or {}).get("path") or "").strip()
+        target, error = _resolve_artifact(ref)
+        if target is None:
+            self._json({"ok": False, "error": error or "找不到这个文件"}, 404)
+            return
+        ok, message = _open_in_system(str(target), action)
+        self._json({"ok": ok, "error": "" if ok else message, "path": str(target)},
+                   200 if ok else 500)
 
     # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
     def _client_ip(self) -> str:

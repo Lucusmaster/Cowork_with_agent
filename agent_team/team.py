@@ -475,6 +475,28 @@ def changed_files(ws: Path) -> list[str]:
     return out
 
 
+def workspace_products(task: dict) -> list[dict]:
+    """这张卡在产物工作区里真正生成/改动的文件，按「是不是清单内」标好。
+
+    返回值 ``[{"path": 相对工作区, "ref": "workspace:<相对路径>", "in_scope": bool}]``：
+
+    - ``ref`` 是给网页用的引用格式（``room_web`` 认 ``workspace:`` 前缀），
+      聊天里那个蓝色文件名点开就是它；
+    - 账本目录（``room/`` ``tasks/`` ``.tmp/`` ``.codex-home/`` …）和缓存产物
+      （``__pycache__`` / ``*.pyc`` / ``*.log``）**不算产物**，``changed_files`` 已经滤掉了；
+    - 没写 scope 的卡一律算清单内（没声明就不限制，跟 ``scope_violations`` 一致）。
+    """
+    ws = task_workspace(task)
+    scope = [str(item).strip().replace("\\", "/").rstrip("/")
+             for item in (task.get("scope") or [])]
+    scope = [item for item in scope if item]
+    products: list[dict] = []
+    for name in changed_files(ws):
+        in_scope = (not scope) or any(name == item or name.startswith(item + "/") for item in scope)
+        products.append({"path": name, "ref": f"workspace:{name}", "in_scope": in_scope})
+    return products
+
+
 def scope_violations(task: dict, ws: Path) -> list[str]:
     """用真实 diff 核对 scope：没写 scope 就不限制，写了就必须落进去。"""
     scope = [str(item).strip().replace("\\", "/").rstrip("/") for item in (task.get("scope") or [])]
