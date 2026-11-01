@@ -96,6 +96,23 @@ def task_dir(tid: str) -> Path:
     return TASKS / tid
 
 
+def new_task_id(now: datetime | None = None) -> str:
+    """生成一个**不会覆盖已有卡**的任务 ID：`T-YYMMDD-HHMMSS`，同秒再加 `-2`、`-3`…
+
+    原来只到秒，同一秒里连建两张卡会直接覆盖前一张（`mkdir(exist_ok=True)` 不拦），
+    而 agent 一次对话里连着建两张卡并不罕见——静默丢卡，事后完全看不出来。
+    """
+    stamp = (now or datetime.now()).strftime("%y%m%d-%H%M%S")
+    base = f"T-{stamp}"
+    if not (TASKS / base).exists():
+        return base
+    for n in range(2, 1000):
+        candidate = f"{base}-{n}"
+        if not (TASKS / candidate).exists():
+            return candidate
+    return f"{base}-{datetime.now().strftime('%f')}"
+
+
 def load_task(tid: str) -> dict:
     path = task_dir(tid) / "task.json"
     if not path.is_file():
@@ -199,7 +216,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         if not workspace.is_dir():
             raise SystemExit(f"--workspace 必须是目录，现在指向的是文件：{workspace}")
     # 校验通过后才建目录：参数非法时不留空任务卡
-    tid = "T-" + datetime.now().strftime("%y%m%d-%H%M%S")
+    tid = new_task_id()
     tdir = task_dir(tid)
     tdir.mkdir(parents=True, exist_ok=True)
     task = {
@@ -343,8 +360,35 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"产物: {result['last'] or '（无）'}")
     if not result["ok"]:
         print(f"执行者未正常结束，看日志: {result['stderr']}")
+    report_scope_now(task, round_no)          # 越界当场说，别等验收
     print(f"下一步: 大脑审阅产物后跑验收 → python bin/team.py verify -t {tid}")
     return 0 if result["ok"] else 1
+
+
+def report_scope_now(task: dict, round_no: int) -> list[str]:
+    """执行完**立刻**核对 scope，越界文件当场列出来（不等验收）。
+
+    验收阶段还会再判一次 FAIL，但那是「已经烧掉一整轮之后」；这里早一步说出来，
+    大脑可以当轮就修，用户也立刻知道有东西跑到声明范围外了。
+    只报告不拦截：拦截由验收闸门负责，这里的作用是「快失败 + 留证据」。
+    """
+    tid = str(task.get("id") or "")
+    try:
+        violations = scope_violations(task, task_workspace(task))
+    except (Exception, SystemExit):  # noqa: BLE001 - 核对失败不该让派发失败
+        return []
+    if violations:
+        task["out_of_scope"] = violations
+        task["updated_at"] = now_iso()
+        save_task(task)
+        room_event(f"⚠ 第 {round_no} 轮有 {len(violations)} 个越界改动："
+                   + "、".join(violations[:5]) + ("…" if len(violations) > 5 else ""),
+                   tid, "dispatch", "bad", "codex")
+        print(f"⚠ 越界改动（不在任务卡 scope 内）：{', '.join(violations)}")
+    elif task.get("out_of_scope"):
+        task.pop("out_of_scope", None)        # 上一轮越界的文件被改回来了，标记跟着清掉
+        save_task(task)
+    return violations
 
 
 LEDGER_PREFIXES = ("tasks/", "room/", "docs/", ".codex-home/", ".tmp/", "config/", "agents/", "bin/")

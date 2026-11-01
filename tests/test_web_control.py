@@ -120,6 +120,7 @@ class WebCase(unittest.TestCase):
         self.store = FakeStore()
         self._saved = {
             "TOKEN": room_web.TOKEN, "TOKEN_FILE": room_web.TOKEN_FILE,
+            "CODE_FILE": room_web.CODE_FILE,
             "ROOM": room_web.ROOM, "TASKS": room_web.TASKS,
             "PROJECT_FILE": room_web.PROJECT_FILE, "TYPING_FILE": room_web.TYPING_FILE,
             "NUDGE_FILE": room_web.NUDGE_FILE, "SESSION_STATE": room_web.SESSION_STATE,
@@ -128,6 +129,7 @@ class WebCase(unittest.TestCase):
         }
         room_web.TOKEN = self.token
         room_web.TOKEN_FILE = self.tmp / "web-token"
+        room_web.CODE_FILE = self.tmp / "web-code"
         room_web.ROOM = self.tmp / "room"
         room_web.TASKS = self.tmp / "tasks"
         room_web.PROJECT_FILE = room_web.ROOM / "project.json"
@@ -705,12 +707,16 @@ class GapHealContractTests(WebCase):
 
 
 class CookieBootstrapTests(WebCase):
-    """?token= 只在 GET / 引导时用一次：302 到干净地址 + 种 Cookie。"""
+    """引导用**一次性码**：`/?k=<code>` 换 Cookie，用掉即作废；长期令牌不进 URL。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.code = room_web._ensure_code()
 
     def test_bootstrap_redirects_and_sets_cookie(self) -> None:
-        status, headers, body = self.raw(f"/?token={self.token}")
+        status, headers, body = self.raw(f"/?k={self.code}")
         self.assertEqual(status, 302)
-        self.assertEqual(headers.get("Location"), "/", "Location 必须是去掉 token 的干净地址")
+        self.assertEqual(headers.get("Location"), "/", "Location 必须是去掉引导码的干净地址")
         cookies = self.set_cookie_values(headers)
         self.assertEqual(len(cookies), 1, f"只该有一条 Set-Cookie，实际 {cookies}")
         cookie = cookies[0]
@@ -719,22 +725,46 @@ class CookieBootstrapTests(WebCase):
         self.assertIn("SameSite=Strict", cookie)
         self.assertIn("Path=/", cookie)
         self.assertIn("Max-Age=2592000", cookie)
-        self.assertNotIn(self.token, body)
+        self.assertNotIn(self.code, body)
         self.assertEqual(body, "")
 
     def test_bootstrap_keeps_other_query_params(self) -> None:
-        """其它查询参数要留下（比如 ?token=..&session=chat-a）。"""
-        status, headers, _ = self.raw(f"/?token={self.token}&session=chat-a")
+        """其它查询参数要留下（比如 ?k=..&session=chat-a）。"""
+        status, headers, _ = self.raw(f"/?k={self.code}&session=chat-a")
         self.assertEqual(status, 302)
         self.assertEqual(headers.get("Location"), "/?session=chat-a")
-        self.assertNotIn(self.token, headers.get("Location"))
+        self.assertNotIn(self.code, headers.get("Location"))
 
-    def test_bootstrap_wrong_token_is_401_without_cookie(self) -> None:
-        status, headers, body = self.raw("/?token=deadbeef")
+    def test_bootstrap_code_is_single_use(self) -> None:
+        """一次性码用过就作废：同一个链接再开一次必须 401，且不能种 Cookie。"""
+        status, _, _ = self.raw(f"/?k={self.code}")
+        self.assertEqual(status, 302)
+        status, headers, body = self.raw(f"/?k={self.code}")
+        self.assertEqual(status, 401, "用过的码还能用 = 这链接等于长期令牌")
+        self.assertEqual(self.set_cookie_values(headers), [])
+        self.assertIn("用过了", body)
+
+    def test_bootstrap_wrong_code_is_401_without_cookie(self) -> None:
+        status, headers, body = self.raw("/?k=deadbeef")
         self.assertEqual(status, 401)
-        self.assertEqual(self.set_cookie_values(headers), [], "令牌错了绝不能种 Cookie")
+        self.assertEqual(self.set_cookie_values(headers), [], "码错了绝不能种 Cookie")
         self.assertNotIn(self.token, body)
-        self.assertIn("令牌不对", body)
+
+    def test_long_lived_token_is_no_longer_accepted_in_url(self) -> None:
+        """长期令牌走 URL 会进历史和 Referer，所以 GET / 直接拒绝（只能粘到页面上）。"""
+        status, headers, body = self.raw(f"/?token={self.token}")
+        self.assertEqual(status, 401)
+        self.assertEqual(self.set_cookie_values(headers), [])
+        self.assertIn("一次性打开链接", body)
+        self.assertNotIn(self.token, body)
+
+    def test_code_rotates_after_use(self) -> None:
+        """用掉之后盘上的码必须是新的，旧链接才真的废了。"""
+        before = room_web._ensure_code()
+        self.raw(f"/?k={before}")
+        after = room_web._ensure_code()
+        self.assertNotEqual(before, after)
+        self.assertEqual(room_web.CODE_FILE.read_text(encoding="utf-8").strip(), after)
 
     def test_plain_root_serves_page_without_token(self) -> None:
         status, headers, body = self.raw("/")

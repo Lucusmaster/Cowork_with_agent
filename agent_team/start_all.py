@@ -35,13 +35,17 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def web_url(port: int) -> str:
-    """带令牌的网页地址：令牌在 room/web-token 里，没有就退回裸地址。"""
+    """带**一次性引导码**的网页地址（`/?k=...`）：用一次就作废并自动换新码。
+
+    长期令牌（room/web-token）不出现在任何 URL 里——链接会留在历史和 Referer 中。
+    拿不到码就退回裸地址，页面会要求粘贴令牌。
+    """
     try:
-        token = (ROOT / "room" / "web-token").read_text(encoding="utf-8").strip()
+        code = (ROOT / "room" / "web-code").read_text(encoding="utf-8").strip()
     except OSError:
-        token = ""
+        code = ""
     base = f"http://127.0.0.1:{port}/"
-    return f"{base}?token={token}" if token else base
+    return f"{base}?k={code}" if code else base
 
 
 def port_busy(port: int, host: str = "127.0.0.1") -> bool:
@@ -184,7 +188,7 @@ def start(port: int) -> int:
         if LOCK.exists():
             LOCK.unlink(missing_ok=True)
         new_pid = spawn([*WORKER, "--interval", "0.5"])
-        print(f"引擎已启动 (pid {new_pid})：发任务后 3 秒内自动开工")
+        print(f"引擎已启动 (pid {new_pid})：发任务后约 1 秒内自动开工")
     print()
     print("打开上面的地址（链接只能用一次，打开后浏览器会记住；别外传），中间输入框发任务即可。")
     return 0

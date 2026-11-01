@@ -61,6 +61,7 @@ TYPING_FILE = ROOM / "typing.json"
 NUDGE_FILE = ROOM / "nudge"
 SESSION_STATE = ROOM / "session_state.json"
 TOKEN_FILE = ROOM / "web-token"          # 网页访问令牌；main() 启动时读/生成
+CODE_FILE = ROOM / "web-code"            # 一次性引导码：/?k= 换 Cookie，用掉就换新的
 MAX_ARTIFACT = 200 * 1024
 CONTROL_ACTIONS = ("pause", "resume", "stop", "approve", "rerun")
 
@@ -853,6 +854,45 @@ def _ensure_token() -> str:
     except OSError:
         pass                                    # 写不进去也别拦着启动，内存里照样有令牌
     return token
+
+
+def _rotate_code() -> str:
+    """换一个新的引导码并落盘，返回它（写不进去也照样返回内存里的这个）。"""
+    code = secrets.token_hex(16)
+    try:
+        CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CODE_FILE.write_text(code, encoding="utf-8")
+        try:
+            os.chmod(CODE_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    return code
+
+
+def _ensure_code() -> str:
+    """一次性引导码：`/?k=<code>` 换 HttpOnly Cookie，**用掉立刻作废并换新码**。
+
+    为什么不让令牌直接进 URL：链接会留在浏览器历史、被 Referer 带出去、也能被本机
+    随便一个进程读命令行。所以对外只发一次性码——被人捡到也只能用一次，用完就换。
+    """
+    try:
+        existing = CODE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if len(existing) >= 16:
+        return existing
+    return _rotate_code()
+
+
+def _code_matches(supplied: str) -> bool:
+    """引导码比较：长度先挡一道，再常量时间比，避免按字符计时的探测。"""
+    code = _ensure_code()
+    supplied = str(supplied or "").strip()
+    if not supplied or len(supplied) != len(code):
+        return False
+    return secrets.compare_digest(supplied, code)
 
 
 _ENGINE_IDLE = {"pid": 0, "beat": 0.0, "age": -1.0, "alive": False,
@@ -5453,7 +5493,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if "token" in qs:
             self._json({"ok": False,
-                        "error": "令牌不能放在 URL 里：只在首次打开时用 ?token= 引导，之后靠 Cookie"}, 401)
+                        "error": "令牌不能放在 URL 里：只在首次打开时用一次性的 ?k= 引导，之后靠 Cookie"}, 401)
             return False
         if parsed.path == "/api/alive":
             return True
@@ -5523,16 +5563,23 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         if parsed.path in ("/", "/index.html"):
-            # ?token= 只在这里用一次：对了就 302 到去掉 token 的同一路径 + 种 Cookie
-            if "token" in qs:
-                supplied = str((qs.get("token") or [""])[0]).strip()
-                if self._token_matches(supplied):
-                    rest = {k: v for k, v in qs.items() if k != "token"}
+            # 引导只认一次性码 ?k=：对了就 302 到干净地址 + 种 Cookie，并且立刻换码作废
+            if "k" in qs:
+                supplied = str((qs.get("k") or [""])[0]).strip()
+                if _code_matches(supplied):
+                    _rotate_code()               # 用掉即作废：旧链接再点一次就没用了
+                    rest = {k: v for k, v in qs.items() if k != "k"}
                     clean = urlencode(rest, doseq=True)
                     self._redirect(parsed.path + (("?" + clean) if clean else ""))
                     return
-                self._send(401, self._page_html("令牌不对，重新粘贴一次"),
+                self._send(401, self._page_html("这个打开链接已经用过了（一次性），重新拿一个"),
                            "text/html; charset=utf-8")
+                return
+            if "token" in qs:
+                # 长期令牌不再接受走 URL：历史/Referer 里留一份就等于长期泄露
+                self._send(401, self._page_html(
+                    "链接里带的是长期令牌，已经不再支持了：用「一次性打开链接」，"
+                    "或者把 room/web-token 的内容粘到下面的输入框里"), "text/html; charset=utf-8")
                 return
             self._send(200, self._page_html(), "text/html; charset=utf-8")
             return
@@ -5989,7 +6036,7 @@ def main() -> int:
         threading.Thread(target=_guardian, args=(args.idle_seconds, args.grace_seconds),
                          daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"协作台: http://{args.host}:{args.port}/?token={TOKEN}", flush=True)
+    print(f"协作台: http://{args.host}:{args.port}/?k={_ensure_code()}", flush=True)
     print(f"（{token_note}；令牌也可以从 room/web-token 粘贴到页面里）", flush=True)
     if STORE.ready:
         print("会话存储：session.py 就绪", flush=True)

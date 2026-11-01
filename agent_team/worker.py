@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""常驻工作流引擎：3 秒轮询群聊，发现新任务就自动跑完整流水线。
+"""常驻工作流引擎：每 0.5 秒轮询群聊（`--interval` 可调），发现新任务就自动跑完整流水线。
 
 流水线：规划（Codex 当参谋出任务卡）→ 派发（Codex 执行）→ 验收（本地命令）
         → 复核（Codex 只读审查）→ 报告 → 回帖
 
-  python bin/worker.py [--interval 3] [--max-rounds 2] [--once]
+  python bin/worker.py [--interval 0.5] [--max-rounds 2] [--once]
+
+（旧版本这里写的是「3 秒轮询 / --interval 3」，那是很早以前的行为；默认早就改成
+ 0.5 秒了。留个说明是因为外部审核照这行注释误判过延迟。）
 
 设计约束：
   - 只处理 from=user 的 task/msg，认领即 ack，避免和大脑心跳重复执行；
@@ -1283,7 +1286,7 @@ def main() -> int:
             log(f"补记了 {len(repaired)} 个任务的终态：{'、'.join(repaired)}")
     except Exception as exc:  # noqa: BLE001
         log(f"终态补记失败（不影响主流程）：{type(exc).__name__}: {exc}")
-    event("工作流引擎已上线：发任务后 3 秒内自动开工", "worker", "ok", "deepseek")
+    event("工作流引擎已上线：发任务后约 1 秒内自动开工", "worker", "ok", "deepseek")
 
     while True:
         try:
