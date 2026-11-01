@@ -870,6 +870,9 @@ BRAIN_PROMPT = """你是这个协作群的"大脑"，名字叫 DeepSeek。群里
 ## 当前项目设置
 {project}
 
+## 工作区现状（顶层）
+{facts}
+
 ## 用户刚说的话
 {request}
 
@@ -903,11 +906,12 @@ BRAIN_PROMPT = """你是这个协作群的"大脑"，名字叫 DeepSeek。群里
 
 def brain_decide(request: str, workspace: Path | None = None) -> dict | None:
     project = load_project()
+    ws = str(workspace or project.get("workspace") or ROOT)
     prompt = (BRAIN_PROMPT
               .replace("{thread}", thread_text() or "（还没有对话）")
               .replace("{project}", json.dumps(project, ensure_ascii=False) if project else "（还没设置）")
+              .replace("{facts}", analysis.workspace_facts(Path(ws)))
               .replace("{request}", request))
-    ws = str(workspace or project.get("workspace") or ROOT)
     out = ROOM / "planner"
     out.mkdir(parents=True, exist_ok=True)
     result = run_codex(prompt, workspace=ws, out_prefix=str(out / f"brain-{int(time.time())}"),

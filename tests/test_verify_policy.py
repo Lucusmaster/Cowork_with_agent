@@ -27,6 +27,10 @@ class PromptTests(unittest.TestCase):
             self.assertNotIn("优先 `python -m unittest", text, name)
             self.assertIn("python -c", text, name)
 
+    def test_brain_and_planner_see_the_workspace_facts(self) -> None:
+        self.assertIn("{facts}", worker.BRAIN_PROMPT)
+        self.assertIn("{facts}", worker.PLANNER_PROMPT)
+
     def test_facts_describe_an_empty_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             facts = analysis.workspace_facts(Path(tmp))
