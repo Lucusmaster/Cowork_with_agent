@@ -134,7 +134,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="看服务与任务状态")
     sub.add_parser("doctor", help="体检：环境、端口、配置")
-    sub.add_parser("reset", help="清空 room/ 与 tasks/（要 --yes）")
+    p = sub.add_parser("reset", help="清空 room/ 与 tasks/（要 --yes）")
+    p.add_argument("--yes", action="store_true", help="确实要删")
+    p.add_argument("--port", type=int, default=8899)
 
     p = sub.add_parser("task", help="命令行交一条任务（自动启停）")
     p.add_argument("--text", required=True)
@@ -168,6 +170,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tool", default="", help="action=call 时指定工具")
     p.add_argument("--args", default="{}", help="action=call 时的 JSON 参数")
 
+    p = sub.add_parser("install-skills",
+                       help="把使用说明（skill）装到 DSH / Codex / Claude Code 的 skills 目录")
+    p.add_argument("--targets", default="", help="逗号分隔：dsh,codex,claude（默认全装）")
+    p.add_argument("--force", action="store_true", help="已有文件直接覆盖，不备份")
+    p.add_argument("--dry-run", action="store_true", help="只说会做什么，不动文件")
+    p.add_argument("--mcp", action="store_true", help="只打印 MCP 配置片段")
+
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not args.command:
         parser.print_help()
@@ -183,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return _run("doctor", [])
     if args.command == "reset":
-        return _run("reset_ledger", [])
+        return _run("reset_ledger", ["--yes"] if args.yes else [])
     if args.command == "task":
         return _run("run_task", ["--text", args.text, "--port", str(args.port)])
     if args.command == "say":
@@ -199,6 +208,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         return _run("mcp_server", ["--action", args.action, "--tool", args.tool,
                                    "--args", args.args])
+    if args.command == "install-skills":
+        from . import skills_install
+
+        argv_skills: list[str] = []
+        if args.targets:
+            argv_skills += ["--targets", args.targets]
+        if args.force:
+            argv_skills.append("--force")
+        if args.dry_run:
+            argv_skills.append("--dry-run")
+        if args.mcp:
+            argv_skills.append("--mcp")
+        return skills_install.main(argv_skills)
 
     parser.print_help()
     return 2

@@ -255,6 +255,18 @@ agent-team mcp --action list                                     # 看有什么�
 
 工具清单与各家客户端配置见 [docs/MCP.md](docs/MCP.md)。
 
+## 让别的 Agent 学会用它（skill）
+
+光有接口不够——别人家的 agent 得知道"什么时候该用它、怎么用、哪些坑"。正本在
+`skills/agent-team-collab/SKILL.md`，一条命令装到本机各家 agent 的加载位置：
+
+```bash
+agent-team install-skills          # DSH / Codex CLI / Claude Code（已有会先备份）
+agent-team install-skills --mcp    # 没有 skill 机制的客户端：打印 MCP 配置
+```
+
+这份 skill 有测试兜底：里面提到的每条命令都会和真实 CLI 比对，写错/写旧了会直接挂测试。
+
 ## 桌面启动（Windows）
 
 双击桌面的 **agent-team** 图标就能用，不用记命令：

@@ -1,3 +1,46 @@
+## 0.9.17 — 把「怎么用协作台」做成可分发的 skill（一份正本，装到各家 agent）
+
+协作台是**项目**，但用它的 agent 各有各的加载方式：DSH 读 `~/.dsh/skills/<名>/SKILL.md`，
+Codex CLI 读 `~/.codex/skills/<名>/SKILL.md`，Claude Code 读 `~/.claude/skills/<名>/SKILL.md`
+（三处格式相同：YAML frontmatter + 正文）。
+
+所以正本只放一份在仓库里（`skills/agent-team-collab/SKILL.md`），跟着版本走：
+
+```bash
+agent-team install-skills            # 装到 DSH / Codex / Claude Code 三处（已有会先备份）
+agent-team install-skills --dry-run  # 只看会做什么
+agent-team install-skills --mcp      # 没有 skill 机制的客户端（豆包等）拿 MCP 配置
+```
+
+### 安装器不粗暴
+
+- 内容一致 → 跳过（幂等，可以塞进部署脚本）；
+- 内容不同 → 先存 `SKILL.md.bak-<时间>` 再写，`--force` 才不备份；
+- 目标不认识（比如 `--targets cursor`）→ 直接拒绝，不猜路径。
+
+### 顺带治了"文档漂移"这个病
+
+旧版 skill 里写着 `python bin/room.py post --as user ...`，而 `bin/room.py` **早就不存在**——
+照着做的 agent 第一条命令就失败。所以 `tests/test_skills.py` 会把 skill 里提到的
+**每条命令、每个模块、每个 `bin/` 脚本**都拿去和真实 CLI/文件比对：
+
+- `agent-team <子命令>` 必须在 `--help` 里存在；
+- `python -m agent_team.<模块>` 必须有这个文件；
+- `bin/<脚本>` 必须存在；
+- 明确禁止再出现 `bin/room.py`、`bin/start_all.py --status` 这类已删除的写法。
+
+另外钉住三个必须写清楚的坑：必须用 `?k=` 一次性链接（裸地址只是解锁页）、
+90 秒静默会收工且后台标签页节流会误判、MCP 的调用方身份只在 `meta.client` 而不在任务卡里。
+
+### 顺带修的小东西
+
+`agent-team reset` 之前把 `--yes` 吞掉了（在无终端的会话里会卡在交互提示），现在能透传。
+
+### 验证
+
+18 项新测试（frontmatter、命令漂移、三个目标布局、幂等、备份不丢手改、`--force`、dry-run 不动盘、
+未知目标拒绝、MCP 片段是真 JSON 且 cwd 不被转义成四重斜杠）。
+
 ## 0.9.16 — MCP 工具：让 Claude Code / Codex / 豆包 直接指挥协作台
 
 5 个工具，标准 stdio JSON-RPC，纯标准库：
