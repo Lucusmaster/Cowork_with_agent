@@ -231,7 +231,8 @@ class ReadmeTests(unittest.TestCase):
         self.readme = (REPO / "README.md").read_text(encoding="utf-8")
 
     def test_readme_tells_downloaders_to_install_the_skill(self) -> None:
-        self.assertIn("刚下载下来", self.readme, "README 第一屏要有下载后的上手步骤")
+        # 标题从「刚下载下来」改成了「刚从 GitHub 下载下来」，这里只认语义不认措辞。
+        self.assertIn("下载下来", self.readme, "README 第一屏要有下载后的上手步骤")
         self.assertIn("install-skills", self.readme)
         self.assertIn("skills/agent-team-collab/SKILL.md", self.readme, "要指出正本在哪")
         self.assertIn("--mcp", self.readme, "没有 skill 机制的客户端要有出路")

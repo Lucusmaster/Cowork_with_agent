@@ -47,7 +47,8 @@ passed/failed ──report──▶ report.md ──▶ finished_at（真正的�
 一个任务卡必须能回答"怎么才算做完"，否则大脑不许建卡：
 
 - `acceptance`：可判真假的标准（不是"优化一下"）；
-- `verify`：可直接执行的命令（默认 `python -m unittest discover -s tests -t . -v`）；
+- `verify`：可直接执行的命令，按任务产出选型：代码/测试用 `python -m unittest ...` 或 `python -m pytest ...`，
+  静态 HTML/文档/配置用 `python -c "..."` 直接检查产物（存在、能解析、含关键内容），不要假设有 `tests/`；
 - 判分只看证据：验收命令退出码、输出原文、`git diff`——不看执行者自己的说法。
 
 ## 守卫

@@ -30,11 +30,41 @@ VERIFY_PROMPT = """你在一个多 Agent 协作群里担任验收者。现在还
 
 需求：{request}
 工作区：{ws}
+工作区现状（顶层）：{facts}
 
 请直接用中文回答，不要动任何文件，控制在 10 行以内：
-1) 一条可以直接执行的验收命令（优先 `python -m unittest discover -s tests -t . -v`）
+1) 一条可以直接在这个工作区里执行的验收命令，用来检查「这次任务的产出」（退出码说话）：
+   - 产出是代码、或者工作区本来就有测试：用 `python -m unittest discover -s tests -t . -v`（或 `python -m pytest`）；
+   - 产出是 HTML / 文档 / 配置 / 脚本这类文件：用能直接检查产物的命令，例如
+     `python -c "..."` 断言文件存在、能解析、含关键内容——不要假设工作区里有 tests/ 目录；
+   - 命令里引用的路径必须现在就有，或者是任务允许新建的；用户明确说"不需要测试"时不要造测试目录；
 2) 3~5 条必须断言到的行为（可判真假，不写"代码质量良好"这种空话）
 """
+
+
+def workspace_facts(ws: Path) -> str:
+    """给验收者/规划者看的现场：顶层有什么、有没有 tests/。
+
+    之前只把路径丢给模型，它在空目录/非 Python 项目里也会照"优先 unittest"的提示
+    编出 `discover -s tests`，验收命令根本跑不起来。
+    """
+    try:
+        entries = sorted(ws.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        return "（读不到这个目录）"
+    names = [p.name + ("/" if p.is_dir() else "") for p in entries[:12]]
+    more = f" 等 {len(entries)} 项" if len(entries) > 12 else ""
+    bits: list[str] = []
+    if (ws / ".git").exists():
+        bits.append("是 git 仓库")
+    if (ws / "tests").is_dir():
+        bits.append("已有 tests/")
+    py = sum(1 for p in entries if p.suffix == ".py")
+    if py:
+        bits.append(f"顶层 {py} 个 .py")
+    if not bits:
+        bits.append("没有测试目录")
+    return f"{'、'.join(names) if names else '空目录'}{more}（{'；'.join(bits)}）"
 
 BOTH = {"risk": RISK_PROMPT, "verify": VERIFY_PROMPT}
 
@@ -76,7 +106,9 @@ def analyze(request: str, workspace: Path, out_dir: Path, *,
     started = time.time()
     jobs = {
         "risk": (RISK_PROMPT.format(request=request, ws=workspace), risk_model, risk_effort),
-        "verify": (VERIFY_PROMPT.format(request=request, ws=workspace), verify_model, verify_effort),
+        "verify": (VERIFY_PROMPT.format(request=request, ws=workspace,
+                                        facts=workspace_facts(workspace)),
+                   verify_model, verify_effort),
     }
     results: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="analysis") as pool:

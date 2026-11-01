@@ -57,8 +57,11 @@ SAFE_VERIFY_PREFIXES = (
     "python -m unittest",
     "python -m pytest",
     "python -m py_compile",
+    "python -m json.tool",
+    "python -c",
     "python tools/",
     "node --test",
+    "node --check",
     "npm test",
     "npx tsc",
     "npm run typecheck",
@@ -72,6 +75,7 @@ PLANNER_PROMPT = """你是一个任务规划助手。根据用户这条需求，
 {request}
 
 工作区根目录：{workspace}
+工作区现状（顶层）：{facts}
 
 JSON 结构（所有字段必填）：
 {
@@ -84,8 +88,10 @@ JSON 结构（所有字段必填）：
 
 规则：
 - acceptance 每条都必须能用命令或代码检查判断真假，不要写"代码优雅"这种话。
-- verify 必须能在工作区根目录直接执行，优先用 `python -m unittest discover -s tests -t . -v`；
-  如果需求是纯文档改动且没有测试，用 `python -m py_compile <文件>` 之类的只读检查。
+- verify 必须能在工作区根目录直接执行，并且检查的是这次任务的产出：
+  代码/测试类任务用 `python -m unittest ...` 或 `python -m pytest ...`；
+  HTML、文档、配置这类产出用 `python -c "..."` 之类的命令直接检查文件（存在、能解析、含关键内容）；
+  不要假设有 tests/ 目录，用户明确说"不需要测试"时更不要造测试。
 - scope 只写相对路径，禁止绝对路径，禁止写 tasks/。
 - 只输出 JSON。"""
 
@@ -114,7 +120,7 @@ JSON 结构（正常情况，所有字段必填）：
 
 只输出 JSON。"""
 
-BANNED_VERIFY = ("rm ", "del ", "rd ", "format ", "shutdown", "reg delete", ">", "&&", "||")
+BANNED_VERIFY = ("rm ", "del ", "rd ", "format ", "shutdown", "reg delete", "&&", "||")
 
 
 def log(text: str) -> None:
@@ -333,7 +339,9 @@ def _planner_model() -> tuple[str, str]:
 
 
 def plan_with_codex(request: str, workspace: Path) -> dict | None:
-    prompt = PLANNER_PROMPT.replace("{request}", request).replace("{workspace}", str(workspace))
+    prompt = (PLANNER_PROMPT.replace("{request}", request)
+              .replace("{workspace}", str(workspace))
+              .replace("{facts}", analysis.workspace_facts(workspace)))
     out = ROOM / "planner"
     out.mkdir(parents=True, exist_ok=True)
     prefix = out / f"plan-{int(time.time())}"
@@ -885,7 +893,7 @@ BRAIN_PROMPT = """你是这个协作群的"大脑"，名字叫 DeepSeek。群里
 - say 永远是必填的：用户看得到这句话。要具体，不要"好的我明白了"这种空话。
 - 需求模糊但有项目上下文：按最合理的理解动手，并在 say 里一句话说明你的假设，别追问一堆。
 - 连项目都还没定：action="chat"，直接问一句"工作区是哪个目录"。
-- action="run" 时 task 必须有可判真假的 acceptance 和能直接执行的 verify（优先 `python -m unittest discover -s tests -t . -v`）。
+- action="run" 时 task 必须有可判真假的 acceptance 和能直接执行的 verify：代码/测试类任务用 `python -m unittest ...`；HTML/文档/配置这类产出用 `python -c "..."` 直接检查文件；不要假设有 tests/ 目录，用户说"不需要测试"时不要造测试。
 - 别把一整周的工作塞进一次 task；一次做能扎实做完的一小块。
 - 用户一句话里说了两件或以上的独立改动（出现"另外/再加/顺便/两件事/分开做/分别/都加上"等），**必须**用 tasks 数组，一件事一张卡，绝不合并成一张卡；只做一件事时用 task 单对象。
 - tasks 里每个任务各自写清 acceptance / verify / scope，不要共用一套。

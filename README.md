@@ -444,8 +444,9 @@ python bin\room.py tail -n 20
 | 两轮仍不过 | 停下，在群里说清卡在哪，等你拍板 |
 | 需求太短（"继续""好"） | 不猜，反问你要改哪个文件、达到什么效果 |
 
-安全阀：验收命令走白名单（只允许 unittest/pytest/py_compile/node --test/npm test 这类），
-含 `rm`、`del`、`>`、`&&` 的一律丢弃；单实例锁防重复执行；全程写 `room/worker.log`。
+安全阀：验收命令走白名单（unittest/pytest/py_compile/json.tool、`python -c "..."`、node --test/npm test 这类），
+含 `rm`、`del`、`&&` 的一律丢弃，引号外的 shell 元字符（`|` `;` `>` 等）也拒绝——
+命令不经过 shell，引号里的 `;` 是 `python -c` 的参数，不拦；单实例锁防重复执行；全程写 `room/worker.log`。
 
 ## 现在是谁在干
 

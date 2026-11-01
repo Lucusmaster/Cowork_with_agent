@@ -7,6 +7,7 @@
 
 用法:
   python bin/team.py new --title "..." --goal "..." --acceptance "..." --verify "python -m unittest ..." --scope tools/ tests/
+  （verify 按任务产出写：代码用 unittest/pytest，静态文件用 `python -c "..."` 直接检查产物）
   python bin/team.py dispatch -t T-260101-120000
   python bin/team.py verify   -t T-260101-120000
   python bin/team.py status
@@ -18,7 +19,6 @@ import argparse
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -497,13 +497,67 @@ def collab_stray_changes(baseline: dict[str, str] | None = None,
     return stray
 
 
+def _unquoted_metachar(command: str) -> str:
+    """引号外的第一个 shell 元字符；引号里的 `;` 是 `python -c "..."` 的参数，不算。"""
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "|&;<>$`\n":
+            return ch
+        i += 1
+    return ""
+
+
+def _split_argv(command: str) -> list[str]:
+    """按引号切参数：去掉成对的引号，保留反斜杠（Windows 路径要原样传下去）。"""
+    parts: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(command) and command[i + 1] in '"\\':
+                i += 1
+                cur.append(command[i])
+            elif ch == quote:
+                quote = ""
+            else:
+                cur.append(ch)
+        elif ch in "\"'":
+            quote = ch
+        elif ch.isspace():
+            if cur:
+                parts.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    if quote:
+        raise SystemExit("验收命令的引号没有闭合")
+    if cur:
+        parts.append("".join(cur))
+    return parts
+
+
 def parse_verify_argv(command: "str | list") -> list[str]:
     """把验收命令变成 argv 列表，绝不交给 shell。
 
     支持三种写法：
       - 已有列表（结构化）：直接逐项传参；
       - JSON 数组字符串：`'["python", "-m", "unittest"]'`；
-      - 普通命令行：用 shlex 切分，但**拒绝**任何 shell 元字符，防止注入。
+      - 普通命令行：按引号切分，只拒绝**引号外**的 shell 元字符。引号里的
+        `;`、`(`、`>` 都是参数本身（`python -c "import sys; ..."` 要靠它），
+        不进 shell 就不会被解释，拦掉了反而让 HTML/文档类任务没法写验收命令。
     """
     if isinstance(command, (list, tuple)):
         argv = [str(part) for part in command]
@@ -521,14 +575,14 @@ def parse_verify_argv(command: "str | list") -> list[str]:
         if not isinstance(data, list) or not data:
             raise SystemExit("验收命令的 JSON 必须是非空数组，例如 [\"python\",\"-m\",\"unittest\"]")
         return [str(part) for part in data]
-    forbidden = sorted({ch for ch in text if ch in "|&;<>$`\n"})
-    if forbidden:
+    bad = _unquoted_metachar(text)
+    if bad:
         raise SystemExit(
-            "验收命令里出现了 shell 元字符 " + " ".join(forbidden)
+            "验收命令里出现了引号外的 shell 元字符 " + bad
             + "，本工具不通过 shell 执行。请改成结构化写法，例如：\n"
             '  --verify-json \'["python", "-m", "unittest", "discover", "-s", "tests", "-t", "."]\'\n'
-            "或者用不带管道/重定向的普通命令。")
-    return shlex.split(text, posix=(os.name != "nt"))
+            "或者把要传给程序的符号放进引号里（如 `python -c \"import sys; ...\"`）。")
+    return _split_argv(text)
 
 
 # 构建/缓存产物不算越界改动：它们不是人写的代码，也不该拖累验收
