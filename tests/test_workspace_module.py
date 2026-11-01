@@ -74,10 +74,10 @@ class ValidateTests(unittest.TestCase):
         self.assertIsNone(found)
         self.assertIn("必须是目录", why)
 
-    def test_non_git_rejected(self) -> None:
+    def test_non_git_directory_is_allowed(self) -> None:
         found, why = workspace.validate(str(self.bare))
-        self.assertIsNone(found)
-        self.assertIn("git", why)
+        self.assertEqual(found, self.bare.resolve())
+        self.assertEqual(why, "")
 
     def test_ledger_itself_rejected(self) -> None:
         found, why = workspace.validate(str(ROOT))

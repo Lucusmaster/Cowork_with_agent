@@ -27,8 +27,8 @@ every agent's output lands in the same message log, so each one sees what the ot
 - **Group chat, not a task form.** Say what you want in plain language — vague is fine. The brain reads
   the thread plus the bound project, replies, and decides: chat, bind project, run a task, or continue
   the previous stage.
-- **Workspace binding.** "The workspace is `E:\my-project`" — it walks up to the nearest `.git` root,
-  refuses ambiguous or missing paths instead of guessing.
+- **Workspace binding.** "The workspace is `E:\my-project`" — it walks up to the nearest `.git` root when one exists,
+  and also accepts any existing writable folder for a new project.
 - **Evidence-only acceptance.** A card must declare falsifiable criteria and a runnable verification
   command; exit codes, raw output and `git diff` decide — not the executor's own claim.
 - **Independent review.** A different, read-only model inspects the diff for fake passes and

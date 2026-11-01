@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_team import launcher
+from agent_team import cli, launcher
 
 REPO = Path(__file__).resolve().parent.parent
 BAT = REPO / "bin" / "agent-team-launcher.bat"
@@ -454,13 +454,15 @@ class InstallDesktopTests(unittest.TestCase):
         self.assertIn("--desktop", proc.stdout)
         self.assertIn("--app", proc.stdout)
 
-    def test_refuses_non_git_directory(self) -> None:
+    def test_accepts_non_git_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            proc = subprocess.run(
-                [sys.executable, "-m", "agent_team.cli", "install-desktop", "--workspace", tmp],
-                capture_output=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
-            self.assertEqual(proc.returncode, 1)
-            self.assertIn("git", proc.stdout)
+            with mock.patch.object(cli.sys, "platform", "win32"):
+                with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+                    code = cli._install_desktop(tmp, False, desktop=tmp)
+            self.assertEqual(code, 0)
+            command = run.call_args.args[0]
+            self.assertIn("-ProjectPath", command)
+            self.assertIn(tmp, command)
 
 
 if __name__ == "__main__":

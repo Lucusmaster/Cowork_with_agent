@@ -258,9 +258,8 @@ def _fallback_validate(raw: str) -> tuple[Path | None, str]:
     if _ledger_inside(path):
         return None, "不能把协作台自己的目录当工作区，换一个仓库路径"
     top = _git_toplevel(path)
-    if not top:
-        return None, "不是 git 仓库（目录里找不到 .git），请先 git init 或换一个仓库路径"
-    return Path(top), ""
+    # Git 只是提供分支、diff 和产物摘要；没有 Git 也可以把任意可写目录作为新项目。
+    return (Path(top) if top else path), ""
 
 
 def _validate_workspace(raw: str) -> tuple[Path | None, str]:
@@ -4332,7 +4331,7 @@ function renderWorkspace(){
   if(cta){
     cta.innerHTML = ws ? '' :
       '<button class="cta-btn" id="welcome-pick">选择工作区</button>'
-      + '<span class="cta-hint">可以浏览目录、先看「是不是 git 仓库 · 多少文件 · 能不能写」再确认</span>';
+      + '<span class="cta-hint">可以浏览目录、先看「Git 状态 · 多少文件 · 能不能写」再确认</span>';
     const wb = $('welcome-pick');
     if(wb) wb.onclick = () => openPicker();
   }
@@ -4838,7 +4837,7 @@ function renderDrives(path){
   });
 }
 
-/* 体检行：✔ git 仓库 main · 8 个文件 · 可写 / ✘ 目录不存在 */
+/* 体检行：✔ git 仓库 main · 8 个文件 · 可写 / 普通文件夹 · 目录不存在 */
 function renderPickFoot(message){
   if(!pickHealthEl) return;
   pickPathEl.textContent = pick.selPath || '还没选目录';
@@ -4855,8 +4854,7 @@ function renderPickFoot(message){
     if(sel.is_git){
       bits.push('✔ git 仓库' + (sel.git_branch ? ' ' + sel.git_branch : ''));
     } else {
-      bits.push('✘ 不是 git 仓库');
-      reasons.push('不是 git 仓库：先在这个目录 git init，或换一个仓库');
+      bits.push('普通文件夹（无 git）');
     }
     bits.push((sel.file_count || 0) + ' 个文件');
     bits.push(sel.writable ? '可写' : '不可写');
@@ -4872,9 +4870,9 @@ function renderPickFoot(message){
   }
   pickHealthEl.className = cls;
   pickHealthEl.textContent = text;
-  const can = !!(sel && sel.exists && sel.is_git && sel.writable && !sel.blocked) && !message;
+  const can = !!(sel && sel.exists && sel.writable && !sel.blocked) && !message;
   pickOk.disabled = !can;
-  pickOk.title = can ? '绑定这个目录作为工作区' : (reasons.join('；') || '先选一个可用的仓库目录');
+  pickOk.title = can ? '绑定这个目录作为工作区' : (reasons.join('；') || '先选一个可用的目录');
 }
 
 function paintRowPick(){

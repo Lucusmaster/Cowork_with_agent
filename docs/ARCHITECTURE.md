@@ -54,7 +54,7 @@ passed/failed ──report──▶ report.md ──▶ finished_at（真正的�
 
 | 守卫 | 防的事 |
 | --- | --- |
-| 工作区绑定 `detect_workspace` | 任务卡绑错目录，产物写进账本仓库；无路径/多路径/路径不存在一律拒绝并追问 |
+| 工作区绑定 `detect_workspace` | 任务卡绑错目录，产物写进账本仓库；无路径/多路径/路径不存在一律拒绝并追问；普通无 Git 文件夹也允许作为新项目 |
 | `ledger_baseline` | 执行时把账本（本仓库）改脏；验收只报新增/变更 |
 | `workspace_baseline` + `baseline.diff` | 复核把"任务开始前就有的脏改动"算到本轮头上，误判越界 |
 | `quiet_flags`（CREATE_NO_WINDOW） | 后台每次调 codex/git/python 闪一个黑框 |

@@ -51,9 +51,9 @@ def _install_desktop(workspace: str, force: bool, desktop: str = "", app: bool =
 
     root = _repo_root()
     target_ws = Path(workspace).resolve() if workspace else root
-    if not (target_ws / ".git").exists():
-        print(f"❌ 不是 git 仓库（没有 .git）：{target_ws}")
-        print("   协作台要在一个 git 项目里跑，先 cd 到项目根目录，或加 --workspace <路径>")
+    if not target_ws.is_dir():
+        print(f"❌ 工作区目录不存在：{target_ws}")
+        print("   先创建目录，或加 --workspace <路径>")
         return 1
 
     launcher = root / "bin" / "agent-team-launcher.bat"

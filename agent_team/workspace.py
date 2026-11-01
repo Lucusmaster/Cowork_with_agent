@@ -4,7 +4,7 @@
 协作台踩过最疼的坑是「绑错工作区」：任务卡绑到协作台自己的仓库，
 跑完才发现代码进了账本、项目里啥也没改。所以这里一律严格：
 
-- 必须存在、必须是目录、必须能上浮到最近的 ``.git`` 根；
+- 必须存在、必须是目录；如果能找到最近的 ``.git`` 根就使用仓库根，否则直接使用所选目录；
 - 不许把协作台自己的目录（含子目录）当工作区；
 - 工作区内的相对路径做越界检查（``resolve()`` 后比前缀，防 ``..`` 与符号链接）；
 - 任务卡 ID 只允许 ``T-\\d{6}-\\d{6}``。
@@ -97,7 +97,8 @@ def validate(raw: str) -> tuple[Path | None, str]:
 
     git_root = _git_root(resolved)
     if git_root is None:
-        return None, f"不是 git 仓库（从 {resolved} 往上找不到 .git）：{text}"
+        # Git 是增强能力，不是开始工作的前提。没有 Git 时仍允许在这个目录里创建项目。
+        return resolved, ""
     try:
         git_root = git_root.resolve()
     except OSError as exc:
