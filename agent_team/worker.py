@@ -1256,6 +1256,15 @@ def _env_hint(tid: str, round_no: int) -> str:
         return ""
 
 
+def _env_gate(tid: str, round_no: int, code: int) -> str:
+    """这轮该不该按"端点不通"停手？只有真的没跑成才看便签。
+
+    跑成了（哪怕中途降级过）说明文件已经改完，便签是上一个型号留下的噪声，
+    照它停手会误杀一张其实已经干完的卡。
+    """
+    return _env_hint(tid, round_no) if code != 0 else ""
+
+
 def _stop_env_blocked(tid: str, hint: str, round_no: int) -> None:
     """端点不通：把原因和"怎么办"一起钉在卡上，停手等人，不跑第二轮。"""
     event(f"{tid} 执行者端点不可达，停手（不返工）", "dispatch", "bad", "codex", tid)
@@ -1298,7 +1307,9 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
                    error="" if code == 0 else f"执行退出码 {code}")
         if code != 0:
             event(f"第 {round_no} 轮执行未正常结束", "dispatch", "bad", "codex", tid)
-        hint = _env_hint(tid, round_no)
+        # 只有这轮真的没跑成，才看"连不上端点"的便签；跑成了（哪怕中间降级过）
+        # 说明文件已经改完，便签是上一个型号留下的噪声，不能据此停手。
+        hint = _env_gate(tid, round_no, code)
         if hint:
             _stop_env_blocked(tid, hint, round_no)
             return

@@ -348,6 +348,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     tdir = task_dir(tid)
     prompt_path = tdir / f"prompt-{round_no:02d}.md"
     prompt_path.write_text(prompt, encoding="utf-8")
+    # 上一轮留下的"连不上端点"便签先清掉：同一轮重派时不该拿旧便签判死
+    (tdir / f"exec-{round_no:02d}.hint.txt").unlink(missing_ok=True)
 
     cfg = load_executor_config()
     task_exec = task.get("executor") or {}

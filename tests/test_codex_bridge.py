@@ -226,6 +226,26 @@ class ProviderCase(unittest.TestCase):
         self.assertIn("连不上模型端点", worker._env_hint("T-test", 1))
         self.assertEqual(worker._env_hint("T-test", 2), "")
 
+    def test_success_round_ignores_stale_hint(self) -> None:
+        """降级成功了就不该再按上一型号留下的便签停手（T-261102-205317 踩过）。"""
+        tdir = worker.TASKS / "T-gate"
+        tdir.mkdir(parents=True)
+        (tdir / "exec-02.hint.txt").write_text("执行者连不上模型端点\n", encoding="utf-8")
+        self.assertEqual(worker._env_gate("T-gate", 2, 0), "")          # 跑成了：忽略便签
+        self.assertIn("连不上模型端点", worker._env_gate("T-gate", 2, 1))  # 没跑成：停手
+
+    def test_successful_run_removes_stale_hint_file(self) -> None:
+        stale = self.tmp / "exec-05.hint.txt"
+        stale.write_text("执行者连不上模型端点\n", encoding="utf-8")
+        ok_result = {"ok": True, "hint": str(stale), "env_error": "执行者连不上模型端点"}
+        with mock.patch.object(codex_bridge.fallback, "run_with_fallback", return_value=ok_result):
+            result = codex_bridge.run_codex(
+                "写个文件", workspace=str(self.ws), out_prefix=str(self.tmp / "exec-05"),
+                timeout=30, model="claude-sonnet-5", fallback_models=["claude-opus-4-8"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["env_error"], "")
+        self.assertFalse(stale.exists(), "成功之后还留着便签，会把下一轮编排带偏")
+
 
 if __name__ == "__main__":
     unittest.main()

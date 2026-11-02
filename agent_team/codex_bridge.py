@@ -298,7 +298,21 @@ def run_codex(
             attempt=index,
         )
 
-    return fallback.run_with_fallback(attempt, models_to_try, label="codex")
+    result = fallback.run_with_fallback(attempt, models_to_try, label="codex")
+    # 降级链里前一个型号没连上、后一个型号跑成了：结果算成功，别把"没连上"的便签留在
+    # 磁盘上——编排是按便签判断"该停手"的，留着会误杀一张其实已经干完的卡
+    # （T-261102-205317 实测：gpt-6.1-sol 容量满载 + 拉不到模型列表，降级 gpt-6-luna 跑成功了，
+    #  exec-02.hint.txt 却还在，编排读到就停了）。
+    if result.get("ok"):
+        hint = str(result.get("hint") or "")
+        if hint:
+            try:
+                Path(hint).unlink(missing_ok=True)
+            except OSError:
+                pass
+        result["env_error"] = ""
+        result["hint"] = ""
+    return result
 
 
 def _run_codex_once(
