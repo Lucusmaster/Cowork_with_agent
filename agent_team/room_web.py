@@ -847,6 +847,30 @@ def _typing_info() -> dict:
     return data
 
 
+def _engine_busy() -> tuple[bool, str]:
+    """引擎现在能不能安全重启：有没跑完的任务卡、或正在回复/规划（typing）就不动它。
+
+    换协调者之后要不要重启引擎由这里说了算：忙的时候**只切换不重启**——切换本来
+    就下一条消息生效；空闲时才顺手重启，省得用户自己动手。
+    """
+    try:
+        from . import start_all
+        cards = start_all.active_cards()
+    except Exception:                       # noqa: BLE001 - 判断失败就当空闲，别卡住换模型
+        cards = []
+    if cards:
+        return True, f"还有任务在跑（{'、'.join(cards)}）"
+    raw = _typing_raw()
+    if raw:
+        try:
+            age = time.time() - float(raw.get("at") or 0)
+        except (TypeError, ValueError):
+            age = 0
+        if age < 300:
+            return True, "引擎正在回复/规划"
+    return False, ""
+
+
 def _session_state_info() -> dict:
     try:
         data = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
@@ -5233,6 +5257,10 @@ function renderModelList(agent, pid){
   if(apiBlocked){
     html += '<div class="p warn">API 模型只收发文字、不能改文件，不能当执行者；协调 / 规划 / 复核可以用。</div>';
   }
+  if(modelMenuRole === 'coordinator'){
+    html += '<div class="p dim">切协调者（大脑）会顺手重启引擎，约 3 秒；'
+      + '有任务或正在回复时只切换、不重启，新模型从下一条消息生效。</div>';
+  }
   if(!reg.length){
     html += '<div class="mh">' + esc(isApi
       ? '这个提供方还没有勾选模型。点下面「拉取模型」，勾选后保存。'
@@ -5546,6 +5574,13 @@ if(modelMenuEl()){
   });
 }
 async function switchModel(role, model){
+  const isBrain = role === 'coordinator';
+  if(isBrain){
+    const ok = window.confirm('切换协调者（大脑）会顺手重启引擎，约 3 秒。'
+      + '有任务或回复在跑时只切换、不重启，新模型从下一条消息生效。继续？');
+    if(!ok) return;
+    toast('正在切换并重启引擎，约 3 秒…');
+  }
   closeModelMenu();
   const data = await apiPost('/api/set-model', {role: role, model: model});
   if(data && data.ok){
@@ -6293,7 +6328,24 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": message, "models": _models_snapshot()}, 400)
             return
         _room_note(message)                 # 群里留一行，事后能看出是谁什么时候换的
-        self._json({"ok": True, "message": message, "models": _models_snapshot()})
+        restart, extra = "", ""
+        if MODELS.resolve_role(role) == "coordinator":
+            # 大脑换了就让引擎自己重启：用户点一下就行，不用再教他敲命令行。
+            # 有任务/回复在跑时不动它——切换本来就下一条消息生效，重启只是顺手让状态干净。
+            busy, why = _engine_busy()
+            if busy:
+                extra = f"；{why}，这次没有重启引擎（换模型下一条消息就生效）"
+            else:
+                try:
+                    from . import start_all
+                    ok_restart, note = start_all.restart_engine()
+                except OSError as exc:
+                    ok_restart, note = False, f"引擎重启失败：{exc}"
+                restart = "ok" if ok_restart else "failed"
+                extra = "；" + note
+                _room_note(note if ok_restart else f"引擎重启失败：{note}")
+        self._json({"ok": True, "message": message + extra, "restart": restart,
+                    "models": _models_snapshot()})
 
     # ---------- /api/agent-cli/*：换模型菜单里的「找 CLI / 识别粘贴 / 保存」 ----------
     def _post_agent_cli(self, action: str, body: dict) -> None:

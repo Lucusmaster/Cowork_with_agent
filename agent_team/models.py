@@ -10,7 +10,8 @@
 
     任务卡覆盖  >  运行时覆盖（room/model_overrides.json）  >  配置文件  >  默认
 
-- 运行时覆盖放 `room/`（gitignored），改它不算改配置，下一张卡立即生效，不用重启；
+- 运行时覆盖放 `room/`（gitignored），改它不算改配置，下一张卡立即生效，不用重启
+  （协调者是下一条消息生效）；
 - 任何名字都必须先 `resolve()` 成注册表里的规范 id，拼错当场拒绝——
   让"切到 claude-opus-5-5"这种笔误在**切换时**报错，而不是烧完一整轮才发现模型不存在；
 - 注册表没写的型号会自动从配置里收录（老配置不改也能用，只是没有别名）。
@@ -239,7 +240,8 @@ def set_model(role: str, model: str) -> tuple[bool, str]:
         return True, f"{ROLE_LABELS[role]}已经是 {canonical}"
     data[role] = canonical
     _write_overrides(data)
-    return True, f"{ROLE_LABELS[role]} → {canonical}（下一张卡生效）"
+    where = "下一条消息" if role == "coordinator" else "下一张卡"
+    return True, f"{ROLE_LABELS[role]} → {canonical}（{where}生效）"
 
 
 def model_for(role: str, task: dict | None = None) -> tuple[str, str]:

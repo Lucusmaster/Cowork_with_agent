@@ -132,6 +132,50 @@ def find_web_pid(port: int) -> list[int]:
     return sorted(set(pids))
 
 
+def active_cards() -> list[str]:
+    """还没结束的任务卡（`<id>(<status>)`）。协作台用它判断"现在能不能安全重启引擎"。"""
+    active: list[str] = []
+    tasks_dir = ROOT / "tasks"
+    if not tasks_dir.is_dir():
+        return active
+    for directory in tasks_dir.iterdir():
+        card = directory / "task.json"
+        if not card.is_file():
+            continue
+        try:
+            task = json.loads(card.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (task.get("status") or "") not in {"passed", "failed", "exec-failed", "stopped"}:
+            active.append(f"{directory.name}({task.get('status')})")
+    return active
+
+
+def restart_engine(wait: float = 8.0) -> tuple[bool, str]:
+    """重启引擎进程（协作台里换协调者模型后调用）。
+
+    只该在空闲时调用：调用方先看 `active_cards()`，免得把正在跑的任务卡连根拔掉。
+    先杀旧进程、等它真的退出（否则新进程会和残留锁打架），再拉起新的。
+    """
+    state = worker_state()
+    pid = int(state.get("pid") or 0)
+    if pid and state.get("alive"):
+        kill_pid(pid)
+        for _ in range(50):
+            if not procs.pid_alive(pid):
+                break
+            time.sleep(0.1)
+    LOCK.unlink(missing_ok=True)
+    spawn([*WORKER, "--interval", "0.5"])
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        new_pid = worker_pid()
+        if new_pid:
+            return True, f"引擎已重启 (pid {new_pid})"
+        time.sleep(0.15)
+    return False, "引擎重启没等到心跳，看 room/worker.log（协作台不受影响，下一条消息会再拉起）"
+
+
 def status(port: int) -> None:
     print(f"仓库      {ROOT}")
     print(f"协作台    {'在跑' if port_busy(port) else '未启动'}  {web_url(port)}")
@@ -145,19 +189,7 @@ def status(port: int) -> None:
         engine = f"在跑 pid {pid}（心跳 {state.get('age')}s 前）"
     print(f"引擎      {engine}")
     print(f"日志      {ROOM / 'worker.log'}")
-    active = []
-    tasks_dir = ROOT / "tasks"
-    if tasks_dir.is_dir():
-        for directory in tasks_dir.iterdir():
-            card = directory / "task.json"
-            if not card.is_file():
-                continue
-            try:
-                task = json.loads(card.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (task.get("status") or "") not in {"passed", "failed", "exec-failed", "stopped"}:
-                active.append(f"{directory.name}({task.get('status')})")
+    active = active_cards()
     print(f"进行中    {', '.join(active) if active else '无'}")
     state_file = ROOM / "session_state.json"
     try:

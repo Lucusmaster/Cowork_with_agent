@@ -77,11 +77,16 @@ class ModelApiCase(unittest.TestCase):
                          mock.patch.dict(agent_clis.os.environ, {}, clear=False)]
         for p in self._isolate:
             p.start()
+        # 换协调者会顺手重启引擎：测试里默认拦住（真重启会拉起 worker 进程），
+        # 只让个别用例把"空闲"打开来验决定逻辑。
+        self._busy = mock.patch.object(room_web, "_engine_busy", return_value=(True, "测试里不重启引擎"))
+        self._busy.start()
         for key in ("CODEX_EXE", "CLAUDE_EXE", "DEEPSEEK_EXE"):
             agent_clis.os.environ.pop(key, None)
         agent_clis._PROBES.clear()
 
     def tearDown(self) -> None:
+        self._busy.stop()
         for p in reversed(self._isolate):
             p.stop()
         self._providers.stop()
@@ -167,6 +172,30 @@ class ModelsEndpointTests(ModelApiCase):
         roles = {row["role"]: row for row in data["models"]["roles"]}
         self.assertEqual(roles["coordinator"]["model"], "gpt-6-luna")
         self.assertEqual(models.overrides(), {"coordinator": "gpt-6-luna"})
+        self.assertIn("下一条消息生效", data["message"])
+        self.assertEqual(data["restart"], "", "忙的时候只切换，不重启引擎")
+        self.assertIn("没有重启引擎", data["message"])
+
+    def test_switch_coordinator_restarts_engine_when_idle(self) -> None:
+        from agent_team import start_all
+        with mock.patch.object(room_web, "_engine_busy", return_value=(False, "")), \
+                mock.patch.object(start_all, "restart_engine",
+                                  return_value=(True, "引擎已重启 (pid 4242)")) as restart:
+            status, data = self.request("/api/set-model", {"role": "协调", "model": "luna"})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["restart"], "ok")
+        self.assertIn("引擎已重启", data["message"])
+        restart.assert_called_once()
+
+    def test_switch_other_roles_never_restart_engine(self) -> None:
+        from agent_team import start_all
+        for role in ("planner", "executor", "reviewer"):
+            with mock.patch.object(start_all, "restart_engine") as restart:
+                status, data = self.request("/api/set-model", {"role": role, "model": "luna"})
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["restart"], "")
+            restart.assert_not_called()
 
     def test_set_model_reset(self) -> None:
         self.request("/api/set-model", {"role": "executor", "model": "luna"})
@@ -274,6 +303,13 @@ class PageContractTests(unittest.TestCase):
         for needle in ("renderModelAgents", "pickModelAgent", "renderModelList", "renderAgentSetup",
                        "/api/agent-cli/detect", "/api/agent-cli/parse", "/api/agent-cli/save",
                        'id="agent-paste"', "复制这段话", "保存并验证", "composedPath"):
+            self.assertIn(needle, src, f"页面里缺 {needle}")
+
+    def test_switch_coordinator_asks_before_engine_restart(self) -> None:
+        """换大脑会顺手重启引擎：点之前先给提示（confirm），别让用户猜页面为什么卡 3 秒。"""
+        src = room_web.PAGE
+        for needle in ("切换协调者（大脑）会顺手重启引擎", "正在切换并重启引擎",
+                       "有任务或正在回复时只切换、不重启"):
             self.assertIn(needle, src, f"页面里缺 {needle}")
 
     def test_inline_js_parses(self) -> None:

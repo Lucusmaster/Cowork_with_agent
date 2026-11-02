@@ -172,6 +172,31 @@ class LauncherTests(unittest.TestCase):
             encoding="utf-8")
         self.assertEqual(start_all.worker_pid(), 0)
 
+    def test_active_cards_lists_unfinished_only(self) -> None:
+        tasks = Path(self.tmp.name) / "tasks"
+        for tid, status in (("T-1", "running"), ("T-2", "planning"),
+                            ("T-3", "passed"), ("T-4", "exec-failed")):
+            (tasks / tid).mkdir(parents=True)
+            (tasks / tid / "task.json").write_text(json.dumps({"status": status}),
+                                                   encoding="utf-8")
+        self.assertEqual(sorted(start_all.active_cards()), ["T-1(running)", "T-2(planning)"])
+
+    def test_restart_engine_kills_old_then_spawns(self) -> None:
+        killed: list[int] = []
+        spawned: list[list[str]] = []
+        with mock.patch.object(start_all, "worker_state",
+                               return_value={"pid": 4242, "alive": True}), \
+                mock.patch.object(start_all, "kill_pid", side_effect=killed.append), \
+                mock.patch.object(start_all.procs, "pid_alive", return_value=False), \
+                mock.patch.object(start_all, "spawn",
+                                  side_effect=lambda args: spawned.append(args) or 7777), \
+                mock.patch.object(start_all, "worker_pid", return_value=7777):
+            ok, message = start_all.restart_engine(wait=0.5)
+        self.assertTrue(ok, message)
+        self.assertIn(4242, killed, "旧引擎必须先停掉，否则新进程抢不到锁")
+        self.assertTrue(spawned)
+        self.assertIn("7777", message)
+
 
 if __name__ == "__main__":
     unittest.main()

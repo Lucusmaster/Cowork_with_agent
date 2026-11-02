@@ -595,6 +595,7 @@ python bin/team.py report -t <ID>
 3. **验收者不可切**。验收跑的是本地验收命令、只认退出码，不调用模型，给它模型菜单等于摆设。
    **协调者（大脑）可以切**：它每条用户消息才调一次模型，没有常驻会话，切完下一条消息就生效，不用重启；
    默认还是 `gpt-6.1-terra`（`config/team.json` 的 `coordinator.model` / `fallback_models` 照常生效）。
+   点换协调者时页面会先弹一句确认，引擎**空闲就顺手重启**（约 3 秒）；有任务或正在回复时只切换、不重启。
 
 切到 Claude Code 后真的是 `claude -p` 在跑（`agent_team/claude_bridge.py`，提示词走 stdin）。它没有 Codex 那样的沙箱开关，权限这样收：
 复核者和规划者禁掉所有写工具和 Bash；执行者用 `acceptEdits` 只放行改文件、**不能跑命令**（放开命令要 `bypassPermissions`，那就没有边界了），
