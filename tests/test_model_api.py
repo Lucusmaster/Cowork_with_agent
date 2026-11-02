@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from agent_team import models, room_web
+from agent_team import api_providers, models, room_web
 
 
 class ModelApiCase(unittest.TestCase):
@@ -47,6 +47,9 @@ class ModelApiCase(unittest.TestCase):
 
         models.CONFIG = self.tmp / "team.json"
         models.OVERRIDES = room_web.ROOM / "model_overrides.json"
+        # API 提供方文件也指到临时目录：否则用户在真环境配了 DeepSeek，这里注册表会多出模型
+        self._providers = mock.patch.object(api_providers, "STORE", room_web.ROOM / "api_providers.json")
+        self._providers.start()
         models.CONFIG.write_text(json.dumps({
             "model_registry": {
                 "gpt-6.1-terra": {"cli": "codex", "aliases": ["terra"]},
@@ -81,6 +84,7 @@ class ModelApiCase(unittest.TestCase):
     def tearDown(self) -> None:
         for p in reversed(self._isolate):
             p.stop()
+        self._providers.stop()
         self._which.stop()
         self.server.shutdown()
         self.server.server_close()
@@ -194,7 +198,7 @@ class AgentCliEndpointTests(ModelApiCase):
     def test_models_snapshot_lists_agents(self) -> None:
         _, data = self.request("/api/models")
         agents = {a["id"]: a for a in data["models"]["agents"]}
-        self.assertEqual(set(agents), {"codex", "claude", "deepseek"})
+        self.assertEqual(set(agents), {"codex", "claude", "deepseek", "api"})
         self.assertFalse(agents["claude"]["found"])
         self.assertIn("ask", agents["claude"]["guide"])
         self.assertIn("claude-opus-5-5", agents["claude"]["models"])

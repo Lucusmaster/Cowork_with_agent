@@ -261,7 +261,8 @@ class ResolveAndReadyTests(IsolatedCase):
 
     def test_snapshot_lists_agents_with_their_models(self) -> None:
         agents = {a["id"]: a for a in models.snapshot()["agents"]}
-        self.assertEqual(set(agents), {"codex", "claude", "deepseek"})
+        # 三个本机 CLI 组必须一直在；api 是后加的第四个组（不依赖本机装没装 CLI）
+        self.assertEqual(set(agents), {"codex", "claude", "deepseek", "api"})
         self.assertIn("claude-sonnet-4-5", agents["claude"]["models"])
         self.assertIn("gpt-6.1-terra", agents["codex"]["models"])
         self.assertIn("ask", agents["claude"]["guide"])

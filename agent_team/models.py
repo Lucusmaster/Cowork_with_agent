@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 from . import agent_clis
+from . import api_providers
 from .paths import workbench_root
 
 ROOT = workbench_root()
@@ -101,14 +102,29 @@ def registry(cfg: dict | None = None) -> dict[str, dict]:
                 "backend": str(spec.get("backend") or ""),
                 "aliases": [str(a) for a in (spec.get("aliases") or []) if str(a).strip()],
                 "note": str(spec.get("note") or ""),
+                # 静态登记的 API 模型：必须带 provider + remote_id，否则不知道发到哪、发什么型号
+                "provider": str(spec.get("provider") or "").strip(),
+                "remote_id": str(spec.get("remote_id") or "").strip(),
             }
     # 用户在本机登记的（换模型菜单里粘贴识别后保存的）
     try:
         for agent in agent_clis.AGENTS:
             for mid in agent_clis.saved_models(agent):
                 if mid not in out:
-                    out[mid] = {"cli": agent, "backend": "", "aliases": [], "note": "本机登记"}
+                    out[mid] = {"cli": agent, "backend": "", "aliases": [], "note": "本机登记",
+                                "provider": "", "remote_id": ""}
     except Exception:  # noqa: BLE001 - 登记文件坏了不能让注册表跟着挂
+        pass
+    # API 提供方里勾选过的模型。id 一律加 `<提供方>:` 前缀：中转站的模型常常也叫 `gpt-*`，
+    # 不加前缀会和本机 CLI 的型号撞名；两个提供方有同名模型时也得能分清发到哪个地址。
+    try:
+        for pid, prov in api_providers.load().items():
+            for mid in prov.get("models") or []:
+                key = f"{pid}:{mid}"
+                out.setdefault(key, {"cli": "api", "backend": pid, "aliases": [],
+                                     "note": str(prov.get("label") or pid),
+                                     "provider": pid, "remote_id": str(mid)})
+    except Exception:  # noqa: BLE001 - 提供方文件坏了不能让注册表跟着挂
         pass
     # 自动收录：配置文件里凡是提到过的型号都算"认识"。
     # 但要先按别名归一：`fallback_models: ["luna"]` 里的 luna 是 gpt-6-luna 的别名，
@@ -212,6 +228,10 @@ def set_model(role: str, model: str) -> tuple[bool, str]:
     canonical = resolve(clean)
     if not canonical:
         return False, (f"不认识模型「{clean}」；可用：{'、'.join(models()) or '（注册表为空，先配 config/team.json）'}")
+    spec = registry().get(canonical) or {}
+    if role == "executor" and str(spec.get("cli") or "") == "api":
+        return False, ("API 模型只能收发文字，不能改文件、也不能跑命令：当执行者每轮都会空跑。"
+                       "协调 / 规划 / 复核可以用它")
     ready, why = cli_ready(canonical)
     if not ready:
         return False, why
@@ -300,9 +320,24 @@ def clis() -> dict[str, bool]:
 
 
 def cli_ready(model: str) -> tuple[bool, str]:
-    """这个模型现在真能跑吗：CLI 找不到、跑不起来、或协作台没有它的执行适配，都别让切。"""
+    """这个模型现在真能跑吗：CLI 找不到、跑不起来、或协作台没有它的执行适配，都别让切。
+
+    `cli == "api"` 时不碰任何 CLI，也不联网（`snapshot()` 每次页面轮询都会调这里）：
+    只看提供方在不在、环境变量里有没有 key。
+    """
     spec = registry().get(model) or {}
     cli = str(spec.get("cli") or "codex").strip()
+    if cli == "api":
+        provider = str(spec.get("provider") or "").strip()
+        if not provider:
+            return False, f"{model}：注册表里没有 provider，不知道该发到哪个 API"
+        entry = api_providers.load().get(provider)
+        if not entry:
+            return False, f"{model}：API 提供方 {provider} 不存在（在换模型菜单里添加）"
+        env = str(entry.get("api_key_env") or "")
+        if not env or not os.environ.get(env, "").strip():
+            return False, f"{model}：没读到环境变量 {env}（设置后要重启协作台才生效）"
+        return True, ""
     ok, why = agent_clis.ready(cli)
     return (True, "") if ok else (False, f"{model}：{why}")
 
@@ -328,14 +363,29 @@ def snapshot(task: dict | None = None) -> dict:
     entries = []
     for mid, spec in sorted(reg.items()):
         ok, why = cli_ready(mid)
-        entries.append({"id": mid, "cli": spec.get("cli", ""), "backend": spec.get("backend", ""),
-                        "aliases": list(spec.get("aliases") or []), "note": spec.get("note", ""),
-                        "ready": ok, "why": why})
+        row = {"id": mid, "cli": spec.get("cli", ""), "backend": spec.get("backend", ""),
+               "aliases": list(spec.get("aliases") or []), "note": spec.get("note", ""),
+               "ready": ok, "why": why}
+        if spec.get("provider"):
+            row["provider"] = str(spec["provider"])
+        entries.append(row)
     agents = []
     for name in agent_clis.AGENTS:
         row = agent_clis.status(name)
         row["models"] = [e["id"] for e in entries if (e["cli"] or "codex") == name]
         agents.append(row)
+    # API 不是一个本机 CLI，但菜单里得和 Codex / Claude 并排显示，所以补一行伪 Agent。
+    # 前端 `renderModelList` 按 `m.cli === agent` 过滤，api 模型会自动归到这一组。
+    providers = [api_providers.status(pid) for pid in api_providers.load()]
+    agents.append({
+        "id": "api", "label": "API（OpenAI 兼容）", "runnable": True,
+        "found": bool(providers), "checked": True,
+        "works": any(p["has_key"] for p in providers),
+        "version": f"{len(providers)} 个提供方", "path": "", "source": "",
+        "reason": "" if providers else "还没有 API 提供方：点这里添加一个",
+        "guide": {}, "models": [e["id"] for e in entries if (e["cli"] or "codex") == "api"],
+        "providers": providers,
+    })
     return {
         "roles": rows,
         "registry": entries,

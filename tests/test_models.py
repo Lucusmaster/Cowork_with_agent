@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_team import agent_clis, models
+from agent_team import agent_clis, api_providers, models
 
 
 class ModelsCase(unittest.TestCase):
@@ -29,6 +29,7 @@ class ModelsCase(unittest.TestCase):
         models.OVERRIDES = self.overrides
         # 本机装没装 claude、登记过什么，都不能影响结果：只留 shutil.which 这一个入口给 only_codex 打桩
         self._isolate = [mock.patch.object(agent_clis, "STORE", self.tmp / "room" / "agent_clis.json"),
+                         mock.patch.object(api_providers, "STORE", self.tmp / "room" / "api_providers.json"),
                          mock.patch.object(agent_clis, "_common_candidates", return_value=[]),
                          mock.patch.dict(agent_clis.os.environ, {}, clear=False)]
         for p in self._isolate:

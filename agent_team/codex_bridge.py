@@ -175,6 +175,12 @@ def run_codex(
                 prompt, workspace=workspace, out_prefix=out_prefix, sandbox=sandbox,
                 timeout=timeout, model=try_model, reasoning_effort=reasoning_effort,
                 attempt=index)
+        if route == "api":
+            from .api_bridge import run_api
+            return run_api(
+                prompt, workspace=workspace, out_prefix=out_prefix, sandbox=sandbox,
+                timeout=timeout, model=try_model, reasoning_effort=reasoning_effort,
+                attempt=index)
         if route != "codex":
             return _no_adapter(route, try_model, workspace, out_prefix)
         return _run_codex_once(

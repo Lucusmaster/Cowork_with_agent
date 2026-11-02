@@ -51,13 +51,19 @@ def check_models() -> list[dict]:
                                  f"模型「{model}」不在注册表；可用：{_available()}",
                                  fix=f"python -m agent_team.cli model set {label} <型号>"))
             else:
-                ready, why = models.cli_ready(resolved)
-                if not ready:
-                    rows.append(item("bad", f"model.{role}.cli", label, why,
-                                     fix=f"装好/登录它对应的 CLI，或 python -m agent_team.cli model set {label} <别的型号>"))
+                cli = str((models.registry().get(resolved) or {}).get("cli") or "")
+                if role == "executor" and cli == "api":
+                    rows.append(item("bad", "model.executor.api_not_allowed", label,
+                                     "执行者是 API 模型：它只能收发文字，改不了文件，每轮都会空跑",
+                                     fix="把执行者换回本机 CLI 模型（协调/规划/复核可以用 API 模型）"))
                 else:
-                    note = f"（{source}）" if source and source != "配置" else ""
-                    rows.append(item("ok", f"model.{role}", label, f"{resolved}{note}"))
+                    ready, why = models.cli_ready(resolved)
+                    if not ready:
+                        rows.append(item("bad", f"model.{role}.cli", label, why,
+                                         fix=f"装好/登录它对应的 CLI，或 python -m agent_team.cli model set {label} <别的型号>"))
+                    else:
+                        note = f"（{source}）" if source and source != "配置" else ""
+                        rows.append(item("ok", f"model.{role}", label, f"{resolved}{note}"))
 
         for name in models.fallback_models(role):
             resolved = models.resolve(name)
@@ -65,6 +71,13 @@ def check_models() -> list[dict]:
                 rows.append(item("warn", f"model.{role}.fallback.{name}", f"{label}降级链",
                                  f"「{name}」不在注册表，撞上模型容量满时这条降级会失效",
                                  fix="在 config/team.json 里改掉这个型号，或先在 model_registry 登记它"))
+                continue
+            if role == "executor" and (models.registry().get(resolved) or {}).get("cli") == "api":
+                # 执行者的降级链里挂 API 模型，等于"满载时换一个改不了文件的模型"，是坏配置
+                rows.append(item("bad", f"model.executor.fallback.api_not_allowed.{resolved}",
+                                 f"{label}降级链",
+                                 f"{resolved} 是 API 模型，改不了文件；执行者满载时切过去只会空跑",
+                                 fix="把它从 executor.fallback_models 里去掉，或换成 CLI 模型"))
                 continue
             ready, why = models.cli_ready(resolved)
             if not ready:

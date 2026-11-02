@@ -581,7 +581,7 @@ python bin/team.py report -t <ID>
 
 三个入口，改的都是同一个运行时覆盖文件 `room/model_overrides.json`，**下一张卡生效**：
 
-- 网页右栏：每个角色名下面有个模型小徽章，点它**先选 Agent（Codex CLI / Claude Code / DeepSeek），再选这个 Agent 的模型**。
+- 网页右栏：每个角色名下面有个模型小徽章，点它**先选 Agent（Codex CLI / Claude Code / DeepSeek，以及后加的 API），再选这个 Agent 的模型**。
   点 Agent 时会在本机找它的命令行（已保存路径 → `CODEX_EXE`/`CLAUDE_EXE` → PATH → 常见安装目录），找到就跑一次 `--version`；
   找不到会给一条终端命令（`where claude`）和一段可以直接发给那个 Agent 的话，让它告诉你可执行文件路径和能用的模型 id，
   把回答整段贴回来点「识别」，勾选后「保存并验证」。保存在 `room/agent_clis.json`（不进 git），登记的模型会出现在它的模型列表里；
@@ -597,6 +597,23 @@ python bin/team.py report -t <ID>
 切到 Claude Code 后真的是 `claude -p` 在跑（`agent_team/claude_bridge.py`，提示词走 stdin）。它没有 Codex 那样的沙箱开关，权限这样收：
 复核者和规划者禁掉所有写工具和 Bash；执行者用 `acceptEdits` 只放行改文件、**不能跑命令**（放开命令要 `bypassPermissions`，那就没有边界了），
 所以 Claude 当执行者时不会自己跑测试——验收本来就由协作台在沙箱外跑。Claude CLI 没有推理档，`effort` 会被忽略。
+
+### 用 API 模型（OpenAI 兼容）
+
+菜单里的第四个组「API（OpenAI 兼容）」不用本机装任何 CLI，给一个 `base_url` + 一个环境变量名就能用
+DeepSeek、Ollama、中转站这些 OpenAI 兼容服务（`agent_team/api_providers.py` + `api_bridge.py`）：
+
+1. 先把 key 放进环境变量（例如 `setx DEEPSEEK_API_KEY sk-...`），**然后重启协作台**——
+   正在跑的进程读不到新变量，菜单里会显示「没读到，设置后要重启」；
+2. 右栏点角色徽章 → API → 添加提供方：选预设（DeepSeek / Ollama）或自己填地址，
+   地址只接受 `https`，本机服务（`127.0.0.1` / `localhost` / `[::1]`）可以用 `http`；
+3. 保存 →「拉取模型」（真的调一次 `GET {base_url}/models`）→ 勾选要用的型号 → 保存勾选；
+4. 这些模型以 `<提供方>:<远端型号>` 的形式进注册表（例如 `deepseek:deepseek-chat`），
+   就能像别的型号一样切给规划者 / 复核者 / 协调者。
+
+三条红线：**协作台不保存 key**（`room/api_providers.json` 里只有环境变量名，文件和接口里都不会出现 key 的值）；
+**API 模型不能当执行者**（它只能收发文字、改不了文件，`set_model`、preflight、界面三处都会拦）；
+**本机 CLI 通道没动**（`agent_clis.py`、`/api/agent-cli/*` 保持原样，前三组还是原来的行为）。
 
 群里只认 `/model` 或「切换模型」这种**显式前缀**：一句「用 python 换实现方式」不会被当成切模型——把用户的正经需求误判成命令，比不支持这功能糟得多。
 

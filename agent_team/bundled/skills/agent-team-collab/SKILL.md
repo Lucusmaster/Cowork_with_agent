@@ -57,12 +57,17 @@ python -m agent_team.cli model reset 执行       # 回到配置默认
 ```
 
 群里也可以 `/model 执行 luna`、`切换模型 复核=terra`；右栏每个角色名下面的徽章能点：
-先选 Agent（Codex CLI / Claude Code / DeepSeek）再选模型。本机找不到那个 Agent 时，菜单给出
+先选 Agent（Codex CLI / Claude Code / DeepSeek / API）再选模型。本机找不到那个 Agent 时，菜单给出
 `where <命令>` 和一段可以直接问那个 Agent 的话，把回答贴回去「识别」→「保存并验证」
 （存 `room/agent_clis.json`）。
 规矩：只认注册表里的型号（拼错直接拒）；CLI 找不到、`--version` 跑不通、或协作台没有它的执行适配
 （DeepSeek 目前只能登记）都不许切；**协调者、验收者不可切**（协调者是引擎自己的大脑，验收不调模型）。
 Claude Code 当执行者时只能改文件、不能跑命令；当复核者时禁掉所有写工具。
+
+第四组「API（OpenAI 兼容）」不用本机 CLI：先把 key 放进环境变量（如 `DEEPSEEK_API_KEY`）并
+**重启协作台**，再在菜单里加提供方（只收 https 或本机 http）→「拉取模型」→ 勾选保存；
+模型以 `<提供方>:<型号>` 进注册表。协作台**不保存 key**（文件里只有环境变量名）；
+**API 模型不能当执行者**（改不了文件），协调 / 规划 / 复核可以。
 
 ## 从别的 Agent 指挥它（MCP）
 

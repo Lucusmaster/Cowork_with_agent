@@ -31,6 +31,7 @@ from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
 from . import models as MODELS  # noqa: E402
 from . import agent_clis as AGENT_CLIS  # noqa: E402
+from . import api_providers as API_PROVIDERS  # noqa: E402
 from . import __version__  # noqa: E402
 
 
@@ -1765,6 +1766,11 @@ input,textarea{caret-color:var(--user)}
   border:var(--hair) solid var(--line2);border-radius:var(--r-1);padding:var(--sp-1);
   font:var(--fs-xs) ui-monospace,Consolas,monospace}
 .model-menu textarea:focus-visible{outline:none;box-shadow:var(--ring)}
+.model-menu .setup input,.model-menu .setup select{width:100%;box-sizing:border-box;background:var(--bg);
+  color:var(--fg);border:var(--hair) solid var(--line2);border-radius:var(--r-1);
+  padding:var(--sp-1) var(--sp-2);font:inherit;font-size:var(--fs-sm)}
+.model-menu .setup input:focus-visible,.model-menu .setup select:focus-visible{outline:none;box-shadow:var(--ring)}
+.model-menu .setup label.step{display:flex;flex-direction:column;gap:var(--sp-1)}
 .model-menu .setup .row{display:flex;gap:var(--sp-1);flex-wrap:wrap}
 .model-menu .pick{display:flex;align-items:flex-start;gap:var(--sp-1);font-size:var(--fs-xs);line-height:1.5}
 /* 空状态 */
@@ -5133,6 +5139,7 @@ function closeArtMenu(){
    没装 / 跑不起来 / 协作台没有执行适配的，一律置灰并写明原因，不让人选完才发现跑不起来。 */
 let modelMenuRole = '';
 let modelMenuAgent = '';
+let modelMenuProvider = '';
 let modelMenuRect = null;
 let modelMenuParsed = null;
 function modelMenuEl(){ return $('model-menu'); }
@@ -5159,6 +5166,11 @@ function showModelMenu(html, wide){
   placeModelMenu();
 }
 function agentTag(a){
+  if(a.id === 'api'){
+    if(!((a.providers || []).length)) return '点这里添加';
+    if(!a.works) return (a.version || '') + ' · 没读到 key';
+    return a.version || '已配置';
+  }
   if(!a.found) return '本机没装 · 点这里找';
   if(!a.runnable) return '已找到 · 协作台还不能用它执行';
   if(a.checked && !a.works) return '跑不起来';
@@ -5180,10 +5192,14 @@ function renderModelAgents(){
   modelAgents().forEach(a => {
     const on = a.id === curCli && !!me.model;
     const bad = !a.found || !a.runnable || (a.checked && !a.works);
+    const blocked = modelMenuRole === 'executor' && a.id === 'api';
+    const why = blocked ? 'API 模型不能改文件，只能做协调/规划/复核' : (a.path || a.reason || '');
     html += '<button class="mi ' + (on ? 'on' : '') + '" data-agent="' + esc(a.id) + '"'
-      + ' title="' + esc(a.path || a.reason || '') + '">'
+      + (blocked ? ' disabled' : '')
+      + ' title="' + esc(why) + '">'
       + '<span>' + esc(a.label) + (on ? ' ✓' : '') + ' ›</span>'
-      + '<span class="tag' + (bad ? ' warn' : '') + '">' + esc(agentTag(a)) + '</span></button>';
+      + '<span class="tag' + (bad || blocked ? ' warn' : '') + '">'
+      + esc(blocked ? '不能当执行者' : agentTag(a)) + '</span></button>';
   });
   html += '<div class="menu-sep"></div>'
     + '<button class="mi" data-model=""><span>恢复配置默认</span>'
@@ -5192,6 +5208,7 @@ function renderModelAgents(){
 }
 async function pickModelAgent(agent){
   modelMenuAgent = agent;
+  if(agent === 'api'){ renderApiProviders(); return; }
   const a = modelAgent(agent);
   showModelMenu('<div class="mh">正在本机查找 ' + esc(a.label || agent) + '…</div>', false);
   const data = await apiPost('/api/agent-cli/detect', {agent: agent});
@@ -5201,28 +5218,182 @@ async function pickModelAgent(agent){
   if(row.found && row.runnable && row.works) renderModelList(agent);
   else renderAgentSetup(agent, row);
 }
-function renderModelList(agent){
+function renderModelList(agent, pid){
   const a = modelAgent(agent);
   const me = modelRole(modelMenuRole);
-  const reg = (((st.models || {}).registry) || []).filter(m => (m.cli || 'codex') === agent);
-  let html = '<button class="mi back" data-back="agents"><span>‹ 选 Agent</span></button>'
-    + '<div class="mh">' + esc(a.label || agent) + ' · ' + esc(a.version || '') + '</div>'
-    + '<div class="mh mono">' + esc(a.path || '') + '</div>';
+  const prov = pid ? apiProvider(pid) : {};
+  const isApi = agent === 'api';
+  const reg = (((st.models || {}).registry) || []).filter(m =>
+    (m.cli || 'codex') === agent && (!pid || (m.provider || '') === pid));
+  const apiBlocked = isApi && modelMenuRole === 'executor';
+  let html = '<button class="mi back" data-back="' + (isApi ? 'providers' : 'agents') + '">'
+    + '<span>‹ ' + (isApi ? 'API 提供方' : '选 Agent') + '</span></button>'
+    + '<div class="mh">' + esc(isApi ? (prov.label || pid || 'API') : (a.label || agent)) + '</div>'
+    + '<div class="mh mono">' + esc(isApi ? (prov.base_url || '') : (a.path || a.version || '')) + '</div>';
+  if(apiBlocked){
+    html += '<div class="p warn">API 模型只收发文字、不能改文件，不能当执行者；协调 / 规划 / 复核可以用。</div>';
+  }
   if(!reg.length){
-    html += '<div class="mh">还没有登记它的模型。点下面「补充模型」，按提示问它要模型 id。</div>';
+    html += '<div class="mh">' + esc(isApi
+      ? '这个提供方还没有勾选模型。点下面「拉取模型」，勾选后保存。'
+      : '还没有登记它的模型。点下面「补充模型」，按提示问它要模型 id。') + '</div>';
   }
   reg.forEach(m => {
     const on = m.id === me.model;
-    const why = m.ready ? '' : (m.why || '本机没装 ' + (m.cli || '对应 CLI'));
+    const why = apiBlocked ? '不能当执行者' : (m.ready ? '' : (m.why || '本机没装 ' + (m.cli || '对应 CLI')));
+    const blocked = apiBlocked || !m.ready;
     html += '<button class="mi ' + (on ? 'on' : '') + '" data-model="' + esc(m.id) + '"'
-      + (m.ready ? '' : ' disabled')
+      + (blocked ? ' disabled' : '')
       + ' title="' + esc(why || ((m.aliases || []).join(' / ') + (m.note ? ' · ' + m.note : ''))) + '">'
-      + '<span>' + esc(m.id) + (on ? ' ✓' : '') + '</span>'
-      + '<span class="tag">' + esc(why ? '不可用' : (m.note || '')) + '</span></button>';
+      + '<span>' + esc(isApi ? (m.id.includes(':') ? m.id.slice(m.id.indexOf(':') + 1) : m.id) : m.id)
+      + (on ? ' ✓' : '') + '</span>'
+      + '<span class="tag">' + esc(why ? (apiBlocked ? '不能当执行者' : '不可用') : (m.note || '')) + '</span></button>';
   });
+  html += '<div class="menu-sep"></div>';
+  if(isApi){
+    html += '<button class="mi" data-provider-setup="' + esc(pid || '') + '"><span>'
+      + (pid ? '编辑地址 / 拉取模型…' : '设置提供方…') + '</span></button>';
+  } else {
+    html += '<button class="mi" data-setup="1"><span>补充模型 / 换路径…</span></button>';
+  }
+  showModelMenu(html, true);
+}
+
+/* ---------- API 通道（OpenAI 兼容）：选项组、提供方、拉取模型 ----------
+   key 不经过协作台：界面上没有填 key 的输入框，只填"key 在哪个环境变量里"。
+   文案里那句"设置后要重启协作台"必须一直在——`setx` 之后正在跑的进程读不到新变量。 */
+function apiProviders(){ const a = modelAgent('api'); return (a && a.providers) || []; }
+function apiProvider(pid){ return apiProviders().find(p => p.id === pid) || {}; }
+function renderApiProviders(){
+  modelMenuProvider = '';
+  const provs = apiProviders();
+  const roleName = (modelRole(modelMenuRole) || {}).name || modelMenuRole;
+  let html = '<button class="mi back" data-back="agents"><span>‹ 选 Agent</span></button>'
+    + '<div class="mh">API（OpenAI 兼容）· ' + esc(String(provs.length)) + ' 个提供方 · 给 ' + esc(roleName) + '</div>';
+  if(!provs.length){
+    html += '<div class="p">还没有提供方。加一个 OpenAI 兼容地址（DeepSeek / Ollama / 中转站），'
+      + 'key 放进环境变量——协作台不保存 key。</div>';
+  }
+  provs.forEach(p => {
+    const n = (p.models || []).length;
+    const keyTxt = p.has_key ? ('已读到 ' + p.api_key_env) : ('没读到 ' + p.api_key_env);
+    html += '<button class="mi" data-provider="' + esc(p.id) + '" title="' + esc(p.base_url || '') + '">'
+      + '<span>' + esc(p.label || p.id) + (n ? '' : ' · 还没勾模型') + ' ›</span>'
+      + '<span class="tag' + (p.has_key ? '' : ' warn') + '">' + esc(n + ' 个模型 · ' + keyTxt) + '</span></button>';
+  });
+  if(provs.some(p => !p.has_key)){
+    html += '<div class="p warn">没读到环境变量：设置后要重启协作台才能生效'
+      + '（关网页收工，或 <code>cli stop</code> 再 <code>start</code>）。</div>';
+  }
   html += '<div class="menu-sep"></div>'
-    + '<button class="mi" data-setup="1"><span>补充模型 / 换路径…</span></button>';
-  showModelMenu(html, false);
+    + '<button class="mi" data-provider-add="1"><span>＋ 添加提供方</span></button>';
+  showModelMenu(html, true);
+}
+function renderProviderModels(pid){
+  modelMenuProvider = pid;
+  renderModelList('api', pid);
+}
+function applyApiPreset(key){
+  const table = {
+    deepseek: {label: 'DeepSeek', id: 'deepseek', url: 'https://api.deepseek.com', env: 'DEEPSEEK_API_KEY'},
+    ollama: {label: 'Ollama', id: 'ollama', url: 'http://127.0.0.1:11434/v1', env: 'OLLAMA_API_KEY'},
+  };
+  const p = table[key];
+  if(!p) return;
+  const setId = $('api-id');
+  if(setId && !setId.disabled) setId.value = p.id;
+  if($('api-label')) $('api-label').value = p.label;
+  if($('api-url')) $('api-url').value = p.url;
+  if($('api-env')) $('api-env').value = p.env;
+}
+function renderApiSetup(pid){
+  modelMenuProvider = pid || '';
+  const p = pid ? apiProvider(pid) : {};
+  const presets = [['', '自定义 / 手动填'], ['deepseek', 'DeepSeek（api.deepseek.com）'], ['ollama', 'Ollama（本机 11434）']];
+  let html = '<button class="mi back" data-provider-back="1"><span>‹ API 提供方</span></button>'
+    + '<div class="mh">' + (pid ? '编辑 API 提供方 · ' + esc(pid) : '添加 API 提供方') + '</div>'
+    + '<div class="setup">'
+    + '<label class="step">预设<select id="api-preset">'
+    + presets.map(x => '<option value="' + esc(x[0]) + '">' + esc(x[1]) + '</option>').join('')
+    + '</select></label>'
+    + '<label class="step">显示名<input id="api-label" value="' + esc(p.label || '')
+    + '" placeholder="DeepSeek" spellcheck="false"></label>'
+    + '<label class="step">提供方 id（模型 id 的前缀）<input id="api-id" value="' + esc(pid || '')
+    + '" placeholder="deepseek" spellcheck="false"' + (pid ? ' disabled' : '') + '></label>'
+    + '<label class="step">地址<input id="api-url" value="' + esc(p.base_url || '')
+    + '" placeholder="https://api.deepseek.com" spellcheck="false"></label>'
+    + '<label class="step">key 所在的环境变量<input id="api-env" value="' + esc(p.api_key_env || '')
+    + '" placeholder="DEEPSEEK_API_KEY" spellcheck="false"></label>'
+    + '<div class="p dim">key 只放环境变量，协作台不保存它。Windows 上 <code>setx</code> 之后要'
+    + '重启协作台才读得到（关网页收工，或 <code>cli stop</code> 再 <code>start</code>）。</div>'
+    + '<div class="row"><button class="pick-btn" data-provider-save="1">保存</button>'
+    + '<button class="pick-btn" data-provider-fetch="1"' + (pid ? '' : ' disabled') + '>拉取模型</button></div>';
+  if(pid){
+    const keyTxt = p.has_key ? '✓ 已读到 ' + p.api_key_env : '✗ 没读到 ' + p.api_key_env;
+    html += '<div class="p' + (p.has_key ? ' dim' : ' warn') + '">' + esc(keyTxt)
+      + (p.has_key ? '' : '：设置后要重启协作台才生效') + '</div>';
+  }
+  html += '<div id="api-models"></div>';
+  if(pid){
+    html += '<div class="row"><button class="pick-btn" data-provider-delete="1">删除提供方</button></div>';
+  }
+  html += '</div>';
+  showModelMenu(html, true);
+}
+async function saveApiProvider(){
+  const val = id => { const el = $(id); return el ? String(el.value || '').trim() : ''; };
+  const pid = val('api-id');
+  const data = await apiPost('/api/api-provider/save', {id: pid, label: val('api-label'),
+    base_url: val('api-url'), api_key_env: val('api-env')});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '保存失败'); return; }
+  toast(data.message || '已保存');
+  renderApiSetup(pid.toLowerCase());
+}
+async function fetchApiModels(){
+  const pid = modelMenuProvider;
+  const box = $('api-models');
+  if(box) box.innerHTML = '<div class="mh">正在问它有哪些模型…</div>';
+  const data = await apiPost('/api/api-provider/fetch', {id: pid});
+  if(!box || modelMenuProvider !== pid) return;      // 等的时候用户已经换了页
+  if(!data || !data.ok){
+    box.innerHTML = '<div class="p warn">' + esc((data && data.error) || '拉取失败') + '</div>';
+    placeModelMenu();
+    return;
+  }
+  const saved = new Set((pid ? apiProvider(pid) : {}).models || []);
+  const ids = data.ids || [];
+  let html = '<div class="mh">勾选要用的模型（' + esc(String(ids.length)) + ' 个）</div>';
+  if(!ids.length) html += '<div class="p dim">它没返回可用的模型 id。</div>';
+  ids.forEach(m => {
+    html += '<label class="pick"><input type="checkbox" name="api-model" value="' + esc(m) + '"'
+      + (saved.has(m) ? ' checked' : '') + '> <span class="mono">' + esc(m) + '</span></label>';
+  });
+  html += '<div class="row"><button class="pick-btn" data-provider-models="1"'
+    + (ids.length ? '' : ' disabled') + '>保存勾选</button></div>';
+  box.innerHTML = html;
+  placeModelMenu();
+}
+async function saveApiModels(){
+  const menu = modelMenuEl();
+  if(!menu) return;
+  const ids = Array.from(menu.querySelectorAll('input[name="api-model"]:checked')).map(x => x.value);
+  const pid = modelMenuProvider;
+  const data = await apiPost('/api/api-provider/models', {id: pid, models: ids});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '保存失败'); return; }
+  toast(data.message || '已保存');
+  if(modelMenuProvider === pid) renderProviderModels(pid);
+}
+async function deleteApiProvider(){
+  const pid = modelMenuProvider;
+  if(!pid) return;
+  if(!window.confirm('删除 API 提供方「' + (apiProvider(pid).label || pid) + '」？已勾选的模型会一起消失。')) return;
+  const data = await apiPost('/api/api-provider/delete', {id: pid});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '删除失败'); return; }
+  toast(data.message || '已删除');
+  renderApiProviders();
 }
 function renderAgentSetup(agent, row){
   const a = row || modelAgent(agent);
@@ -5310,6 +5481,7 @@ function closeModelMenu(){
   if(menu) menu.hidden = true;
   modelMenuRole = '';
   modelMenuAgent = '';
+  modelMenuProvider = '';
   modelMenuParsed = null;
 }
 if(modelMenuEl()){
@@ -5319,13 +5491,26 @@ if(modelMenuEl()){
     if(!btn || btn.disabled) return;
     const role = modelMenuRole;
     if(btn.dataset.agent) pickModelAgent(btn.dataset.agent);
+    else if(btn.dataset.back === 'providers') renderApiProviders();
     else if(btn.dataset.back) renderModelAgents();
+    else if(btn.dataset.providerAdd) renderApiSetup('');
+    else if(btn.dataset.providerSetup !== undefined) renderApiSetup(btn.dataset.providerSetup);
+    else if(btn.dataset.provider) renderProviderModels(btn.dataset.provider);
+    else if(btn.dataset.providerBack !== undefined) renderApiProviders();
+    else if(btn.dataset.providerSave) saveApiProvider();
+    else if(btn.dataset.providerFetch) fetchApiModels();
+    else if(btn.dataset.providerModels) saveApiModels();
+    else if(btn.dataset.providerDelete !== undefined) deleteApiProvider();
     else if(btn.dataset.setup) renderAgentSetup(modelMenuAgent);
     else if(btn.dataset.copy) copyAgentAsk();
     else if(btn.dataset.parse) parseAgentPaste();
     else if(btn.dataset.redetect) pickModelAgent(modelMenuAgent);
     else if(btn.dataset.save) saveAgentCli();
     else if(btn.dataset.model !== undefined) switchModel(role, btn.dataset.model);
+  });
+  // 预设下拉只填表，不发请求
+  modelMenuEl().addEventListener('change', ev => {
+    if(ev.target && ev.target.id === 'api-preset') applyApiPreset(ev.target.value);
   });
 }
 async function switchModel(role, model){
@@ -6051,6 +6236,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in ("/api/agent-cli/detect", "/api/agent-cli/parse", "/api/agent-cli/save"):
             self._post_agent_cli(parsed.path.rsplit("/", 1)[-1], body)
             return
+        if parsed.path.startswith("/api/api-provider/"):
+            self._post_api_provider(parsed.path.rsplit("/", 1)[-1], body)
+            return
         self._json({"ok": False, "error": "接口不存在"}, 404)
 
     # ---------- 产物：用默认程序打开 / 在资源管理器里定位 ----------
@@ -6099,6 +6287,37 @@ class Handler(BaseHTTPRequestHandler):
             _room_note(message)
         self._json({"ok": ok, "message": message if ok else "", "error": "" if ok else message,
                     "agent": row, "models": _models_snapshot()}, 200 if ok else 400)
+
+    # ---------- /api/api-provider/*：API 通道（OpenAI 兼容） ----------
+    def _post_api_provider(self, action: str, body: dict) -> None:
+        """save / models / delete 写 room/api_providers.json，fetch 还会对外发请求，
+        所以全部走 POST + 写守卫。key 只在 fetch 那一刻从环境变量读，接口返回值里没有它。"""
+        body = body if isinstance(body, dict) else {}
+        pid = str(body.get("id") or "").strip()
+        if action == "fetch":
+            ok, message, ids = API_PROVIDERS.fetch_models(pid)
+            self._json({"ok": ok, "ids": ids, "error": "" if ok else message,
+                        "message": message if ok else ""}, 200 if ok else 400)
+            return
+        if action == "save":
+            ok, message = API_PROVIDERS.save_provider(
+                pid, str(body.get("label") or ""), str(body.get("base_url") or ""),
+                str(body.get("api_key_env") or ""))
+        elif action == "models":
+            raw = body.get("models")
+            if not isinstance(raw, list):
+                self._json({"ok": False, "error": "models 要是列表"}, 400)
+                return
+            ok, message = API_PROVIDERS.save_models(pid, raw)
+        elif action == "delete":
+            ok, message = API_PROVIDERS.delete(pid)
+        else:
+            self._json({"ok": False, "error": "接口不存在"}, 404)
+            return
+        if ok:
+            _room_note(message)             # 登记/删提供方这类动作要留痕
+        self._json({"ok": ok, "message": message if ok else "", "error": "" if ok else message,
+                    "models": _models_snapshot()}, 200 if ok else 400)
 
     # ---------- /api/unlock：解锁卡片用的换 Cookie 接口 ----------
     def _client_ip(self) -> str:

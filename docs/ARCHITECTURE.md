@@ -78,13 +78,15 @@ agent_team/      引擎与所有运行时模块（包）
   team.py        任务卡协议：建卡 / 派发 / 验收 / 复核 / 报告
   room.py        消息总账
   room_web.py    网页工作台（群聊界面）
-  codex_bridge.py 调 Codex CLI 的唯一出口
+  codex_bridge.py 调 Codex CLI 的唯一出口（按注册表的 cli 分流到 claude / api）
+  api_providers.py API 提供方：地址 + key 所在的环境变量名（不存 key）
+  api_bridge.py  调 OpenAI 兼容接口（chat/completions）的唯一出口
   start_all.py   启停与状态
   cli.py         统一命令入口 agent-team
 bin/             兼容壳（老命令 python bin/xxx.py 仍可用）+ 系统启动脚本
 config/          team.json：模型、超时、重试
 agents/          复核者的系统提示词
-tests/           回归测试（290 项）
+tests/           回归测试（688 项）
 docs/            设计文档
 room/ tasks/     运行时账本与任务卡（不进产物仓库）
 ```
@@ -93,5 +95,6 @@ room/ tasks/     运行时账本与任务卡（不进产物仓库）
 
 - 大脑一轮回复 10–40 秒：没有流式输出，靠"正在思考"指示器兜住体验；
 - 单项目串行：同一个引擎一次只跑一条流水线；
+- API 通道只有文字：OpenAI 兼容接口改不了文件，所以 API 模型只能做协调 / 规划 / 复核，执行者必须是本机 CLI；
 - 成本随上下文增长：一次执行 2–30 万 tokens，一圈完整流水线约 20 万起；
 - 只在 Windows 上验证过（PowerShell 5.1 + GBK 控制台），macOS/Linux 路径已留但未长期跑。

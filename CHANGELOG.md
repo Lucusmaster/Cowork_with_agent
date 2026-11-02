@@ -1,3 +1,63 @@
+## 0.9.25 — 第四个模型组：API（OpenAI 兼容）
+
+换模型菜单原来只有 Codex CLI / Claude Code / DeepSeek 三组，都得本机装 CLI。想在规划、
+复核上用 DeepSeek 官方接口或中转站，之前只能改配置、自己拼模型 id，拼错了要跑到下一张卡
+才炸。现在菜单里多一个「API（OpenAI 兼容）」组：填地址和环境变量名，点「拉取模型」，
+勾选真实型号就能切给角色。
+
+### 1. 提供方登记（`agent_team/api_providers.py`）
+
+- `room/api_providers.json`（gitignored）只存 `label / base_url / api_key_env / models`——
+  **没有 key 本身**；`key_for()` 是唯一读 key 的地方，只在发请求那一刻从 `os.environ` 现读。
+- 地址校验用 `urlsplit` 的**主机名**：只放行 https，本机 http 只认 `127.0.0.1` /
+  `localhost` / `[::1]`，所以 `http://localhost.evil.com` 会被拒；地址里带 `@` 用户密码也拒。
+- `fetch_models()` 调 `GET {base_url}/models`，10 秒超时、最多读 1 MB、只取 `data[].id`；
+  401/403 报「key 无效（环境变量 X）」、404 提示 base_url 可能要带 `/v1`、超时报主机名，
+  **任何一句信息里都不出现 key 的值**（上游报错回显请求头时也会先抹掉）。
+- 提供方 id 会做模型前缀：`deepseek:deepseek-chat`。中转站的型号常常也叫 `gpt-*`，
+  不加前缀会和本机 CLI 的型号撞名，两个提供方有同名型号时也分不清发到哪个地址。
+
+### 2. 注册表与角色限制（`agent_team/models.py`）
+
+- `registry()` 在"本机登记"之后并入 API 模型（`setdefault`，撞名时本机 CLI 的条目不动）；
+  静态配置里也可以写 `cli: api` + `provider` + `remote_id`。
+- `cli_ready()` 对 `cli == "api"` **不联网、不碰 CLI**：提供方在不在、环境变量里有没有 key。
+  没 key 时原因里带变量名和"设置后要重启协作台"——`setx` 之后正在跑的进程读不到新变量。
+- `snapshot()["agents"]` 补一行伪 Agent `id == "api"`（带 `providers`），前三组一个不少。
+- `set_model()`、`preflight.check_models()`（含执行者降级链）、菜单三处都拦
+  "API 模型当执行者"：它只能收发文字、改不了文件，当执行者每轮都会空跑。
+
+### 3. 调用与路由（`agent_team/api_bridge.py`）
+
+- `run_api()` 返回和 `run_codex` 同形的结果，同样写 `.last.md` / `.out.txt` / `.err.txt`；
+  请求体里的 `model` 是**远端型号**（`deepseek-chat`），不是带前缀的注册表 id；
+  推理档位不用（响应里如实写"已忽略"）。
+- `codex_bridge.run_codex()` 的 attempt 闭包加 `route == "api"` 分支，降级链照旧工作；
+  429/503 在 `.err.txt` 写一行带 `at capacity` 的说明，`fallback.is_capacity_error()` 直接复用。
+
+### 4. 接口与界面（`agent_team/room_web.py`）
+
+- 新增 `POST /api/api-provider/{save,fetch,models,delete}`，和 `/api/agent-cli/*` 一样走
+  令牌 + `_write_guard`；成功的 save / models / delete 会往群里记一条事件。
+- 菜单新增「API（OpenAI 兼容）」分组：提供方列表（地址、key 状态、模型数）→ 添加/编辑表单
+  （预设 DeepSeek / Ollama / 自定义，四个字段）→ 保存 → 拉取模型 → 勾选 → 保存勾选。
+  **没有填 key 的输入框**，旁边写明"key 放在环境变量里，协作台不保存 key"。
+- 当前角色是执行者时，api 组置灰并提示"不能改文件，只能做协调/规划/复核"；
+  `/models` 返回的型号 id 来自外部服务，插入页面前一律过 `esc()`。
+
+### 证据
+
+- 新增 `tests/test_api_providers.py`（24 项）：地址白名单（含 `localhost.evil.com`）、
+  拉模型解析/401/404/网络错/地址被改坏、`save_models` 过滤非法 id、注册表前缀与撞名、
+  没 key 不就绪、snapshot 保留三个 CLI 行、snapshot 与 `/api/state` 里 grep 不到假 key、
+  `set_model` 拒绝执行者但接受规划者、被占用时拒绝删除、请求体用远端型号、
+  四种路由不带令牌 401。`urllib.request.urlopen` 全部打桩，**不联网**。
+- 真机演练（本地起一个 stub `/models` 服务，走真实 HTTP 路由）：保存 → 拉取 → 勾选 →
+  `/api/state` 里出现 `drill:drill-chat` 且没有假 key → 规划者切换 200 → 执行者 400 →
+  被占用时删除 400。
+- 全套 688 项通过；`ruff check agent_team tests` 干净；`skills/` 与
+  `agent_team/bundled/skills/` 镜像已同步；`room/*` 本来就在 `.gitignore` 里，提供方文件不会进版本库。
+
 ## 0.9.24 — 下单前先体检：闸门排在发消息之前
 
 外部 agent 走 MCP 下单时，环境坏着也照样把需求发进群：消息一发，大脑就被激活开始规划，
