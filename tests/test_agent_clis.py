@@ -361,5 +361,62 @@ class PlannerWiringTests(IsolatedCase):
             self.assertIn("_planner_model()", src, func.__name__)
 
 
+class BrainWiringTests(IsolatedCase):
+    """协调者（大脑）也要读运行时切换：右栏徽章和真正调用的模型必须是同一个。
+
+    以前 `brain_decide()` 写死 `model="gpt-6.1-terra", reasoning_effort="low"`，
+    配置里 coordinator 的 model / effort 和运行时切换全被忽略——徽章显示的和实际跑的不一致。
+    """
+
+    def write_brain_config(self) -> None:
+        cfg = json.loads(models.CONFIG.read_text(encoding="utf-8"))
+        cfg["coordinator"] = {"model": "gpt-6.1-terra",
+                              "fallback_models": ["gpt-6.1-terra"],
+                              "reasoning_effort": "high"}
+        models.CONFIG.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_brain_reads_runtime_switch(self) -> None:
+        from agent_team import worker
+        self.write_brain_config()
+        self.assertEqual(worker._brain_model(), ("gpt-6.1-terra", "high"), "没切就用配置")
+        self.install_claude()
+        ok, message = models.set_model("coordinator", "claude-sonnet-4-5")
+        self.assertTrue(ok, message)
+        self.assertEqual(worker._brain_model()[0], "claude-sonnet-4-5")
+
+    def test_brain_decide_actually_passes_the_overridden_model(self) -> None:
+        """关键是"真的用了"：打桩 run_codex，看它收到的参数。"""
+        from agent_team import worker
+        self.write_brain_config()
+        self.install_claude()
+        self.assertTrue(models.set_model("coordinator", "claude-sonnet-4-5")[0])
+        last = self.tmp / "brain-last.md"
+        last.write_text('{"task": {"title": "改个按钮"}}', encoding="utf-8")
+        calls: list[dict] = []
+
+        def fake_run(prompt, **kw):
+            calls.append(kw)
+            return {"ok": True, "last": str(last), "summary": ""}
+
+        with mock.patch.object(worker, "run_codex", side_effect=fake_run), \
+                mock.patch.object(worker, "load_project", return_value={}), \
+                mock.patch.object(worker, "thread_text", return_value=""), \
+                mock.patch.object(worker, "ROOM", self.tmp / "room"), \
+                mock.patch.object(worker.analysis, "workspace_facts", return_value=""):
+            decision = worker.brain_decide("改个按钮", workspace=self.tmp)
+        self.assertEqual(decision, {"task": {"title": "改个按钮"}})
+        self.assertEqual(calls[0]["model"], "claude-sonnet-4-5", "大脑必须真的用切换后的模型")
+        self.assertEqual(calls[0]["reasoning_effort"], "high")
+        self.assertEqual(calls[0]["fallback_models"], ["gpt-6.1-terra"], "大脑也要走降级链")
+
+    def test_brain_decide_no_longer_hardcodes_the_model(self) -> None:
+        import inspect
+
+        from agent_team import worker
+        src = inspect.getsource(worker.brain_decide)
+        self.assertNotIn('model="gpt-6.1-terra"', src)
+        self.assertIn("_brain_model()", src)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,42 @@
+## 0.9.27 — 协调者（大脑）也能换模型了
+
+`COORDINATOR_API_SPEC.md` 的 A 部分。之前右栏「协调」徽章上显示的模型和真正调用的模型
+**对不上**：`brain_decide()` 里写死 `model="gpt-6.1-terra", reasoning_effort="low"`，
+配置里的 `coordinator.model` 和运行时切换全被忽略。现在统一走和规划/执行/复核同一条链。
+
+### 1. 为什么以前标"不可切"的理由不成立
+
+原来的说法是"换它要重启引擎"。实际上 `brain_decide()` 每条用户消息才调一次 `run_codex`，
+没有常驻会话、没有缓存模型——所以"切完下一条消息生效、不用重启"是成立的，
+这个限制纯属历史遗留。
+
+### 2. 改了什么
+
+- `models.py`：`SWITCHABLE` 加 `coordinator`，`UNSWITCHABLE` 只留 `tester`；
+  `UNSWITCHABLE_REASON` 改指 tester（原来那句会让模块导入直接 KeyError）；
+  模块 docstring 同步。
+- `worker.py`：新增 `_brain_model()`（`models.model_for("coordinator")`，没有值才落到
+  `gpt-6.1-terra`；effort 用 `models.effort_for("coordinator") or "low"`），
+  `brain_decide()` 改用它，并把 `fallback_models=models.fallback_models("coordinator")` 传下去
+  ——大脑现在也走容量降级链。
+- 前端不用改：徽章读的是 `snapshot().roles[].switchable`，协调者变成可点之后，
+  菜单、置灰、来源标签自然就对上了。
+
+### 3. 边界没变
+
+- `tester` 仍然不可切（不调模型）；切换仍然"下一次调用生效"，不打断正在跑的任务。
+- API 模型可以当协调者（配合 0.9.25 的第四组菜单 / 0.9.26 的贴 key），
+  但**仍然不能当执行者**，三处拦截都在。
+
+### 4. 证据
+
+- 新增 `tests/test_agent_clis.py::BrainWiringTests`：`_brain_model()` 读运行时切换；
+  **打桩 `run_codex` 断言 `brain_decide()` 真的把切换后的 model / effort / 降级链传出去**
+  （不是只测"配置读到了"）；源码里不再出现写死的 `model="gpt-6.1-terra"`。
+- 三处旧断言（`test_models` 两处、`test_model_api` 一处）改成断言可切；
+  `/api/set-model` 切协调者后 `room/model_overrides.json` 里出现 `coordinator` 键。
+- 全套 699 项通过；`ruff` 干净；`skills/` 与 bundled 镜像同步，`install-skills` 已重装三份。
+
 ## 0.9.26 — key 直接在菜单里贴：不用设环境变量，也不用重启
 
 0.9.25 把 API 通道做通了，但给 key 的路只有一条：`setx` 设环境变量，**再重启协作台**。

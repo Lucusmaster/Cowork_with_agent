@@ -3,7 +3,7 @@
 这一层的价值全在"别让人悄悄跑在错的模型上"：
 - 名字拼错 → 切换时当场拒绝（不是烧完一轮才发现模型不存在）；
 - 优先级 → 卡上指定 > 运行时切换 > 配置 > 默认，谁也不能越级；
-- 协调者不可切 → 它是引擎自己的大脑，如实拒绝而不是假装切了。
+- 协调者可切、验收者不可切 → 前者每条消息现取模型、后者根本不调模型。
 """
 from __future__ import annotations
 
@@ -170,10 +170,13 @@ class SwitchTests(ModelsCase):
         self.assertEqual(models.overrides(), {})
         self.assertEqual(models.model_for("executor"), ("gpt-6.1-terra", "配置"))
 
-    def test_coordinator_is_not_switchable(self) -> None:
-        ok, message = models.set_model("coordinator", "luna")
-        self.assertFalse(ok)
-        self.assertIn("大脑模型", message)
+    def test_coordinator_is_switchable(self) -> None:
+        """大脑模型每条消息现取一次，没有常驻会话：切完下一条就生效，不用重启。"""
+        with self.only_codex():
+            ok, message = models.set_model("coordinator", "luna")
+        self.assertTrue(ok, message)
+        self.assertEqual(models.model_for("coordinator"), ("gpt-6-luna", "临时"))
+        self.assertEqual(models.overrides(), {"coordinator": "gpt-6-luna"})
 
     def test_unknown_role_is_rejected(self) -> None:
         ok, _ = models.set_model("司机", "luna")
@@ -225,7 +228,8 @@ class SnapshotTests(ModelsCase):
         self.assertEqual(set(roles), set(models.ROLES))
         self.assertEqual(roles["executor"]["model"], "gpt-6.1-terra")
         self.assertEqual(roles["executor"]["source"], "配置")
-        self.assertFalse(roles["coordinator"]["switchable"])
+        self.assertTrue(roles["coordinator"]["switchable"], "协调者（大脑）现在也能运行时切换")
+        self.assertFalse(roles["tester"]["switchable"], "验收不调模型，仍然不可切")
 
     def test_snapshot_marks_unready_registry_entries(self) -> None:
         with self.only_codex():

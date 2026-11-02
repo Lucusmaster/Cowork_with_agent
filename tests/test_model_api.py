@@ -136,7 +136,7 @@ class ModelsEndpointTests(ModelApiCase):
         roles = {row["role"]: row for row in payload["roles"]}
         self.assertEqual(roles["executor"]["model"], "gpt-6.1-terra")
         self.assertEqual(roles["reviewer"]["model"], "gpt-6-luna")
-        self.assertFalse(roles["coordinator"]["switchable"])
+        self.assertTrue(roles["coordinator"]["switchable"], "大脑现在也能切")
         self.assertEqual({item["id"] for item in payload["registry"]},
                          {"gpt-6.1-terra", "gpt-6-luna", "claude-opus-5-5"})
 
@@ -160,10 +160,13 @@ class ModelsEndpointTests(ModelApiCase):
         self.assertIn("不认识", data["error"])
         self.assertEqual(models.overrides(), {}, "失败的切换不能留下痕迹")
 
-    def test_set_model_rejects_coordinator(self) -> None:
+    def test_set_model_can_switch_coordinator(self) -> None:
         status, data = self.request("/api/set-model", {"role": "coordinator", "model": "luna"})
-        self.assertEqual(status, 400)
-        self.assertIn("大脑模型", data["error"])
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        roles = {row["role"]: row for row in data["models"]["roles"]}
+        self.assertEqual(roles["coordinator"]["model"], "gpt-6-luna")
+        self.assertEqual(models.overrides(), {"coordinator": "gpt-6-luna"})
 
     def test_set_model_reset(self) -> None:
         self.request("/api/set-model", {"role": "executor", "model": "luna"})

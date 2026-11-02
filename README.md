@@ -592,7 +592,9 @@ python bin/team.py report -t <ID>
 
 1. **只认注册表里的型号**。`config/team.json` 的 `model_registry` 定义可选型号和别名（`claude`/`ds`/`luna`…），拼错直接拒绝并列出可用项；
 2. **没装对应 CLI 的不许切**。注册表里写了 `claude-opus-5-5` 但本机找不到 `claude`、`--version` 跑不通、或者协作台还没有这个 CLI 的执行适配（目前 DeepSeek 只能登记、不能派发）→ 拒绝并说明，而不是切过去让下一张卡必然失败；
-3. **协调者、验收者不可切**。协调者用的是引擎自己的大脑模型，换要改配置并重启引擎；验收跑的是本地验收命令、只认退出码，不调用模型。页面上标虚线、接口直接拒绝。
+3. **验收者不可切**。验收跑的是本地验收命令、只认退出码，不调用模型，给它模型菜单等于摆设。
+   **协调者（大脑）可以切**：它每条用户消息才调一次模型，没有常驻会话，切完下一条消息就生效，不用重启；
+   默认还是 `gpt-6.1-terra`（`config/team.json` 的 `coordinator.model` / `fallback_models` 照常生效）。
 
 切到 Claude Code 后真的是 `claude -p` 在跑（`agent_team/claude_bridge.py`，提示词走 stdin）。它没有 Codex 那样的沙箱开关，权限这样收：
 复核者和规划者禁掉所有写工具和 Bash；执行者用 `acceptEdits` 只放行改文件、**不能跑命令**（放开命令要 `bypassPermissions`，那就没有边界了），

@@ -389,6 +389,16 @@ def _planner_model() -> tuple[str, str]:
     return (model or "gpt-6.1-terra"), (models.effort_for("planner") or "low")
 
 
+def _brain_model() -> tuple[str, str]:
+    """大脑用的模型：和右栏「协调」徽章同一条链（运行时切换 > 配置），都没写才用老默认。
+
+    以前这里写死 `gpt-6.1-terra`，于是右栏协调者徽章显示的型号和真正调用的对不上。
+    现在每条用户消息都现取一次：没有常驻会话，所以切完下一条消息就生效，不用重启。
+    """
+    model, _ = models.model_for("coordinator")
+    return (model or "gpt-6.1-terra"), (models.effort_for("coordinator") or "low")
+
+
 def plan_with_codex(request: str, workspace: Path) -> dict | None:
     prompt = (PLANNER_PROMPT.replace("{request}", request)
               .replace("{workspace}", str(workspace))
@@ -968,9 +978,11 @@ def brain_decide(request: str, workspace: Path | None = None) -> dict | None:
               .replace("{request}", request))
     out = ROOM / "planner"
     out.mkdir(parents=True, exist_ok=True)
+    model, effort = _brain_model()
     result = run_codex(prompt, workspace=ws, out_prefix=str(out / f"brain-{int(time.time())}"),
-                       sandbox="read-only", timeout=300, model="gpt-6.1-terra",
-                       reasoning_effort="low")
+                       sandbox="read-only", timeout=300, model=model,
+                       reasoning_effort=effort,
+                       fallback_models=models.fallback_models("coordinator"))
     text = ""
     if result.get("last"):
         text = Path(result["last"]).read_text(encoding="utf-8", errors="replace")

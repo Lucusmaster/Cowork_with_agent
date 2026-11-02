@@ -61,7 +61,9 @@ python -m agent_team.cli model reset 执行       # 回到配置默认
 `where <命令>` 和一段可以直接问那个 Agent 的话，把回答贴回去「识别」→「保存并验证」
 （存 `room/agent_clis.json`）。
 规矩：只认注册表里的型号（拼错直接拒）；CLI 找不到、`--version` 跑不通、或协作台没有它的执行适配
-（DeepSeek 目前只能登记）都不许切；**协调者、验收者不可切**（协调者是引擎自己的大脑，验收不调模型）。
+（DeepSeek CLI 只能登记，走 API 组）都不许切；**验收者不可切**（不调模型）；
+**协调者（大脑）可以切**——每条用户消息现取一次模型，切完下一条生效、不用重启，降级链也认
+（`config/team.json` 的 `coordinator.fallback_models` 或运行时覆盖）。
 Claude Code 当执行者时只能改文件、不能跑命令；当复核者时禁掉所有写工具。
 
 第四组「API（OpenAI 兼容）」不用本机 CLI：菜单里加提供方（只收 https 或本机 http），

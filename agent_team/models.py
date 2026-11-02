@@ -15,9 +15,10 @@
   让"切到 claude-opus-5-5"这种笔误在**切换时**报错，而不是烧完一整轮才发现模型不存在；
 - 注册表没写的型号会自动从配置里收录（老配置不改也能用，只是没有别名）。
 
-谁能切：`coordinator` 固定不可切——它是引擎自己的大脑模型，换它要重启引擎，
-不是同一套机制（这里如实标出来，而不是假装能切）。`tester` 也不可切：验收跑的是本地命令，
-只认退出码，根本不调模型——给它一个模型菜单等于摆设。
+谁能切：`coordinator` 现在也能切——它每条用户消息才调一次大脑（`worker.brain_decide` 里
+`models.model_for("coordinator")`），没有常驻会话也没有缓存模型，所以"下一次调用生效"成立，
+不用重启引擎。`tester` 不可切：验收跑的是本地命令，只认退出码，根本不调模型——
+给它一个模型菜单等于摆设。
 
 模型背后是哪个 CLI（codex / claude / …）由注册表的 `cli` 决定；找没找到、能不能跑交给
 `agent_clis`。用户在本机登记的模型（room/agent_clis.json）也算注册表的一部分。
@@ -54,13 +55,12 @@ ROLE_ALIASES = {
     "tester": "tester", "test": "tester", "verify": "tester", "验收": "tester", "验收者": "tester",
     "reviewer": "reviewer", "review": "reviewer", "复核": "reviewer", "复核者": "reviewer",
 }
-# 这些角色真的会调模型、而且派发时读这里的结果（worker 规划 / team dispatch / team review）。
-SWITCHABLE = {"planner", "executor", "reviewer"}
+# 这些角色真的会调模型、而且派发时读这里的结果（worker 大脑 / 规划 / team dispatch / team review）。
+SWITCHABLE = {"coordinator", "planner", "executor", "reviewer"}
 UNSWITCHABLE = {
-    "coordinator": "协调者用的是引擎自己的大脑模型，换它要重启引擎（先改 config 再 restart）",
     "tester": "验收跑的是本地验收命令、只认退出码，不调用模型，没有可换的",
 }
-UNSWITCHABLE_REASON = UNSWITCHABLE["coordinator"]
+UNSWITCHABLE_REASON = UNSWITCHABLE["tester"]
 
 
 def _read_json(path: Path) -> dict:
