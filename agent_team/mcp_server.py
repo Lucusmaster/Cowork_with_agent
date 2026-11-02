@@ -8,9 +8,11 @@
 
     team_status     协作台在不在跑（不需要令牌）
     team_launch     没在跑就起来，返回一次性链接
-    team_task_create 把需求发进群（协作台会拆卡执行），并**等出任务号**
+    team_preflight  下单前的环境体检：模型、降级链、工作区、引擎
+    team_task_create 把需求发进群（先过体检，不过不建卡），并**等出任务号**
     team_task_wait  阻塞等到终态，回报结果
     team_task_list  最近的任务卡
+    team_task_stop  停一张正在跑的卡
 
 几个关键决定：
 
@@ -32,6 +34,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 
+from . import preflight
 from .paths import workbench_root
 from . import __version__
 
@@ -210,8 +213,42 @@ def _recent_messages(port: int | None) -> list:
     return _rows(data.get("messages") if isinstance(data, dict) else [])
 
 
+def team_preflight(port: int | None = None) -> dict:
+    """下单前的环境体检：模型、降级链、工作区、引擎。返回 ok + 阻塞项 + 修复建议。
+
+    `workspace` 直接取 `/api/state` 的字段：`_state_payload` 已经把它合并成
+    「项目工作区 优先，否则活动会话绑的那个」，别去读 `project.workspace`。
+    """
+    state: dict | None
+    try:
+        _, data = _request("GET", "/api/state", port=port)
+        state = data if isinstance(data, dict) else None
+    except ToolError:
+        state = None          # 服务没起来：交给 preflight 报 engine.offline，别在这里抛
+    workspace = str((state or {}).get("workspace") or "")
+    return preflight.run(workspace=workspace, state=state)
+
+
+def _gate_message(gate: dict) -> str:
+    """把体检结果拼成调用方模型能直接照着修的一段话。"""
+    blocking = gate.get("blocking") or []
+    warnings = gate.get("warnings") or []
+    lines = ["环境校验未通过，没有建卡（不消耗轮次）。必须先解决："]
+    for index, row in enumerate(blocking, 1):
+        line = f"{index}. [{row.get('key')}] {row.get('detail')}"
+        if row.get("fix"):
+            line += f" → {row['fix']}"
+        lines.append(line)
+    if warnings:
+        lines.append(f"另有 {len(warnings)} 项提醒（不阻塞）：" + "；".join(
+            f"{row.get('name')}：{row.get('detail')}" for row in warnings[:3]))
+    lines.append("修好后原样重试即可；也可以单独调 team_preflight 看全部项。")
+    return "\n".join(lines)
+
+
 def team_task_create(request: str, port: int | None = None, client: str = "mcp",
-                     plan_timeout: float = 90.0, session_id: str = "") -> dict:
+                     plan_timeout: float = 90.0, session_id: str = "",
+                     skip_preflight: bool = False) -> dict:
     """把需求发进群，并尽量等到任务号。
 
     `POST /api/post` 只返回消息 id；任务卡由后台 worker 拆好后发一条带 task 的群消息。
@@ -220,11 +257,20 @@ def team_task_create(request: str, port: int | None = None, client: str = "mcp",
     request = (request or "").strip()
     if not request:
         raise ToolError("需求不能为空")
+    # 硬闸门：环境跑不起来就别建卡。放在发消息之前——消息一发出去，
+    # 大脑就会被激活、开始规划，轮次和额度就开始烧了。
+    if not skip_preflight:
+        gate = team_preflight(port=port)
+        if not gate.get("ok"):
+            raise ToolError(_gate_message(gate))
     before_task = _newest_task_id(port)
     # agent 只认五角色/user/system（`_agent_from` 会把没见过的名字折成 coordinator），
     # 所以"谁提的需求"放 meta：它原样保留在群消息里，页面也能看到。
-    body = {"content": request, "agent": "user",
-            "meta": {"client": client, "via": "mcp"}}
+    meta = {"client": client, "via": "mcp"}
+    if skip_preflight:
+        # 误报要能绕过，但绕过这件事得能查到：群消息上留个痕。
+        meta["preflight"] = "skipped"
+    body = {"content": request, "agent": "user", "meta": meta}
     if session_id:
         body["session_id"] = session_id
     status, msg = _request("POST", "/api/post", body, port=port)
@@ -375,15 +421,24 @@ TOOLS: dict[str, dict] = {
             "port": {"type": "integer", "description": "端口，默认 8899"},
             "wait": {"type": "number", "description": "最多等多少秒就绪，默认 30"}}},
     },
+    "team_preflight": {
+        "fn": team_preflight,
+        "description": "下单前的环境体检。team_task_create 会自动跑一遍，你也可以单独调来看该修什么。",
+        "inputSchema": {"type": "object", "properties": {
+            "port": {"type": "integer", "description": "端口，默认 8899"}}},
+    },
     "team_task_create": {
         "fn": team_task_create,
         "description": ("把需求发进协作台的群，由它拆任务卡、执行、验收。返回 task_id（等得到时）"
-                        "或 message_id + 提示。需求要写成一句能独立看懂的话。"),
+                        "或 message_id + 提示。需求要写成一句能独立看懂的话。"
+                        "发之前会先做环境体检，不过直接报错、不建卡。"),
         "inputSchema": {"type": "object", "properties": {
             "request": {"type": "string", "description": "需求原文"},
             "client": {"type": "string", "description": "调用方标识，会记在群消息上，默认 mcp"},
             "session_id": {"type": "string", "description": "指定会话 ID（可选，不指定就用当前活动会话）"},
             "plan_timeout": {"type": "number", "description": "等任务号最多多少秒，默认 90"},
+            "skip_preflight": {"type": "boolean",
+                               "description": "跳过环境校验（不推荐；校验误报时才用，会记在群消息上）"},
             "port": {"type": "integer"}}, "required": ["request"]},
     },
     "team_task_wait": {

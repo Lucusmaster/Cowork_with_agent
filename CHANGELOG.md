@@ -1,3 +1,47 @@
+## 0.9.24 — 下单前先体检：闸门排在发消息之前
+
+外部 agent 走 MCP 下单时，环境坏着也照样把需求发进群：消息一发，大脑就被激活开始规划，
+轮次和额度开始烧，往往烧完一轮才在日志里看到"模型拼错了 / 引擎没在跑 / 工作区是空的"。
+`doctor` 也帮不上忙——它只把配置里的模型名打印出来，拼错的型号照样报 ✓。
+
+### 1. 新增 `agent_team/preflight.py`（纯函数，不发 HTTP）
+
+把「这台机器现在能不能真的跑完一张卡」拆成四项可判真假的检查，每项带机器可读的
+`key` 和一句可执行的 `fix`：
+
+| 检查 | 拦什么 | key |
+| --- | --- | --- |
+| 模型 | 主模型不在注册表 / 背后 CLI 跑不了（executor、reviewer、planner 各查一遍） | `model.<role>.unknown`、`model.<role>.cli` |
+| 降级链 | 链里每个 id 逐个查；坏一条只是提醒 | `model.<role>.fallback.<id>` |
+| 工作区 | 空、不存在、落在台账本里、写不进去（探针写一个 `.write-probe` 再删） | `workspace.unbound/.invalid/.in_ledger/.readonly` |
+| 引擎 | 没在跑、进程没了、端口上是别的仓库的实例 | `engine.offline/.dead/.other_repo` |
+
+`blocking` 的顺序就是修复顺序（引擎 → 工作区 → 模型）：引擎没起来时后两项多半是连带的，
+别让外部 agent 从末端开始修。只做判断、不做修复——不自动起引擎、不自动改配置。
+
+### 2. 闸门与入口
+
+- `mcp_server.team_task_create` 在 `POST /api/post` **之前**跑体检，不过就抛错：
+  「环境校验未通过，没有建卡（不消耗轮次）。必须先解决：1. [engine.dead] … → 用 team_launch 起协作台」。
+  消息没发出去 = 大脑没被激活 = 一张卡、一轮额度都没烧；
+- 新增第 7 个工具 `team_preflight`，可以单独调来看全部项；其余五个工具**不加闸门**
+  （环境坏了的时候它们正是用来诊断和修复的，拦住等于把人锁在门外）；
+- 逃生口 `skip_preflight=true` 默认关闭，绕过时在群消息 `meta.preflight` 写 `"skipped"`——
+  误报要能绕过，绕过这件事要能查到；
+- `doctor.check_config` 改成逐角色渲染 preflight 的结果（配置文件的"在不在/解析得开"
+  仍由 doctor 自己判），现在拼错的型号会显示 `✗` 而不是 `✓`。
+
+### 3. 证据
+
+- 新增 `tests/test_preflight.py`（18 项）：`cli_ready` 全部打桩，跑在哪个机器上结论都一样；
+  覆盖坏主模型、坏降级项（只警告，`run()["ok"]` 仍为真）、空链 / 全死链、
+  工作区四种坏法、引擎三种坏法、`blocking` 顺序、`include_remote=False` 的纯本地模式；
+- `tests/test_mcp_server.py` 新增 5 项：体检不过时 `team_task_create` 抛错**且一个 HTTP 请求都没发**
+  （断言的是"没发消息"，不是只断言抛错）；`skip_preflight=true` 能发出去且 `meta.preflight=="skipped"`；
+  `team_preflight` 已登记且 `tools/list` 能列出来；
+- 全套 664 项通过，`ruff check .` 干净；`skills/` 正本与 `agent_team/bundled/skills/` 镜像已同步，
+  `docs/MCP.md` 与 README 的工具清单从 6 个改成 7 个。
+
 ## 0.9.23 — 鹈鹕骑车那一晚：验收命令看产出，模型满载会降级
 
 一张"用 HTML 画一只骑自行车的鹈鹕"的卡（T-261102-012458）两轮都没过，两轮的原因还不一样。

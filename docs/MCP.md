@@ -1,19 +1,20 @@
 # MCP 工具（给别的 Agent 调你的协作台）
 
-协作台不只会自己跑任务——它还暴露 6 个 MCP 工具，任何支持 MCP 的客户端
+协作台不只会自己跑任务——它还暴露 7 个 MCP 工具，任何支持 MCP 的客户端
 （Claude Code、Codex、豆包、DeepSeek Harness 等）都能直接让它干活：
 
 > 「让 agent-team 建一个计算器，跑完把结论给我。」
 
 传输是**标准 stdio JSON-RPC**，只用标准库实现（不引 MCP SDK，也不用额外的包）。
 
-## 六个工具
+## 七个工具
 
 | 工具 | 干什么 | 需要令牌 |
 | --- | --- | --- |
 | `team_status` | 协作台在不在跑；顺带给出最近几张卡 | 否（`/api/alive`） |
 | `team_launch` | 没在跑就起，**已经在跑就不动**；返回一次性打开链接 | 否 |
-| `team_task_create` | 把需求发进群，拆卡执行；**返回 task_id** | 是 |
+| `team_preflight` | 下单前的环境体检：模型、降级链、工作区、引擎 | 是 |
+| `team_task_create` | 把需求发进群，**先过体检**（不过不建卡），拆卡执行；**返回 task_id** | 是 |
 | `team_task_wait` | 阻塞到终态（passed/failed/exec-failed/stopped），给结论 | 是 |
 | `team_task_list` | 最近的卡 | 是 |
 | `team_task_stop` | 停掉一张卡：引擎在下一个步骤边界停下，记为 stopped（`POST /api/control`） | 是 |
@@ -87,10 +88,15 @@ agent-team mcp --action call --tool team_task_create \
    任务号不存在直接报错、已经结束就如实说「已经是 passed/failed，没写指令」。
    写下去的指令是**一条共享槽位**（`room/control.json`，后到的覆盖先到的），
    所以别同时停两张卡。
+7. **`team_task_create` 的体检闸门排在 `POST /api/post` 之前**：模型拼错、降级链全死、
+   工作区为空/落在账本里/不可写、引擎没在跑——任一条不过就直接报错，**不建卡、不消耗轮次**。
+   报错里带机器可读的 `key`（如 `engine.dead`）和修复动作，顺序是引擎 → 工作区 → 模型。
+   校验误报时可以 `skip_preflight: true` 绕过，但会在群消息的 `meta.preflight` 上留痕。
+   其余工具**不加**这道闸门：环境坏了的时候，`team_status` / `team_launch` 正是用来诊断修复的。
 
 ## 自检
 
 ```bash
-python -m unittest tests.test_mcp_server -v      # 36 项
+python -m unittest tests.test_mcp_server -v      # 41 项
 python .tmp/probe17/mcp_e2e.py                   # 真起一个 MCP 子进程走完整握手
 ```

@@ -17,7 +17,7 @@ description: Use when the user wants work done by a team of agents rather than o
 ## 五分钟上手
 
 ```bash
-python -m agent_team.cli doctor    # 体检：环境、端口、配置
+python -m agent_team.cli doctor    # 体检：环境、端口、模型可用性（含降级链）
 python -m agent_team.cli start     # 起协作台 + 引擎
 ```
 
@@ -66,8 +66,8 @@ Claude Code 当执行者时只能改文件、不能跑命令；当复核者时�
 
 ## 从别的 Agent 指挥它（MCP）
 
-协作台暴露 6 个 MCP 工具（stdio JSON-RPC，纯标准库）：`team_status`、`team_launch`、
-`team_task_create`、`team_task_wait`、`team_task_list`、`team_task_stop`。
+协作台暴露 7 个 MCP 工具（stdio JSON-RPC，纯标准库）：`team_status`、`team_launch`、
+`team_preflight`、`team_task_create`、`team_task_wait`、`team_task_list`、`team_task_stop`。
 
 ```bash
 claude mcp add agent-team -- python -m agent_team.mcp_server   # Claude Code
@@ -75,6 +75,9 @@ python -m agent_team.cli mcp --action list                     # 看工具
 python -m agent_team.cli mcp --action call --tool team_status --args '{}'
 ```
 
+- **先体检再下单**：`team_task_create` 内部会先跑 `team_preflight`，
+  校验不过**直接报错、不建卡、不烧轮次**。报错里带 `key` 和修复动作，照着做再重试。
+  想提前知道该修什么就单独调 `team_preflight`。
 - `team_task_create` 会**等到真任务号**再返回；等不到就说"已收下、还在规划"，不会编假 id。
 - `team_task_stop` 停一张正在跑的卡：引擎在下一个步骤边界停，任务记 `stopped`。
   任务号不存在会直接报错、已经结束会如实说「已经是 passed」，不会假装停成功。
@@ -134,6 +137,7 @@ python -m agent_team.cli install-desktop    # 桌面生成 agent-team.lnk，之�
 | 发消息没反应 | `room/worker.log`、`cli status`、`room/typing.json` |
 | 复核总是 NEEDS_FIX | `tasks/<ID>/baseline.diff`（任务前的脏改动）与 `review-*.last.md` |
 | 「继续」不开工 | 消息里有问号/冒号会被当闲聊；确认是短指令（"继续"/"下一步"/"继续做第二阶段"） |
+| MCP 下单直接报「环境校验未通过」 | 报错里的 `key`；或单独调 `team_preflight` 看全部项 |
 | 端口占用 | `cli doctor`，或 `--port` 换一个 |
 | 账本脏了 | `python -m agent_team.cli reset --yes`（先停服务） |
 

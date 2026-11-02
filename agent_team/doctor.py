@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import preflight
 from .resources import resource
 from .winproc import quiet_flags
 from .paths import workbench_root  # noqa: E402
@@ -72,18 +73,23 @@ def check_codex() -> None:
 
 
 def check_config() -> None:
+    """模型与降级链交给 preflight 判——拼错的型号不能只因为"写在配置里"就报 ✓。
+
+    配置文件的"在不在/解析得开"仍是 doctor 自己的事：models.config() 读不到文件时
+    会安静地退回默认值，那种情况下 preflight 只能看到空字符串，说不了"缺文件"。
+    """
     path = resource("config", "team.json")
     if not path.is_file():
         add(BAD, "模型配置", f"缺 {path}")
         return
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
+        json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         add(BAD, "模型配置", f"解析失败：{exc}")
         return
-    executor = (cfg.get("executor") or {}).get("model", "?")
-    reviewer = (cfg.get("reviewer") or {}).get("model", "?")
-    add(OK, "模型配置", f"执行 {executor} / 复核 {reviewer}（在 config/team.json 里改）")
+    levels = {"ok": OK, "warn": WARN, "bad": BAD}
+    for row in [*preflight.check_models(), *preflight.check_fallback_health()]:
+        add(levels.get(row["level"], WARN), row["name"], row["detail"])
 
 
 def check_layout() -> None:

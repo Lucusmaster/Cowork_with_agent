@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -107,11 +108,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(self.mcp._handle_rpc(
             {"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
-    def test_tools_list_has_six_tools_with_schema(self) -> None:
+    def test_tools_list_has_seven_tools_with_schema(self) -> None:
         out = self.mcp._handle_rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in out["result"]["tools"]}
-        self.assertEqual(set(tools), {"team_status", "team_launch", "team_task_create",
-                                      "team_task_wait", "team_task_list", "team_task_stop"})
+        self.assertEqual(set(tools), {"team_status", "team_launch", "team_preflight",
+                                      "team_task_create", "team_task_wait",
+                                      "team_task_list", "team_task_stop"})
         for tool in tools.values():
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertTrue(tool["description"])
@@ -170,6 +172,16 @@ class StatusTests(RoomTestCase):
 
 
 class CreateTaskTests(RoomTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # 闸门本身在 GateTests 里单独测。这里只钉"发消息、等任务号"的行为：
+        # 临时账本没绑工作区，真跑一遍体检会一律被拦。
+        patcher = mock.patch.object(
+            self.mcp, "team_preflight",
+            return_value={"ok": True, "items": [], "blocking": [], "warnings": []})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_create_returns_task_id_when_worker_makes_card(self) -> None:
         """真实现场：发完消息后台会建卡。这里模拟 worker 在 2 秒后建卡。"""
         def make_card() -> None:
@@ -210,6 +222,93 @@ class CreateTaskTests(RoomTestCase):
         self.assertEqual(mine[-1].get("agent"), "user")
         self.assertEqual((mine[-1].get("meta") or {}).get("client"), "claude-code")
         self.assertEqual((mine[-1].get("meta") or {}).get("via"), "mcp")
+
+
+class GateTests(unittest.TestCase):
+    """闸门必须在 `POST /api/post` 之前：校验不过时一条消息都不许发。
+
+    消息一发出去，大脑就被激活开始规划，轮次和额度就开始烧了——
+    所以这里断言的是"没发 HTTP"，不是只断言"抛了错"。
+    """
+
+    def setUp(self) -> None:
+        from agent_team import mcp_server
+        self.mcp = mcp_server
+
+    @staticmethod
+    def _bad_gate() -> dict:
+        return {
+            "ok": False,
+            "items": [],
+            "blocking": [
+                {"level": "bad", "key": "engine.dead", "name": "协作台引擎",
+                 "detail": "引擎进程不在了", "fix": "用 team_launch 重启"},
+                {"level": "bad", "key": "workspace.unbound", "name": "工作区",
+                 "detail": "还没绑定工作区", "fix": "先在群里说「工作区是 X:\\某个仓库」"},
+            ],
+            "warnings": [{"level": "warn", "key": "fallback.executor.empty",
+                          "name": "执行者降级链", "detail": "执行者没配降级链", "fix": ""}],
+        }
+
+    def test_preflight_failure_never_posts(self) -> None:
+        calls: list[tuple] = []
+
+        def fake_request(method, path, *args, **kwargs):
+            calls.append((method, path))
+            return 200, {}
+
+        with mock.patch.object(self.mcp, "team_preflight", return_value=self._bad_gate()), \
+                mock.patch.object(self.mcp, "_request", side_effect=fake_request):
+            with self.assertRaises(self.mcp.ToolError) as ctx:
+                self.mcp.team_task_create("建一个计算器")
+
+        message = str(ctx.exception)
+        self.assertIn("没有建卡", message)
+        self.assertIn("不消耗轮次", message)
+        self.assertIn("engine.dead", message)
+        self.assertEqual(calls, [], "闸门没过，一个 HTTP 请求都不该发出去")
+
+    def test_skip_preflight_posts_and_leaves_a_trace(self) -> None:
+        posts: list[dict] = []
+
+        def fake_request(method, path, body=None, **kwargs):
+            if method == "POST" and path == "/api/post":
+                posts.append(body)
+                return 200, {"ok": True, "id": "msg-0001"}
+            if path == "/api/tasks":
+                return 200, []
+            if path == "/api/state":
+                return 200, {"messages": []}
+            return 200, {}
+
+        with mock.patch.object(self.mcp, "team_preflight",
+                               side_effect=AssertionError("跳过时不该再体检")), \
+                mock.patch.object(self.mcp, "_request", side_effect=fake_request):
+            out = self.mcp.team_task_create("绕过体检的请求", skip_preflight=True, plan_timeout=0)
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["message_id"], "msg-0001")
+        self.assertEqual(posts[0]["meta"]["preflight"], "skipped",
+                         "误报要能绕过，但绕过这件事得能查到")
+
+    def test_gate_message_keeps_repair_order_and_keys(self) -> None:
+        text = self.mcp._gate_message(self._bad_gate())
+        self.assertLess(text.index("engine.dead"), text.index("workspace.unbound"),
+                        "修复顺序是引擎 → 工作区，别让调用方从末端开始修")
+        self.assertIn("另有 1 项提醒", text)
+
+    def test_team_preflight_reports_offline_instead_of_raising(self) -> None:
+        with mock.patch.object(self.mcp, "_request",
+                               side_effect=self.mcp.ToolError("连不上协作台")):
+            gate = self.mcp.team_preflight(port=1)
+        self.assertFalse(gate["ok"])
+        self.assertIn("engine.offline", [row["key"] for row in gate["blocking"]])
+
+    def test_team_preflight_tool_is_registered(self) -> None:
+        self.assertIn("team_preflight", self.mcp.TOOLS)
+        schema = self.mcp.TOOLS["team_preflight"]["inputSchema"]
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("port", schema["properties"])
 
 
 class WaitTests(RoomTestCase):
@@ -390,8 +489,8 @@ class CliTests(unittest.TestCase):
                               cwd=str(REPO),
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for name in ("team_status", "team_launch", "team_task_create", "team_task_wait",
-                     "team_task_list", "team_task_stop"):
+        for name in ("team_status", "team_launch", "team_preflight", "team_task_create",
+                     "team_task_wait", "team_task_list", "team_task_stop"):
             self.assertIn(name, proc.stdout)
 
     def test_cli_call_returns_json(self) -> None:
