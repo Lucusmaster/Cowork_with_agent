@@ -1,12 +1,13 @@
-"""API 提供方：登记 OpenAI 兼容的地址，以及**key 存在哪个环境变量里**。
+"""API 提供方：登记 OpenAI 兼容的地址，以及 key 放在哪里。
 
-协作台不保存 key。`room/api_providers.json`（gitignored）里只有地址和环境变量名；
-真正的 key 只在发请求那一刻从 `os.environ` 现读。这样页面接口被滥用、日志被贴出去，
-都泄漏不到 key。
+key 有两条路，都在本机、都不进版本库：
 
-一个容易踩的坑：协作台进程启动时就继承了环境变量。Windows 上 `setx` 设好之后，
-**正在跑的协作台读不到**，要重启（关网页或 `cli stop` 再 `start`）。所以 `status()`
-每次都现读环境变量、不缓存，`has_key` 为假时界面上必须把这句话写出来。
+1. **环境变量**（推荐，尤其是多台机器共用一份配置时）：文件里只存变量名，key 在系统里；
+2. **直接在菜单里粘贴**（省事，免 `setx`、免重启）：存到 `room/api_keys.json`（gitignored，
+   尽力设成 600）。这条是本机明文文件，和别家工具的凭据文件同一类风险。
+
+两条都有的情况下环境变量优先（`key_for()` 的顺序），所以"机器上设了变量"永远能盖过文件。
+不论哪条路，key 都不会进接口返回值、群消息或日志；`key_for()` 是唯一读 key 的地方。
 """
 from __future__ import annotations
 
@@ -25,35 +26,58 @@ from .paths import workbench_root
 
 ROOT = workbench_root()
 STORE = ROOT / "room" / "api_providers.json"     # 只有环境变量名，没有 key
+KEYS = ROOT / "room" / "api_keys.json"           # 菜单里直接粘贴的 key（本机明文，gitignored）
 
 PID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,23}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{1,63}$")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 MAX_MODELS = 100
+MAX_KEY = 512
 FETCH_LIMIT = 200
 READ_LIMIT = 1_048_576          # /models 响应最多读 1 MB
 
 
-def _read() -> dict:
+def _read_at(path: Path) -> dict:
     try:
-        data = json.loads(STORE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _write(data: dict) -> None:
+def _write_at(path: Path, data: dict) -> None:
     """原子写：mkstemp、先关句柄、再 os.replace（Windows 上不关句柄会 WinError 32）。"""
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=str(STORE.parent), prefix=".api-providers-", suffix=".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}-", suffix=".tmp")
     tmp = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(data, ensure_ascii=False, indent=2))
-        os.replace(tmp, STORE)
+        os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
+    try:                              # 有 key 的文件尽量只给当前用户读（Windows 上是 no-op）
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _read() -> dict:
+    return _read_at(STORE)
+
+
+def _write(data: dict) -> None:
+    _write_at(STORE, data)
+
+
+def _read_keys() -> dict:
+    return {str(pid): str(value) for pid, value in _read_at(KEYS).items()
+            if PID_RE.match(str(pid)) and isinstance(value, str) and value.strip()}
+
+
+def _write_keys(data: dict) -> None:
+    _write_at(KEYS, data)
 
 
 def load() -> dict[str, dict]:
@@ -74,13 +98,15 @@ def load() -> dict[str, dict]:
 
 
 def status(pid: str) -> dict:
-    """给界面用：不含 key，`has_key` 每次都现读环境变量。"""
+    """给界面用：不含 key，`has_key` 现读（环境变量或本机保存的 key）。"""
     entry = load().get(str(pid)) or {}
     env = str(entry.get("api_key_env") or "")
+    source = _key_source(str(pid))
     return {"id": str(pid), "label": str(entry.get("label") or pid),
             "base_url": str(entry.get("base_url") or ""),
             "api_key_env": env,
-            "has_key": bool(env) and bool(os.environ.get(env, "").strip()),
+            "has_key": bool(source),
+            "key_source": source,          # "env" / "file" / ""，界面上用来区分
             "models": list(entry.get("models") or []),
             "fetched_at": str(entry.get("fetched_at") or "")}
 
@@ -137,11 +163,50 @@ def save_provider(pid: str, label: str, base_url: str, api_key_env: str) -> tupl
     return True, f"已保存 API 提供方 {name}（{count} 个模型）"
 
 
-def key_for(pid: str) -> str:
-    """从环境变量读 key。只在 `api_bridge` 发请求时调用，别处不许读。"""
+def _key_source(pid: str) -> str:
+    """key 从哪来：`env`（环境变量优先）、`file`（菜单里粘过）、空串（没有）。"""
     entry = load().get(str(pid)) or {}
     env = str(entry.get("api_key_env") or "")
-    return os.environ.get(env, "").strip() if env else ""
+    if env and os.environ.get(env, "").strip():
+        return "env"
+    return "file" if _read_keys().get(str(pid)) else ""
+
+
+def key_for(pid: str) -> str:
+    """取 key：环境变量优先，其次本机保存的那份。只在发请求时调用，别处不许读。"""
+    entry = load().get(str(pid)) or {}
+    env = str(entry.get("api_key_env") or "")
+    from_env = os.environ.get(env, "").strip() if env else ""
+    if from_env:
+        return from_env
+    return str(_read_keys().get(str(pid)) or "").strip()
+
+
+def save_key(pid: str, key: str) -> tuple[bool, str]:
+    """把 key 存到本机（`room/api_keys.json`，gitignored）；立即生效，不用重启。"""
+    pid = str(pid or "").strip().lower()
+    if pid not in load():
+        return False, f"没有这个 API 提供方：{pid or '（空）'}（先保存提供方再贴 key）"
+    value = str(key or "").strip()
+    if not value:
+        return False, "key 是空的：要清掉请点「清除 key」"
+    if len(value) > MAX_KEY:
+        return False, f"key 太长了（最多 {MAX_KEY} 个字符），是不是粘错了"
+    if "\n" in value or "\r" in value:
+        return False, "key 里不能有换行，只粘 key 本身"
+    keys = _read_keys()
+    keys[pid] = value
+    _write_keys(keys)
+    return True, f"key 已保存到本机（{KEYS.name}，不进 git），立即生效"
+
+
+def clear_key(pid: str) -> tuple[bool, str]:
+    """删掉本机保存的 key；环境变量里设的 key 不受影响。"""
+    keys = _read_keys()
+    if not keys.pop(str(pid), None):
+        return False, "本机没有保存过这个提供方的 key"
+    _write_keys(keys)
+    return True, "已清除本机保存的 key（环境变量里的不受影响）"
 
 
 def _scrub(text: str, key: str) -> str:
@@ -167,7 +232,8 @@ def fetch_models(pid: str) -> tuple[bool, str, list[str]]:
     env = str(entry.get("api_key_env") or "")
     key = key_for(pid)
     if not key:
-        return False, f"没读到环境变量 {env}（设置后要重启协作台才生效）", []
+        return False, (f"没读到 key：环境变量 {env} 为空，本机也没保存过"
+                       "（在菜单里贴 key 立即生效；设环境变量则要重启协作台）"), []
     url = str(entry.get("base_url") or "").rstrip("/") + "/models"
     try:
         req = urllib.request.Request(url, method="GET")
@@ -235,8 +301,11 @@ def delete(pid: str) -> tuple[bool, str]:
     label = str(entry.get("label") or pid)
     data.pop(str(pid), None)
     _write(data)
+    keys = _read_keys()
+    if keys.pop(str(pid), None):
+        _write_keys(keys)
     return True, f"已删除 API 提供方 {label}"
 
 
-__all__ = ["LOCAL_HOSTS", "delete", "fetch_models", "key_for", "load",
-           "save_models", "save_provider", "status"]
+__all__ = ["KEYS", "LOCAL_HOSTS", "clear_key", "delete", "fetch_models", "key_for", "load",
+           "save_key", "save_models", "save_provider", "status"]

@@ -79,14 +79,14 @@ agent_team/      引擎与所有运行时模块（包）
   room.py        消息总账
   room_web.py    网页工作台（群聊界面）
   codex_bridge.py 调 Codex CLI 的唯一出口（按注册表的 cli 分流到 claude / api）
-  api_providers.py API 提供方：地址 + key 所在的环境变量名（不存 key）
+  api_providers.py API 提供方：地址、key（环境变量名或本机保存的那份）
   api_bridge.py  调 OpenAI 兼容接口（chat/completions）的唯一出口
   start_all.py   启停与状态
   cli.py         统一命令入口 agent-team
 bin/             兼容壳（老命令 python bin/xxx.py 仍可用）+ 系统启动脚本
 config/          team.json：模型、超时、重试
 agents/          复核者的系统提示词
-tests/           回归测试（688 项）
+tests/           回归测试（696 项）
 docs/            设计文档
 room/ tasks/     运行时账本与任务卡（不进产物仓库）
 ```

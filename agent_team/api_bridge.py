@@ -70,7 +70,8 @@ def run_api(prompt: str, workspace: str | None = None, out_prefix: str | None = 
         return fail(2, f"API 提供方 {provider} 没配地址：在换模型菜单里补上")
     key = api_providers.key_for(provider)
     if not key:
-        return fail(2, f"没读到环境变量 {env}（设置后要重启协作台才生效）")
+        return fail(2, (f"没读到 key（环境变量 {env or '（未填写）'} 为空，本机也没保存过）："
+                        "在换模型菜单里贴 key，或设好环境变量后重启协作台"))
 
     url = base_url + "/chat/completions"
     body = {"model": remote, "messages": [{"role": "user", "content": str(prompt or "")}]}

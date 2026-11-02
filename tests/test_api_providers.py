@@ -71,6 +71,7 @@ class ApiCase(unittest.TestCase):
         self.write_config()
         self._patches = [
             mock.patch.object(api_providers, "STORE", room / "api_providers.json"),
+            mock.patch.object(api_providers, "KEYS", room / "api_keys.json"),
             mock.patch.object(agent_clis, "STORE", room / "agent_clis.json"),
             mock.patch.object(agent_clis, "_common_candidates", return_value=[]),
             mock.patch.dict(agent_clis.os.environ, {}, clear=False),
@@ -255,6 +256,70 @@ class RegistryTests(ApiCase):
         self.assertTrue(ok, message)
 
 
+class KeyStorageTests(ApiCase):
+    """key 也可以直接在菜单里贴：只落本机文件、立即生效、绝不回显。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.add_provider()
+
+    def test_saved_key_takes_effect_without_env(self) -> None:
+        ok, message = api_providers.save_key("deepseek", FAKE_KEY)
+        self.assertTrue(ok, message)
+        self.assertEqual(api_providers.key_for("deepseek"), FAKE_KEY)
+        status = api_providers.status("deepseek")
+        self.assertTrue(status["has_key"])
+        self.assertEqual(status["key_source"], "file")
+        # key 在 STORE 里没有，在单独的 keys 文件里（这就是"存本机"的代价）
+        self.assertNotIn(FAKE_KEY, api_providers.STORE.read_text(encoding="utf-8"))
+        self.assertIn(FAKE_KEY, api_providers.KEYS.read_text(encoding="utf-8"))
+
+    def test_env_var_wins_over_saved_key(self) -> None:
+        api_providers.save_key("deepseek", FAKE_KEY)
+        api_providers.os.environ[ENV] = "sk-from-env"
+        self.assertEqual(api_providers.key_for("deepseek"), "sk-from-env")
+        self.assertEqual(api_providers.status("deepseek")["key_source"], "env")
+
+    def test_clear_key_removes_only_the_local_copy(self) -> None:
+        api_providers.save_key("deepseek", FAKE_KEY)
+        self.assertTrue(api_providers.clear_key("deepseek")[0])
+        self.assertFalse(api_providers.status("deepseek")["has_key"])
+        self.assertEqual(api_providers.key_for("deepseek"), "")
+        api_providers.os.environ[ENV] = "sk-from-env"
+        self.assertEqual(api_providers.key_for("deepseek"), "sk-from-env", "环境变量不该被连带清掉")
+
+    def test_rejects_empty_multiline_and_unknown_provider(self) -> None:
+        self.assertFalse(api_providers.save_key("deepseek", "")[0])
+        self.assertFalse(api_providers.save_key("deepseek", "sk-a\nsk-b")[0])
+        ok, message = api_providers.save_key("nope", FAKE_KEY)
+        self.assertFalse(ok)
+        self.assertIn("没有这个 API 提供方", message)
+
+    def test_delete_removes_saved_key(self) -> None:
+        api_providers.save_key("deepseek", FAKE_KEY)
+        self.assertTrue(api_providers.delete("deepseek")[0])
+        self.assertFalse(api_providers.status("deepseek")["has_key"])
+        self.assertNotIn(FAKE_KEY, api_providers.KEYS.read_text(encoding="utf-8"))
+
+    def test_snapshot_never_contains_saved_key(self) -> None:
+        api_providers.save_key("deepseek", FAKE_KEY)
+        api_providers.save_models("deepseek", ["deepseek-chat"])
+        raw = json.dumps(models.snapshot(), ensure_ascii=False)
+        self.assertNotIn(FAKE_KEY, raw)
+        self.assertIn("deepseek:deepseek-chat", raw)
+
+    def test_fetch_works_with_saved_key_and_never_echoes_it(self) -> None:
+        api_providers.save_key("deepseek", FAKE_KEY)
+        saved: list = []
+        with mock.patch.object(urllib.request, "urlopen",
+                               side_effect=_ok({"data": [{"id": "m1"}]}, saved)):
+            ok, message, ids = api_providers.fetch_models("deepseek")
+        self.assertTrue(ok, message)
+        self.assertEqual(ids, ["m1"])
+        self.assertEqual(saved[0].get_header("Authorization"), f"Bearer {FAKE_KEY}")
+        self.assertNotIn(FAKE_KEY, message)
+
+
 class ApiBridgeTests(ApiCase):
     def setUp(self) -> None:
         super().setUp()
@@ -384,6 +449,8 @@ class RouteAuthTests(ApiCase):
         for path, body in (("/api/api-provider/save", {"id": "d"}),
                            ("/api/api-provider/fetch", {"id": "d"}),
                            ("/api/api-provider/models", {"id": "d", "models": []}),
+                           ("/api/api-provider/key", {"id": "d", "key": "sk-x"}),
+                           ("/api/api-provider/clear-key", {"id": "d"}),
                            ("/api/api-provider/delete", {"id": "d"})):
             status, _ = self.request(path, body, token="")
             self.assertEqual(status, 401, path)
@@ -413,6 +480,30 @@ class RouteAuthTests(ApiCase):
         self.assertEqual(status, 200, raw)
         self.assertIn("m1", raw)
         self.assertNotIn(FAKE_KEY, raw)     # 假 key 进了请求头，也不能回显
+
+    def test_key_route_enables_fetch_without_env_or_restart(self) -> None:
+        """菜单里贴 key 的那条路：不设环境变量也能立刻拉模型。"""
+        status, raw = self.request("/api/api-provider/save", {
+            "id": "deepseek", "label": "DeepSeek",
+            "base_url": "https://api.deepseek.com", "api_key_env": ENV})
+        self.assertEqual(status, 200, raw)
+        status, raw = self.request("/api/api-provider/key", {"id": "deepseek", "key": FAKE_KEY})
+        self.assertEqual(status, 200, raw)
+        self.assertNotIn(FAKE_KEY, raw)
+        with mock.patch.object(urllib.request, "urlopen",
+                               side_effect=_ok({"data": [{"id": "m1"}]})):
+            status, raw = self.request("/api/api-provider/fetch", {"id": "deepseek"})
+        self.assertEqual(status, 200, raw)
+        self.assertIn("m1", raw)
+        self.assertNotIn(FAKE_KEY, raw)
+        status, raw = self.request("/api/state")
+        self.assertEqual(status, 200)
+        self.assertNotIn(FAKE_KEY, raw)
+        status, raw = self.request("/api/api-provider/clear-key", {"id": "deepseek"})
+        self.assertEqual(status, 200, raw)
+        self.assertNotIn(FAKE_KEY, raw)
+        status, raw = self.request("/api/api-provider/fetch", {"id": "deepseek"})
+        self.assertEqual(status, 400, "清掉 key 之后就拉不动了：" + raw)
 
 
 if __name__ == "__main__":

@@ -5276,14 +5276,15 @@ function renderApiProviders(){
   }
   provs.forEach(p => {
     const n = (p.models || []).length;
-    const keyTxt = p.has_key ? ('已读到 ' + p.api_key_env) : ('没读到 ' + p.api_key_env);
+    const keyTxt = p.key_source === 'env' ? ('已读到（环境变量 ' + p.api_key_env + '）')
+      : (p.key_source === 'file' ? 'key 已保存在本机' : ('没读到 ' + (p.api_key_env || 'key')));
     html += '<button class="mi" data-provider="' + esc(p.id) + '" title="' + esc(p.base_url || '') + '">'
       + '<span>' + esc(p.label || p.id) + (n ? '' : ' · 还没勾模型') + ' ›</span>'
       + '<span class="tag' + (p.has_key ? '' : ' warn') + '">' + esc(n + ' 个模型 · ' + keyTxt) + '</span></button>';
   });
   if(provs.some(p => !p.has_key)){
-    html += '<div class="p warn">没读到环境变量：设置后要重启协作台才能生效'
-      + '（关网页收工，或 <code>cli stop</code> 再 <code>start</code>）。</div>';
+    html += '<div class="p warn">还没有 key：在提供方里直接贴（立即生效、不用重启），'
+      + '或者设好环境变量再重启协作台。</div>';
   }
   html += '<div class="menu-sep"></div>'
     + '<button class="mi" data-provider-add="1"><span>＋ 添加提供方</span></button>';
@@ -5322,16 +5323,24 @@ function renderApiSetup(pid){
     + '" placeholder="deepseek" spellcheck="false"' + (pid ? ' disabled' : '') + '></label>'
     + '<label class="step">地址<input id="api-url" value="' + esc(p.base_url || '')
     + '" placeholder="https://api.deepseek.com" spellcheck="false"></label>'
-    + '<label class="step">key 所在的环境变量<input id="api-env" value="' + esc(p.api_key_env || '')
+    + '<label class="step">key 所在的环境变量（可留默认）<input id="api-env" value="' + esc(p.api_key_env || '')
     + '" placeholder="DEEPSEEK_API_KEY" spellcheck="false"></label>'
-    + '<div class="p dim">key 只放环境变量，协作台不保存它。Windows 上 <code>setx</code> 之后要'
-    + '重启协作台才读得到（关网页收工，或 <code>cli stop</code> 再 <code>start</code>）。</div>'
+    + '<div class="p dim">两种给 key 的方式，选一种就行：① 设环境变量（<code>setx</code> 之后要重启协作台）；'
+    + '② 在下面直接贴——只存本机 <code>room/api_keys.json</code>（不进 git、不回显），保存后<strong>立即生效、不用重启</strong>。</div>'
     + '<div class="row"><button class="pick-btn" data-provider-save="1">保存</button>'
     + '<button class="pick-btn" data-provider-fetch="1"' + (pid ? '' : ' disabled') + '>拉取模型</button></div>';
   if(pid){
-    const keyTxt = p.has_key ? '✓ 已读到 ' + p.api_key_env : '✗ 没读到 ' + p.api_key_env;
-    html += '<div class="p' + (p.has_key ? ' dim' : ' warn') + '">' + esc(keyTxt)
-      + (p.has_key ? '' : '：设置后要重启协作台才生效') + '</div>';
+    const src = p.key_source === 'env' ? ('✓ 已读到（环境变量 ' + p.api_key_env + '）')
+      : (p.key_source === 'file' ? '✓ 已保存在本机（立即生效）'
+        : ('✗ 还没有 key：环境变量 ' + (p.api_key_env || '（未填写）') + ' 为空，本机也没保存过'));
+    html += '<div class="p' + (p.has_key ? ' dim' : ' warn') + '">' + esc(src) + '</div>'
+      + '<label class="step">直接贴 key（只存本机，不回显）<input id="api-key" type="password"'
+      + ' autocomplete="off" spellcheck="false" placeholder="sk-…"></label>'
+      + '<div class="row"><button class="pick-btn" data-provider-key="1">保存 key</button>'
+      + (p.key_source === 'file' ? '<button class="pick-btn" data-provider-clear-key="1">清除本机 key</button>' : '')
+      + '</div>';
+  } else {
+    html += '<div class="p dim">先点「保存」登记这个提供方，再贴 key。</div>';
   }
   html += '<div id="api-models"></div>';
   if(pid){
@@ -5394,6 +5403,27 @@ async function deleteApiProvider(){
   if(!data || !data.ok){ toast((data && data.error) || '删除失败'); return; }
   toast(data.message || '已删除');
   renderApiProviders();
+}
+async function saveApiKey(){
+  const pid = modelMenuProvider;
+  const el = $('api-key');
+  const key = el ? String(el.value || '').trim() : '';
+  if(!pid) return;
+  if(!key){ toast('先把 key 粘进来'); return; }
+  const data = await apiPost('/api/api-provider/key', {id: pid, key: key});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '保存 key 失败'); return; }
+  toast(data.message || 'key 已保存，立即生效');
+  renderApiSetup(pid);       // 重画会把输入框整个换掉，key 不在页面上停留
+}
+async function clearApiKey(){
+  const pid = modelMenuProvider;
+  if(!pid) return;
+  const data = await apiPost('/api/api-provider/clear-key', {id: pid});
+  if(data && data.models) st.models = data.models;
+  if(!data || !data.ok){ toast((data && data.error) || '清除失败'); return; }
+  toast(data.message || '已清除');
+  renderApiSetup(pid);
 }
 function renderAgentSetup(agent, row){
   const a = row || modelAgent(agent);
@@ -5498,6 +5528,8 @@ if(modelMenuEl()){
     else if(btn.dataset.provider) renderProviderModels(btn.dataset.provider);
     else if(btn.dataset.providerBack !== undefined) renderApiProviders();
     else if(btn.dataset.providerSave) saveApiProvider();
+    else if(btn.dataset.providerKey) saveApiKey();
+    else if(btn.dataset.providerClearKey !== undefined) clearApiKey();
     else if(btn.dataset.providerFetch) fetchApiModels();
     else if(btn.dataset.providerModels) saveApiModels();
     else if(btn.dataset.providerDelete !== undefined) deleteApiProvider();
@@ -6309,6 +6341,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "models 要是列表"}, 400)
                 return
             ok, message = API_PROVIDERS.save_models(pid, raw)
+        elif action == "key":
+            # 只在服务端收下并落盘，任何响应里都不带 key 本身
+            ok, message = API_PROVIDERS.save_key(pid, str(body.get("key") or ""))
+        elif action == "clear-key":
+            ok, message = API_PROVIDERS.clear_key(pid)
         elif action == "delete":
             ok, message = API_PROVIDERS.delete(pid)
         else:

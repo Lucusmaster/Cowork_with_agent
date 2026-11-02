@@ -1,3 +1,41 @@
+## 0.9.26 — key 直接在菜单里贴：不用设环境变量，也不用重启
+
+0.9.25 把 API 通道做通了，但给 key 的路只有一条：`setx` 设环境变量，**再重启协作台**。
+这两步都卡人：`setx` 不生效（正在跑的进程继承不到新变量）、重启还得换引导链接。
+所以补一条不折腾的路——在菜单里直接把 key 粘进去，存本机、马上能用。
+
+### 1. key 存哪、怎么生效（`agent_team/api_providers.py`）
+
+- 新增 `room/api_keys.json`（在 `/room/*` 忽略规则里，**不进 git**；写入后尽力 `chmod 600`），
+  只存 `提供方 id → key`。这点变化要说清楚：**key 会落本机明文文件**，和别家 CLI 的
+  `auth.json` / `.aws/credentials` 同一类风险；多人共用同一台机器时，仍建议用环境变量。
+- 两条路都保留，**环境变量优先**：`key_for()` 先看环境变量，没有才读本机文件。
+  `status()` 多返回一个 `key_source`（`env` / `file` / 空），界面上分别显示"已读到（环境变量 X）"
+  "已保存在本机（立即生效）"。
+- `save_key(pid, key)` / `clear_key(pid)`：校验提供方存在、key 非空、≤512 字符、不带换行；
+  删除提供方时连同本机保存的 key 一起清掉。`clear_key` 只清本机那份，环境变量不受影响。
+- key **依旧不出现在任何返回值、群事件、日志、快照里**；上游报错回显请求头时照旧先抹掉。
+
+### 2. 菜单里那一格（`agent_team/room_web.py`）
+
+- 提供方表单里多一个 `type="password"` 的「直接贴 key」输入框 + 「保存 key」/「清除本机 key」，
+  保存后**重画整个表单**，key 不在页面上停留。
+- 新增两条路由：`POST /api/api-provider/key`（`{id, key}`）和 `POST /api/api-provider/clear-key`（`{id}`），
+  和别的写接口一样走令牌 + `_write_guard`；成功的动作会往群里记一条事件（不含 key）。
+- 没有 key 时的提示改成两选一："在提供方里直接贴（立即生效、不用重启），或者设好环境变量再重启协作台"。
+
+### 3. 证据
+
+- `tests/test_api_providers.py` 从 24 项加到 32 项：本机保存的 key 立即生效（不设环境变量）、
+  环境变量优先于本机文件、`clear_key` 不连带清环境变量、空 key/多行 key/未知提供方被拒、
+  删提供方连 key 一起清、快照里 grep 不到 key、路由保存后能直接拉模型且响应不含 key、
+  六条 `/api/api-provider/*` 路由不带令牌 401。
+- 真机演练（本地 stub `/models`，**完全没设环境变量**）：保存提供方 200 → 未贴 key 拉取 400 →
+  贴 key 200 且响应不含 key → 拉取拿到 `['drill-chat']` → 勾选 200 → `/api/state` 有
+  `drill:drill-chat`、无 key → 规划者切换 200 → 执行者 400 → 清除 key 后再拉 400。
+- 全套 696 项通过；`ruff check agent_team tests` 干净；页面内联 JS `node --check` 通过；
+  `skills/` 与 bundled 镜像已同步，`install-skills` 已重新安装三份。
+
 ## 0.9.25 — 第四个模型组：API（OpenAI 兼容）
 
 换模型菜单原来只有 Codex CLI / Claude Code / DeepSeek 三组，都得本机装 CLI。想在规划、

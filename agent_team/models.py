@@ -335,8 +335,9 @@ def cli_ready(model: str) -> tuple[bool, str]:
         if not entry:
             return False, f"{model}：API 提供方 {provider} 不存在（在换模型菜单里添加）"
         env = str(entry.get("api_key_env") or "")
-        if not env or not os.environ.get(env, "").strip():
-            return False, f"{model}：没读到环境变量 {env}（设置后要重启协作台才生效）"
+        if not api_providers.key_for(provider):
+            return False, (f"{model}：没读到 key（环境变量 {env or '（未填写）'} 为空，本机也没保存过）；"
+                           "在菜单里贴 key 立即生效，设环境变量则要重启协作台")
         return True, ""
     ok, why = agent_clis.ready(cli)
     return (True, "") if ok else (False, f"{model}：{why}")
