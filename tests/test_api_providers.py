@@ -134,6 +134,37 @@ class SaveProviderTests(ApiCase):
         saved = json.loads(raw)["deepseek"]
         self.assertEqual(set(saved), {"label", "base_url", "api_key_env", "models", "fetched_at"})
 
+    def test_env_name_is_case_insensitive_and_optional(self) -> None:
+        """用户把 `deepseek_api_key` 小写粘进来、或者干脆不填，都不该报错。"""
+        ok, message = api_providers.save_provider("aa", "A", "https://x.com", "deepseek_api_key")
+        self.assertTrue(ok, message)
+        self.assertEqual(api_providers.load()["aa"]["api_key_env"], "DEEPSEEK_API_KEY")
+        ok, message = api_providers.save_provider("bb", "B", "https://x.com", "")
+        self.assertTrue(ok, message)
+        self.assertEqual(api_providers.load()["bb"]["api_key_env"], "BB_API_KEY")
+
+    def test_key_pasted_into_env_field_is_saved_as_key(self) -> None:
+        """真实误操作：把 `sk-...` 贴进"环境变量名"栏。别只丢一句大写报错。"""
+        ok, message = api_providers.save_provider("deepseek", "DeepSeek",
+                                                  "https://api.deepseek.com", FAKE_KEY)
+        self.assertTrue(ok, message)
+        self.assertEqual(api_providers.key_for("deepseek"), FAKE_KEY)
+        self.assertEqual(api_providers.status("deepseek")["key_source"], "file")
+        self.assertEqual(api_providers.load()["deepseek"]["api_key_env"], "DEEPSEEK_API_KEY")
+        self.assertNotIn(FAKE_KEY, api_providers.STORE.read_text(encoding="utf-8"))
+
+    def test_provider_and_key_saved_in_one_call(self) -> None:
+        ok, message = api_providers.save_provider("deepseek", "DeepSeek",
+                                                  "https://api.deepseek.com", ENV, FAKE_KEY)
+        self.assertTrue(ok, message)
+        self.assertEqual(api_providers.key_for("deepseek"), FAKE_KEY)
+        self.assertIn("立即生效", message)
+
+    def test_bad_env_name_explains_where_to_put_the_key(self) -> None:
+        ok, message = api_providers.save_provider("aa", "A", "https://x.com", "my var")
+        self.assertFalse(ok)
+        self.assertIn("直接贴 key", message)
+
 
 class FetchModelsTests(ApiCase):
     def setUp(self) -> None:
@@ -480,6 +511,20 @@ class RouteAuthTests(ApiCase):
         self.assertEqual(status, 200, raw)
         self.assertIn("m1", raw)
         self.assertNotIn(FAKE_KEY, raw)     # 假 key 进了请求头，也不能回显
+
+    def test_save_route_can_carry_the_key(self) -> None:
+        """一次保存就够：提供方 + key 同一条请求，保存完直接能拉模型。"""
+        status, raw = self.request("/api/api-provider/save", {
+            "id": "deepseek", "label": "DeepSeek", "base_url": "https://api.deepseek.com",
+            "api_key_env": "deepseek_api_key", "key": FAKE_KEY})
+        self.assertEqual(status, 200, raw)
+        self.assertNotIn(FAKE_KEY, raw)
+        self.assertIn("立即生效", raw)
+        with mock.patch.object(urllib.request, "urlopen",
+                               side_effect=_ok({"data": [{"id": "m1"}]})):
+            status, raw = self.request("/api/api-provider/fetch", {"id": "deepseek"})
+        self.assertEqual(status, 200, raw)
+        self.assertIn("m1", raw)
 
     def test_key_route_enables_fetch_without_env_or_restart(self) -> None:
         """菜单里贴 key 的那条路：不设环境变量也能立刻拉模型。"""

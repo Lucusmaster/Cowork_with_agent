@@ -5351,10 +5351,13 @@ function renderApiSetup(pid){
     + '" placeholder="deepseek" spellcheck="false"' + (pid ? ' disabled' : '') + '></label>'
     + '<label class="step">地址<input id="api-url" value="' + esc(p.base_url || '')
     + '" placeholder="https://api.deepseek.com" spellcheck="false"></label>'
-    + '<label class="step">key 所在的环境变量（可留默认）<input id="api-env" value="' + esc(p.api_key_env || '')
-    + '" placeholder="DEEPSEEK_API_KEY" spellcheck="false"></label>'
+    + '<label class="step">key 所在的环境变量（可留空，自动用 ' + esc((pid || 'deepseek').toUpperCase() + '_API_KEY')
+    + '）<input id="api-env" value="' + esc(p.api_key_env || '')
+    + '" placeholder="留空自动填，如 DEEPSEEK_API_KEY" spellcheck="false"></label>'
     + '<div class="p dim">两种给 key 的方式，选一种就行：① 设环境变量（<code>setx</code> 之后要重启协作台）；'
     + '② 在下面直接贴——只存本机 <code>room/api_keys.json</code>（不进 git、不回显），保存后<strong>立即生效、不用重启</strong>。</div>'
+    + '<label class="step">直接贴 key（存本机；和提供方一起保存）<input id="api-key" type="password"'
+    + ' autocomplete="off" spellcheck="false" placeholder="sk-…（贴在这里，不要贴到上面变量名栏）"></label>'
     + '<div class="row"><button class="pick-btn" data-provider-save="1">保存</button>'
     + '<button class="pick-btn" data-provider-fetch="1"' + (pid ? '' : ' disabled') + '>拉取模型</button></div>';
   if(pid){
@@ -5362,13 +5365,9 @@ function renderApiSetup(pid){
       : (p.key_source === 'file' ? '✓ 已保存在本机（立即生效）'
         : ('✗ 还没有 key：环境变量 ' + (p.api_key_env || '（未填写）') + ' 为空，本机也没保存过'));
     html += '<div class="p' + (p.has_key ? ' dim' : ' warn') + '">' + esc(src) + '</div>'
-      + '<label class="step">直接贴 key（只存本机，不回显）<input id="api-key" type="password"'
-      + ' autocomplete="off" spellcheck="false" placeholder="sk-…"></label>'
-      + '<div class="row"><button class="pick-btn" data-provider-key="1">保存 key</button>'
+      + '<div class="row"><button class="pick-btn" data-provider-key="1">单独保存 key</button>'
       + (p.key_source === 'file' ? '<button class="pick-btn" data-provider-clear-key="1">清除本机 key</button>' : '')
       + '</div>';
-  } else {
-    html += '<div class="p dim">先点「保存」登记这个提供方，再贴 key。</div>';
   }
   html += '<div id="api-models"></div>';
   if(pid){
@@ -5381,7 +5380,7 @@ async function saveApiProvider(){
   const val = id => { const el = $(id); return el ? String(el.value || '').trim() : ''; };
   const pid = val('api-id');
   const data = await apiPost('/api/api-provider/save', {id: pid, label: val('api-label'),
-    base_url: val('api-url'), api_key_env: val('api-env')});
+    base_url: val('api-url'), api_key_env: val('api-env'), key: val('api-key')});
   if(data && data.models) st.models = data.models;
   if(!data || !data.ok){ toast((data && data.error) || '保存失败'); return; }
   toast(data.message || '已保存');
@@ -6386,7 +6385,7 @@ class Handler(BaseHTTPRequestHandler):
         if action == "save":
             ok, message = API_PROVIDERS.save_provider(
                 pid, str(body.get("label") or ""), str(body.get("base_url") or ""),
-                str(body.get("api_key_env") or ""))
+                str(body.get("api_key_env") or ""), str(body.get("key") or ""))
         elif action == "models":
             raw = body.get("models")
             if not isinstance(raw, list):

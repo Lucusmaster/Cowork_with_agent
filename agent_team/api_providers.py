@@ -30,6 +30,7 @@ KEYS = ROOT / "room" / "api_keys.json"           # 菜单里直接粘贴的 key�
 
 PID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,23}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{1,63}$")
+_ENV_CHARS = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")   # 输入宽容：小写也收，存之前转大写
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 MAX_MODELS = 100
 MAX_KEY = 512
@@ -140,17 +141,57 @@ def _normalize_base_url(raw: str) -> tuple[str, str]:
     return text.rstrip("/"), ""
 
 
-def save_provider(pid: str, label: str, base_url: str, api_key_env: str) -> tuple[bool, str]:
-    """校验后写入；已有模型列表保留（换地址不用重新勾一遍）。"""
+def _env_looks_like_key(text: str) -> bool:
+    """用户把 key 贴进了「环境变量名」那一栏时认出来。
+
+    真实场景：选完 DeepSeek 预设，看到"环境变量"就把 `sk-...` 粘了进去，然后收到
+    "只能是大写字母/数字/下划线"的报错——报错本身没错，但用户想要的是"把 key 存上"。
+    这里先认出来，后面直接当 key 保存，并提示已经把变量名换成了默认值。
+    """
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value.lower().startswith(("sk-", "sk_", "api-", "token-", "bearer ")):
+        return True
+    return len(value) >= 24 and not _ENV_CHARS.match(value)
+
+
+def _default_env(pid: str) -> str:
+    """没填环境变量名时用 `<提供方>_API_KEY`（id 里的 `-` 换成 `_`）。"""
+    return re.sub(r"[^A-Z0-9_]", "_", str(pid).upper()) + "_API_KEY"
+
+
+def save_provider(pid: str, label: str, base_url: str,
+                  api_key_env: str, api_key: str = "") -> tuple[bool, str]:
+    """校验后写入；已有模型列表保留（换地址不用重新勾一遍）。
+
+    第 5 个参数是"顺手存下的 key"（菜单里那张直接贴 key 的框）：提供方和 key 一次保存，
+    省得用户先存提供方、再回头贴 key 那一趟。key 只进 `room/api_keys.json`。
+    """
     pid = str(pid or "").strip().lower()
     if not PID_RE.match(pid):
         return False, "提供方 id 只能是小写字母开头、由小写字母/数字/_/- 组成，2–24 位（例如 deepseek）"
     url, why = _normalize_base_url(base_url)
     if why:
         return False, why
-    env = str(api_key_env or "").strip().upper()
+    raw_env = str(api_key_env or "").strip()
+    key_here = str(api_key or "").strip()
+    env = raw_env.upper()
+    pasted_key = False
+    if raw_env and not _ENV_CHARS.match(raw_env):
+        if _env_looks_like_key(raw_env):
+            # 贴在变量名栏的其实是 key：变量名退回默认，内容当 key 存
+            key_here = key_here or raw_env
+            env = _default_env(pid)
+            pasted_key = True
+        else:
+            return False, ("环境变量名只能用字母/数字/下划线（例如 DEEPSEEK_API_KEY）；"
+                           "如果你想贴的是 key，请贴到「直接贴 key」那一栏，会自动存到本机")
+    elif not env:
+        env = _default_env(pid)
     if not ENV_RE.match(env):
-        return False, "环境变量名只能是大写字母/数字/下划线，且不能以数字开头（例如 DEEPSEEK_API_KEY）"
+        return False, ("环境变量名只能用字母/数字/下划线，且不能以数字开头（例如 DEEPSEEK_API_KEY）；"
+                       "想贴 key 的话请用「直接贴 key」那一栏")
     name = str(label or "").strip()[:60] or pid
     data = _read()
     old = data.get(pid) if isinstance(data.get(pid), dict) else {}
@@ -160,7 +201,16 @@ def save_provider(pid: str, label: str, base_url: str, api_key_env: str) -> tupl
                  "fetched_at": str(old.get("fetched_at") or "")}
     _write(data)
     count = len(data[pid]["models"])
-    return True, f"已保存 API 提供方 {name}（{count} 个模型）"
+    message = f"已保存 API 提供方 {name}（{count} 个模型）"
+    if key_here:
+        ok_key, why_key = save_key(pid, key_here)
+        if ok_key:
+            message += "；key 已存本机，立即生效"
+            if pasted_key:
+                message += "（你把 key 贴在了变量名栏，已自动改成 key；变量名用 " + env + "）"
+        else:
+            message += "；key 没存下：" + why_key
+    return True, message
 
 
 def _key_source(pid: str) -> str:
