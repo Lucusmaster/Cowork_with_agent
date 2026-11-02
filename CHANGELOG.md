@@ -1,3 +1,36 @@
+## 0.9.32 — 验收命令自己崩了，就别再怪执行者
+
+实测暴露的产品短板：验收命令是大脑"闭着眼睛"写的（它读不到文件、也不执行），于是经常出现
+**命令本身是坏的**这种情况——正则假设了文件里没有的符号（`crankCX`）、拿"度/ms"去除"弧度/ms"
+（算出 `ratio=28.075`）。这类失败跟执行者无关，派返工只会白烧一轮，还可能把本来正确的文件改坏。
+
+### 1. 派发前体检（`agent_team/verify_guard.py` + `team.cmd_dispatch`）
+
+- 新建 `verify_guard`：`crash_reason()` 判断命令是"崩了"还是"断言没过"；`probe_all()` 用
+  `run_capped` 逐条试跑（有超时上限，卡死也不会挂住编排）。
+- `dispatch` 在执行者动工前先跑一遍验收命令：命中崩溃类就写 `verify-script-broken.md`、
+  卡上记 `note`、群里说明，**直接返回退出码 3，不派执行者**。
+- 判据故意保守：`AssertionError`（代码确实不达标）和 `FileNotFoundError` / `No module named`
+  （产物还没做出来）都不算脚本崩溃，照常走返工；只有 `SyntaxError`/`AttributeError`/`KeyError`/
+  `TypeError`/`Never closed` 这类才判脚本自身出错。
+
+### 2. 验收阶段同一套判据（`team.cmd_verify` + `worker._stop_verify_script`）
+
+- `verify` 跑完若有命令崩溃，除了写 `verify-NN.txt` 还写 `verify-script-broken.md`，退出码为 **2**。
+- 编排看到这个标记就停手：不发返工单、不写 `verdict`，而是在群里说清"验收命令本身写错了，
+  让大脑先读文件重写 `verify`，再重派这张卡"。
+
+### 3. 证据
+
+- 新增 10 项测试（`tests/test_verify_guard.py`）：崩溃/断言/缺文件三类判据、真实试跑、
+  `dispatch` 前体检只拦崩溃、`worker` 读标记。
+- 全套 **736 项通过**，`ruff check agent_team tests` 干净。
+- 真机验证：故意写坏验收命令的卡 `T-261102-220215`，`dispatch` 直接拒绝派发（退出码 3，
+  `note` 写明 `AttributeError`），执行者一次都没跑；单独跑 `verify` 得退出码 2 + 标记文件。
+- 顺带用当前无 VPN 的环境验了端点提示：`gpt-6.1-sol` 29 秒失败，`env_error` 首行点明
+  `OpenAI 默认端点（chatgpt.com / api.openai.com）`，第二行给出"没开 VPN/代理，或代理只接管了
+  浏览器、没接管命令行"的原因和三条处理办法，`.hint.txt` 已落盘。
+
 ## 0.9.31 — 降级跑成了，却被上一个型号留下的"连不上"便签误杀
 
 0.9.30 上线后第一次实测就抓到自己的 bug：T-261102-205317 第 2 轮里，

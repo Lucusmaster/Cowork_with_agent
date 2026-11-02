@@ -1265,6 +1265,41 @@ def _env_gate(tid: str, round_no: int, code: int) -> str:
     return _env_hint(tid, round_no) if code != 0 else ""
 
 
+def _verify_script_broken(tid: str) -> str:
+    """验收命令自己崩了（不是代码没写对）时，team 会留一张 verify-script-broken.md。"""
+    path = TASKS / tid / "verify-script-broken.md"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _stop_verify_script(tid: str, text: str, round_no: int) -> None:
+    """验收脚本坏了：停手让大脑重写命令，不给执行者派返工。"""
+    event(f"{tid} 验收命令自身报错，停手（不派返工）", "verify", "bad", "deepseek", tid)
+    path = TASKS / tid / "task.json"
+    try:
+        task = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        task = {}
+    if task:
+        task["status"] = "failed"
+        task["note"] = "验收命令自身报错，需要大脑重写验收命令：" + text.splitlines()[0][:200]
+        task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    say(f"这张卡的**验收命令本身写错了**（第 {round_no} 轮），所以我停下了，没让执行者返工——\n"
+        f"改代码不可能让一条崩掉的验收命令通过。\n\n"
+        f"下一步：让大脑先读文件、按真实存在的符号重写 `verify`，再重派这张卡。\n"
+        f"详情见 tasks/{tid}/verify-script-broken.md",
+        task_id=tid, status="failed")
+    do_report(tid)
+    mark_finished(tid)
+    append_progress(tid)
+
+
 def _stop_env_blocked(tid: str, hint: str, round_no: int) -> None:
     """端点不通：把原因和"怎么办"一起钉在卡上，停手等人，不跑第二轮。"""
     event(f"{tid} 执行者端点不可达，停手（不返工）", "dispatch", "bad", "codex", tid)
@@ -1305,6 +1340,12 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
         post_agent("executor", tid, code == 0,
                    _read(exec_log, 900) if exec_log.exists() else "",
                    error="" if code == 0 else f"执行退出码 {code}")
+        # 派发前的体检拦下了：验收命令自己崩了，执行者根本没跑
+        # （先看这个，再看"执行未正常结束"，免得把"没派执行者"说成"执行失败"）
+        broken = _verify_script_broken(tid)
+        if broken:
+            _stop_verify_script(tid, broken, round_no)
+            return
         if code != 0:
             event(f"第 {round_no} 轮执行未正常结束", "dispatch", "bad", "codex", tid)
         # 只有这轮真的没跑成，才看"连不上端点"的便签；跑成了（哪怕中间降级过）
@@ -1320,6 +1361,11 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
                    f"第 {round_no} 轮验收{'通过' if code == 0 else '未通过'}")
         if code == 0:
             break
+        # 验收没过的原因是"命令自己崩了"：让大脑改命令，别派返工
+        broken = _verify_script_broken(tid)
+        if broken:
+            _stop_verify_script(tid, broken, round_no)
+            return
         if round_no == 1:
             (TASKS / tid / "verdict-01.md").write_text(
                 "# 验收未通过（自动返工）\n\n## 结论\nrepair\n\n## 要求\n"

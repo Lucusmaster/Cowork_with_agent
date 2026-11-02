@@ -526,6 +526,11 @@ python bin/team.py report -t <ID>
 - 状态机：`planned → executed → failed/passed`，超轮次自动 `stopped`（默认最多 3 轮）。
 - `verdict-NN.md` 的结论只有三种：`pass` / `repair`（给一条可执行的修复指令）/ `stop`（必须找人）。
 - `task.json` 里 `scope` 是执行者唯一允许改的路径；`acceptance` 是验收判据；`verify` 是验收命令。
+- **验收命令要先过体检**（`agent_team/verify_guard.py`）：派发前先试跑一遍，命令自己崩了
+  （`AttributeError`/`KeyError`/`SyntaxError`…，典型是正则假设了文件里没有的符号、变量名写错、
+  度/弧度搞混）就**不打发执行者**，直接停下并把 `verify-script-broken.md` 写给大脑，让它按文件里
+  真实存在的符号重写命令。断言没过（`AssertionError`）和"产物还不存在"（`FileNotFoundError`）
+  不算脚本崩溃，照常走返工——**改代码救不了一条崩掉的命令**，派返工只会白烧一轮。
 
 ## 三个角色
 

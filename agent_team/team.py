@@ -36,6 +36,7 @@ from .resources import resource  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
 from . import models  # noqa: E402
+from . import verify_guard  # noqa: E402
 
 STATUS_ORDER = {
     "planned": "已建卡",
@@ -344,8 +345,25 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     task["workspace_baseline"] = workspace_untracked(task_workspace(task))
     _snapshot_workspace(task, tid)
 
-    prompt = build_prompt(task, round_no)
     tdir = task_dir(tid)
+    # 上一轮判过"验收脚本坏了"的结论先清掉：大脑可能已经改过命令，重派时要重新体检
+    verify_guard.marker_path(tdir).unlink(missing_ok=True)
+    # 派发前先给验收命令做体检：命令自己崩了（正则假设了不存在的符号、变量名写错……）
+    # 就别派执行者——改代码不可能让这种命令通过，只会白烧一轮。
+    broken = preflight_verify_scripts(task, tdir)
+    if broken:
+        note = "验收命令自身报错，已停手（未派执行者）：" + "；".join(
+            f"{item['command']} → {item['reason']}" for item in broken)
+        task["status"] = "failed"
+        task["note"] = note
+        task["updated_at"] = now_iso()
+        save_task(task)
+        room_event(f"验收命令自身报错，没派执行者就停下：{broken[0]['reason']}", tid, "verify", "bad", "deepseek")
+        print(f"⚠ 验收命令自身报错（{broken[0]['reason']}），不派执行者；详情见 "
+              f"{tdir / verify_guard.BROKEN_FILE}")
+        return 3
+
+    prompt = build_prompt(task, round_no)
     prompt_path = tdir / f"prompt-{round_no:02d}.md"
     prompt_path.write_text(prompt, encoding="utf-8")
     # 上一轮留下的"连不上端点"便签先清掉：同一轮重派时不该拿旧便签判死
@@ -683,6 +701,22 @@ def scope_violations(task: dict, ws: Path) -> list[str]:
     return bad
 
 
+def preflight_verify_scripts(task: dict, tdir: Path, timeout: int = 120) -> list[dict]:
+    """建卡/派发前给验收命令做体检，返回"命令自己崩了"的那些。
+
+    只抓崩溃类（SyntaxError/AttributeError/KeyError…），断言没过不算——那是
+    "还没实现"，属于正常未达标；产物不存在（FileNotFoundError）也不算。
+    """
+    pairs = [(cmd, parse_verify_argv(cmd)) for cmd in task.get("verify") or []]
+    if not pairs:
+        return []
+    broken = verify_guard.probe_all(pairs, task_workspace(task), timeout=timeout)
+    if broken:
+        verify_guard.marker_path(tdir).write_text(verify_guard.render_broken(broken),
+                                                  encoding="utf-8")
+    return broken
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     tid = resolve_task_id(args.task)
     task = load_task(tid)
@@ -690,6 +724,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     round_no = max(1, round_count(task))
     lines = [f"# 验收轮次 {round_no} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
     all_ok = True
+    crashed: list[dict] = []
 
     for cmd in task.get("verify") or []:
         started = time.time()
@@ -702,9 +737,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
         code = proc.returncode
         elapsed = int(time.time() - started)
         all_ok = all_ok and code == 0
+        output = (proc.stdout or "") + (proc.stderr or "")
         lines += [f"## `{cmd}`", f"- argv: `{argv}`", f"- 退出码: {code}  耗时: {elapsed}s", "```",
-                  (proc.stdout or "") + (proc.stderr or ""), "```", ""]
-        print(f"  退出码 {code}，耗时 {elapsed}s")
+                  output, "```", ""]
+        reason = "" if code == 0 else verify_guard.crash_reason(output)
+        if reason:
+            crashed.append({"command": cmd, "argv": argv, "code": code, "reason": reason,
+                            "output": output, "seconds": elapsed})
+            lines += [f"**验收命令自身报错**：{reason}（不是代码没写对）", ""]
+        print(f"  退出码 {code}，耗时 {elapsed}s" + (f"，脚本崩溃：{reason}" if reason else ""))
 
     out_of_scope = scope_violations(task, task_workspace(task))
     if out_of_scope:
@@ -731,6 +772,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     task["status"] = "passed" if all_ok else "failed"
     task["updated_at"] = now_iso()
+    if crashed and not all_ok:
+        # 崩溃的是验收命令自己：让大脑改命令，别给执行者派返工
+        verify_guard.marker_path(tdir).write_text(verify_guard.render_broken(crashed, round_no),
+                                                 encoding="utf-8")
+        task["note"] = "验收命令自身报错（" + "；".join(
+            f"{item['command']} → {item['reason']}" for item in crashed) + "）"
+        save_task(task)
+        room_event(f"验收命令自身报错，不派返工：{crashed[0]['reason']}", tid, "verify", "bad", "deepseek")
+        print(f"⚠ 验收命令自身报错（{crashed[0]['reason']}），判为脚本问题，不派返工")
+        print(f"证据: {verify_guard.marker_path(tdir)}")
+        return 2
     save_task(task)
 
     room_event(f"验收 {'通过' if all_ok else '未通过'}（{tid} 第 {round_no} 轮）",
