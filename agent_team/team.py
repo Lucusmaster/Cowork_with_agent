@@ -36,6 +36,7 @@ from .resources import resource  # noqa: E402
 from .winproc import quiet_flags  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
 from . import models  # noqa: E402
+from . import budget  # noqa: E402
 from . import verify_guard  # noqa: E402
 
 STATUS_ORDER = {
@@ -362,6 +363,17 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"⚠ 验收命令自身报错（{broken[0]['reason']}），不派执行者；详情见 "
               f"{tdir / verify_guard.BROKEN_FILE}")
         return 3
+
+    # 预算闸门：这张卡已经烧掉的 token/时间超过上限就先停，别继续往里加
+    over = budget.check(task)
+    if over:
+        task["status"] = "stopped"
+        task["note"] = over
+        task["updated_at"] = now_iso()
+        save_task(task)
+        room_event(f"预算用尽，停止派发：{over}", tid, "dispatch", "bad", "deepseek")
+        print(f"⛔ {over}")
+        return 4
 
     prompt = build_prompt(task, round_no)
     prompt_path = tdir / f"prompt-{round_no:02d}.md"

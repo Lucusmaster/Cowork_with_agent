@@ -114,5 +114,10 @@
   ],
   "policy": {
     "require_approval": false
-  }
+  },
+  "budget": {
+    "max_tokens": 800000,
+    "max_seconds": 7200
+  },
+  "heartbeat_seconds": 30
 }

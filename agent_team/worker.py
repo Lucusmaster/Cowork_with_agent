@@ -40,9 +40,11 @@ TYPING = ROOM / "typing.json"     # 谁正在思考，页面据此显示"正在�
 
 from . import agents  # noqa: E402
 from . import analysis  # noqa: E402
+from . import budget  # noqa: E402
 from . import control  # noqa: E402
 from . import models  # noqa: E402
 from . import procs  # noqa: E402
+from . import progress  # noqa: E402
 from . import room  # noqa: E402
 from .winproc import quiet_flags, run_capped  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
@@ -553,8 +555,13 @@ def control_note(kind: str, tid: str, stage: str = "") -> None:
     say(text, task_id=tid)
 
 
-def step(tid: str, argv: list[str], timeout: int, label: str, stage: str) -> tuple[int, str]:
-    """跑一步，跑之前先过闸门：暂停就等，停止就抛，重跑就重做这一步。"""
+def step(tid: str, argv: list[str], timeout: int, label: str, stage: str,
+         watch: tuple[Path, str] | None = None) -> tuple[int, str]:
+    """跑一步，跑之前先过闸门：暂停就等，停止就抛，重跑就重做这一步。
+
+    `watch` 是（目录, 通配）——长步骤期间每 `heartbeat_seconds` 秒把"已跑多久 +
+    日志最新一行"发到群里，免得两三分钟没动静像卡死了。
+    """
     while True:
         try:
             action = control.gate(
@@ -564,9 +571,25 @@ def step(tid: str, argv: list[str], timeout: int, label: str, stage: str) -> tup
         except control.TaskStopped:
             raise
         if action != "rerun":
-            return run_step(argv, timeout, label)
+            if watch is None:
+                return run_step(argv, timeout, label)
+            directory, pattern = watch
+            with progress.Beater(
+                    label, tid=tid, directory=directory, pattern=pattern,
+                    interval=_heartbeat_interval(),
+                    emit=lambda text: event(text, stage, "run", "coordinator", tid)):
+                return run_step(argv, timeout, label)
         control_note("rerun", tid, stage)
         event(f"按你的要求重跑：{label}", stage, "run", "coordinator", tid)
+
+
+def _heartbeat_interval() -> float:
+    """进度心跳间隔，默认 30 秒（config/team.json 的 heartbeat_seconds 可调）。"""
+    try:
+        value = float(models.config().get("heartbeat_seconds") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value >= 5 else 30.0
 
 VAGUE = {"继续", "好的", "好", "嗯", "可以", "ok", "继续吧", "下一步", "继续干"}
 
@@ -1300,6 +1323,39 @@ def _stop_verify_script(tid: str, text: str, round_no: int) -> None:
     append_progress(tid)
 
 
+def _budget_gate(tid: str) -> str:
+    """这张卡是不是已经超预算了（token 或时间）？超了返回一句人话。"""
+    try:
+        task = json.loads((TASKS / tid / "task.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return budget.check(task)
+
+
+def _stop_budget(tid: str, reason: str) -> None:
+    """超预算：停手，把账和三个选项摆给用户，不继续往里烧。"""
+    event(f"{tid} 超预算，停手", "dispatch", "bad", "deepseek", tid)
+    card = TASKS / tid / "task.json"
+    try:
+        task = json.loads(card.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        task = {}
+    if task:
+        task["status"] = "stopped"
+        task["note"] = reason
+        task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            card.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    say(f"{reason}。\n我先停在这里，没继续派活。三个选择：换个便宜点的执行模型、"
+        f"把这件事拆成两张卡，或者调高 config/team.json 的 budget 再重派。",
+        task_id=tid, status="failed")
+    do_report(tid)
+    mark_finished(tid)
+    append_progress(tid)
+
+
 def _stop_env_blocked(tid: str, hint: str, round_no: int) -> None:
     """端点不通：把原因和"怎么办"一起钉在卡上，停手等人，不跑第二轮。"""
     event(f"{tid} 执行者端点不可达，停手（不返工）", "dispatch", "bad", "codex", tid)
@@ -1333,9 +1389,14 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
     # 执行者单轮上限 1900s：config 里 executor.timeout 是 1800s（走中转时一轮很慢），
     # 这里必须比它大一点，否则编排先把自己的子进程掐了，执行者的超时/日志就全丢了。
     for round_no in range(1, 3):
+        over = _budget_gate(tid)
+        if over:
+            _stop_budget(tid, over)
+            return
         with thinking("executor"):
             code, _ = step(tid, ["dispatch", "-t", tid], 1900,
-                           f"第 {round_no} 轮执行", "dispatch")
+                           f"第 {round_no} 轮执行", "dispatch",
+                           watch=(TASKS / tid, f"exec-{round_no:02d}*err.txt"))
         exec_log = TASKS / tid / f"exec-{round_no:02d}.last.md"
         post_agent("executor", tid, code == 0,
                    _read(exec_log, 900) if exec_log.exists() else "",
@@ -1356,7 +1417,8 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
             return
         with thinking("tester"):
             code, _ = step(tid, ["verify", "-t", tid], 600,
-                           f"第 {round_no} 轮验收", "verify")
+                           f"第 {round_no} 轮验收", "verify",
+                           watch=(TASKS / tid, f"verify-{round_no:02d}.txt"))
         post_agent("tester", tid, code == 0,
                    f"第 {round_no} 轮验收{'通过' if code == 0 else '未通过'}")
         if code == 0:
@@ -1382,9 +1444,14 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
             return
 
     for attempt in range(1, 3):
+        over = _budget_gate(tid)
+        if over:
+            _stop_budget(tid, over)
+            return
         with thinking("reviewer"):
             code, _ = step(tid, ["review", "-t", tid], 900,
-                           f"第 {attempt} 次复核", "review")
+                           f"第 {attempt} 次复核", "review",
+                           watch=(TASKS / tid, f"review-{round_no:02d}-*err.txt"))
         if code == 0:
             post_agent("reviewer", tid, True, "复核通过")
             break
@@ -1402,10 +1469,12 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
         event(f"{tid} 复核挑出问题，自动返工第 {next_round} 轮", "review", "bad", "reviewer", tid)
         with thinking("executor"):
             step(tid, ["dispatch", "-t", tid], 1900,
-                     f"第 {next_round} 轮返工", "dispatch")
+                     f"第 {next_round} 轮返工", "dispatch",
+                     watch=(TASKS / tid, f"exec-{next_round:02d}*err.txt"))
         with thinking("tester"):
             vcode, _ = step(tid, ["verify", "-t", tid], 600,
-                                f"第 {next_round} 轮验收", "verify")
+                                f"第 {next_round} 轮验收", "verify",
+                                watch=(TASKS / tid, f"verify-{next_round:02d}.txt"))
         post_agent("executor", tid, vcode == 0, f"按复核意见返工第 {next_round} 轮")
         post_agent("tester", tid, vcode == 0, f"返工后验收{'通过' if vcode == 0 else '未通过'}")
         if vcode != 0:

@@ -531,6 +531,13 @@ python bin/team.py report -t <ID>
   度/弧度搞混）就**不打发执行者**，直接停下并把 `verify-script-broken.md` 写给大脑，让它按文件里
   真实存在的符号重写命令。断言没过（`AssertionError`）和"产物还不存在"（`FileNotFoundError`）
   不算脚本崩溃，照常走返工——**改代码救不了一条崩掉的命令**，派返工只会白烧一轮。
+- **单卡有预算闸门**（`agent_team/budget.py`）：按卡累计 `rounds[].tokens` 与执行秒数，
+  超过 `config/team.json` 的 `budget.max_tokens`（默认 80 万）/ `budget.max_seconds`
+  （默认 2 小时）就停手，把账和三个选项（换便宜模型、拆小任务、调高上限）摆在群里，
+  不再往里烧。一张卡正常几万到十几万 token，搞砸的返工才可能顶到这个量级。
+- **长步骤有进度心跳**（`agent_team/progress.py`）：执行/验收/复核跑着的时候，每
+  `heartbeat_seconds`（默认 30 秒）往群里发一条"第 N 轮执行：已跑 8s，最新：<日志最后一行>"，
+  两三分钟没动静也能看出它还在动，而不是像卡死。
 
 ## 三个角色
 
