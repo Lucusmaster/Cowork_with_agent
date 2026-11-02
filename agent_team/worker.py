@@ -44,7 +44,7 @@ from . import control  # noqa: E402
 from . import models  # noqa: E402
 from . import procs  # noqa: E402
 from . import room  # noqa: E402
-from .winproc import quiet_flags  # noqa: E402
+from .winproc import quiet_flags, run_capped  # noqa: E402
 from .codex_bridge import run_codex  # noqa: E402
 
 for _stream in (sys.stdout, sys.stderr):
@@ -524,12 +524,20 @@ def collect_analysis(handle) -> dict | None:
 # ---------------- 流水线 ----------------
 def run_step(args: list[str], timeout: int, label: str) -> tuple[int, str]:
     log(f"$ {' '.join(args)}")
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "bin" / "team.py"), *args],
-        cwd=str(ROOT), capture_output=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=quiet_flags())
-    output = (proc.stdout or "") + (proc.stderr or "")
-    log(f"{label} 退出码 {proc.returncode}")
-    return proc.returncode, output
+    try:
+        rc, out, err, timedout = run_capped(
+            [sys.executable, str(ROOT / "bin" / "team.py"), *args],
+            cwd=str(ROOT), timeout=timeout)
+    except OSError as exc:                       # 解释器都起不来：如实报，别让流水线空等
+        log(f"{label} 启动失败：{exc}")
+        return 127, str(exc)
+    output = (out or "") + (err or "")
+    if timedout:
+        # 硬超时：子进程树已经杀掉，流水线必须往下走（验收/报告/停手），不能吊死
+        log(f"{label} 超时 {timeout}s，已终止")
+        return 124, output + f"\n[worker] {label} 超时 {timeout}s，已连同子进程一起终止。"
+    log(f"{label} 退出码 {rc}")
+    return rc, output
 
 
 def control_note(kind: str, tid: str, stage: str = "") -> None:
@@ -1235,10 +1243,54 @@ def pipeline(tid: str, card: dict, request: str) -> None:
         mark_finished(tid)
 
 
+def _env_hint(tid: str, round_no: int) -> str:
+    """执行者连不上模型端点时，codex_bridge 会在 exec-NN 旁边留一张 .hint.txt。
+
+    读得到就说明这轮不是"代码写错了"，而是根本没连上模型——返工/换模型都救不了，
+    只会在同一个网络上再空烧几分钟。所以由调用方直接停手。
+    """
+    path = TASKS / tid / f"exec-{round_no:02d}.hint.txt"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _stop_env_blocked(tid: str, hint: str, round_no: int) -> None:
+    """端点不通：把原因和"怎么办"一起钉在卡上，停手等人，不跑第二轮。"""
+    event(f"{tid} 执行者端点不可达，停手（不返工）", "dispatch", "bad", "codex", tid)
+    card = TASKS / tid / "task.json"
+    try:
+        task = json.loads(card.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        task = {}
+    if task:
+        task["status"] = "failed"
+        task["note"] = hint
+        task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            card.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    # 换模型时至少给他一份能直接抄的清单，别让人自己翻配置
+    try:
+        options = "、".join(models.models()[:8])
+    except Exception:  # noqa: BLE001 - 列不出来不影响主流程
+        options = ""
+    tail = f"\n可以换的型号：{options}" if options else ""
+    say(f"执行者连不上模型端点，第 {round_no} 轮没写代码就停了（不是任务本身失败）。\n{hint}{tail}",
+        task_id=tid, status="failed")
+    do_report(tid)
+    mark_finished(tid)
+    append_progress(tid)
+
+
 def _pipeline(tid: str, card: dict, request: str) -> None:
+    # 执行者单轮上限 1900s：config 里 executor.timeout 是 1800s（走中转时一轮很慢），
+    # 这里必须比它大一点，否则编排先把自己的子进程掐了，执行者的超时/日志就全丢了。
     for round_no in range(1, 3):
         with thinking("executor"):
-            code, _ = step(tid, ["dispatch", "-t", tid], 1200,
+            code, _ = step(tid, ["dispatch", "-t", tid], 1900,
                            f"第 {round_no} 轮执行", "dispatch")
         exec_log = TASKS / tid / f"exec-{round_no:02d}.last.md"
         post_agent("executor", tid, code == 0,
@@ -1246,6 +1298,10 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
                    error="" if code == 0 else f"执行退出码 {code}")
         if code != 0:
             event(f"第 {round_no} 轮执行未正常结束", "dispatch", "bad", "codex", tid)
+        hint = _env_hint(tid, round_no)
+        if hint:
+            _stop_env_blocked(tid, hint, round_no)
+            return
         with thinking("tester"):
             code, _ = step(tid, ["verify", "-t", tid], 600,
                            f"第 {round_no} 轮验收", "verify")
@@ -1288,7 +1344,7 @@ def _pipeline(tid: str, card: dict, request: str) -> None:
             json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         event(f"{tid} 复核挑出问题，自动返工第 {next_round} 轮", "review", "bad", "reviewer", tid)
         with thinking("executor"):
-            step(tid, ["dispatch", "-t", tid], 1200,
+            step(tid, ["dispatch", "-t", tid], 1900,
                      f"第 {next_round} 轮返工", "dispatch")
         with thinking("tester"):
             vcode, _ = step(tid, ["verify", "-t", tid], 600,

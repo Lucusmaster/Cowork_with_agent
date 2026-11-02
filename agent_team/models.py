@@ -39,6 +39,7 @@ from .paths import workbench_root
 ROOT = workbench_root()
 CONFIG = ROOT / "config" / "team.json"
 OVERRIDES = ROOT / "room" / "model_overrides.json"   # 运行时选择，不入库
+PROVIDERS = ROOT / "room" / "model_providers.json"   # 本机端点覆盖，不入库
 
 ROLES = ("coordinator", "planner", "executor", "tester", "reviewer")
 ROLE_LABELS = {
@@ -270,6 +271,43 @@ def model_for(role: str, task: dict | None = None) -> tuple[str, str]:
     if isinstance(block, dict) and str(block.get("model") or "").strip():
         return str(block["model"]).strip(), "配置"
     return "", "默认"
+
+
+def model_provider(model: str) -> dict:
+    """某个型号专用的模型端点（`room/model_providers.json` 优先，其次 `config/team.json`）。
+
+    有些型号在本机直连不通（对方要求代理、或者走的是自建中转），就该让这个型号
+    自己带一份 `base_url` / 密钥变量名，而不是逼用户改全局 CLI 配置。查不到返回 `{}`。
+
+    本机这份放 `room/`（gitignored），换台机器/换条中转不用动仓库里的默认配置；
+    两边同型号时以 `room/` 为准。写法（键是型号，值至少要有 `base_url`）::
+
+        "model_providers": {
+          "claude-sonnet-5": {"name": "中转", "base_url": "https://api.example.com/v1",
+                              "env_key": "EXAMPLE_KEY", "key_store": "example",
+                              "wire_api": "responses"}
+        }
+
+    `key_store` 填 API 菜单里保存过的提供方 id 时，密钥从 `room/api_keys.json` 取
+    （环境变量优先），这样不用把 key 写进配置文件。
+    """
+    name = str(model or "").strip()
+    if not name:
+        return {}
+    spec: dict = {}
+    for table in (_read_json(PROVIDERS).get("model_providers"),
+                  config().get("model_providers")):
+        if not isinstance(table, dict):
+            continue
+        found = table.get(name)
+        if not isinstance(found, dict):
+            found = table.get(resolve(name) or "")
+        if isinstance(found, dict):
+            spec = dict(found)
+            break
+    if not str(spec.get("base_url") or "").strip():
+        return {}
+    return spec
 
 
 def effort_for(role: str) -> str:

@@ -555,7 +555,7 @@ python bin/team.py report -t <ID>
 | --- | --- |
 | model | 默认 `gpt-6.1-terra`（示例值，换成你账号下可用的模型即可） |
 | reasoning_effort | `low`（小任务默认；大任务用 `new --effort medium` 写进任务卡，或 `dispatch --effort medium`） |
-| timeout | 900s |
+| timeout | 1800s（走中转时一轮很慢；编排侧给单轮留 1900s，比它略大） |
 | sandbox | `workspace-write` |
 
 换模型或档位有四层，按优先级：`dispatch` 命令行参数 → 任务卡里的 `executor: {model, effort}`（`new --model/--effort` 写入）→ **运行时切换**（见下）→ `config/team.json`；环境变量 `EXECUTOR_MODEL` / `EXECUTOR_EFFORT` 会覆盖配置文件里的默认值。
@@ -576,6 +576,37 @@ python bin/team.py report -t <ID>
 - 降级链里混着别的 CLI 的型号，会按每个型号自己的 CLI 路由；指向本机没装的 CLI 就跳过；
 - 真换过模型会写进 `task.json` 的 `rounds[].fallback_note`，命令行和群里也会打出
   "原定 A，容量满载，降级为 B"。复核者的同名配置一直支持，逻辑同一套（`agent_team/fallback.py`）。
+
+### 执行者端点不通 / 要走中转：给型号单独配端点
+
+这台机器直连 `api.openai.com` 不通、或者执行用的其实是一条自建中转时，执行者会在
+`codex exec` 里连挂几分钟，然后只报一句"执行未正常结束"，`exec-*.err.txt` 里是
+`workspace routing discovery timed out` / `error sending request for url` 这类措辞——
+用户看到的就是"plan.md 写完就停了"。不用改 `~/.codex/config.toml`（那会连带影响
+这台机器上别的 Codex 用法），在 `room/model_providers.json` 给这个型号写一份端点即可
+（`room/` 不进 git，换机器/换中转都不动仓库）：
+
+```json
+{
+  "model_providers": {
+    "claude-sonnet-5": {
+      "name": "中转",
+      "base_url": "https://api.example.com/v1",
+      "env_key": "EXAMPLE_KEY",
+      "key_store": "example",
+      "wire_api": "responses"
+    }
+  }
+}
+```
+
+- `base_url` 要 OpenAI 兼容；Codex 0.166 起 `wire_api` 只认 `responses`（写 `chat` 会直接报错退出）；
+- 密钥优先读环境变量 `env_key`，读不到就取「API」菜单里存过的提供方（`key_store`），别把 key 写进配置文件；
+- `config/team.json` 里也能写同一张表；两边都有同一个型号时以 `room/model_providers.json` 为准；
+- 端点真的不通时，执行者**只跑一轮就停手**（不再空烧第二轮），原因写进
+  `tasks/<id>/exec-NN.hint.txt`、`task.json` 的 `rounds[].env_error`，并在群里说明怎么修：
+  先查网络/VPN（常见坑是代理只接管了浏览器、没接管命令行），再给两条替代路——换个本机可达的模型
+  （`/model 执行 <型号>`，消息里会列可选型号），或给这个型号配一条中转端点。
 
 ### 运行时换模型（不用改配置、不用重启）
 

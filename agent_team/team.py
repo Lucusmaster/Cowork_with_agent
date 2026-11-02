@@ -230,7 +230,7 @@ def build_prompt(task: dict, round_no: int) -> str:
 """
     prompt += f"""
 ## 关键约束
-- 当前工作目录：{ROOT}
+- 当前工作目录：{task_workspace(task)}
 - 只改上面允许的路径；不改 tasks/、agents/、bin/ 里的协作系统文件。
 - 不安装第三方依赖，不联网下载。
 - 不确定就说明不确定，禁止编造已验证的结果。
@@ -408,6 +408,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         "effort": result.get("reasoning_effort", ""),
         "tokens": result.get("tokens"),
         "fallback_note": result.get("fallback_note", ""),
+        "env_error": str(result.get("env_error") or ""),
+        "endpoint": str(result.get("endpoint") or ""),
     })
     task["status"] = "executed" if result["ok"] else "exec-failed"
     task["updated_at"] = now_iso()
@@ -423,6 +425,13 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"产物: {result['last'] or '（无）'}")
     if not result["ok"]:
         print(f"执行者未正常结束，看日志: {result['stderr']}")
+    env_error = str(result.get("env_error") or "")
+    if env_error:
+        # 端点不通是环境问题：换模型/返工都救不了，立刻说清楚，别让人以为卡住了
+        room_event(f"执行者连不上模型端点：{env_error}", tid, "dispatch", "bad", "codex")
+        print(f"⚠ {env_error}")
+        print(f"   端点: {result.get('endpoint') or '（Codex 默认）'}")
+        print(f"   说明: {result.get('hint') or result.get('stderr')}")
     report_scope_now(task, round_no)          # 越界当场说，别等验收
     print(f"下一步: 大脑审阅产物后跑验收 → python bin/team.py verify -t {tid}")
     return 0 if result["ok"] else 1
@@ -856,6 +865,11 @@ def cmd_review(args: argparse.Namespace) -> int:
             text = Path(result["last"]).read_text(encoding="utf-8", errors="replace")
         upper = text.upper()
         if "PASS" in upper or "NEEDS_FIX" in upper:
+            break
+        if result.get("env_error"):
+            # 复核模型连不上端点：换下一个型号还是同一个网络，别一个个空烧三分钟
+            room_event(f"复核模型连不上端点：{result['env_error']}", tid, "review", "bad", "reviewer")
+            print(f"⚠ {result['env_error']}")
             break
         if index + 1 < len(attempts):
             print(f"  {candidate} 没给出结论（可能模型排队/限流），换 {attempts[index + 1]} 重试一次")

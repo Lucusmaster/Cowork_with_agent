@@ -11,12 +11,11 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
 from . import fallback
-from .winproc import quiet_flags
+from .winproc import run_capped
 from pathlib import Path
 from .paths import workbench_root  # noqa: E402
 
@@ -29,6 +28,111 @@ ROOT = workbench_root()
 # 默认落到 C:\Users\<user>\.codex。这里把「本次工作区」的 CODEX_HOME
 # 指进工作区自己的 .codex-home/，只从用户目录复制登录凭据，不动历史会话。
 CREDENTIAL_FILES = ("auth.json", "config.toml")
+
+# 模型端点覆盖：某些型号直连不通（OpenAI 在本机被墙、或只能走自建中转）时，
+# 由 config/team.json 的 model_providers 给这个型号单独指定 base_url。
+# 用独立的 provider id，避免和用户 config.toml 里已有的 custom 互相覆盖。
+PROVIDER_ID = "workbench"
+# Codex 0.166 起只认 responses；wire_api="chat" 会直接报错退出。
+DEFAULT_WIRE_API = "responses"
+
+# 执行者压根没连上模型端点时的特征。只认 Codex 自己的网络报错措辞，
+# 不要写宽（"error"/"timeout" 这种）——否则任务真的失败也会被当成网络问题而不返工。
+NETFAIL_MARKERS = (
+    "workspace routing discovery timed out",
+    "failed to refresh available models",
+    "error sending request for url",
+    "transport channel closed",
+    "failed to connect",
+    "connection refused",
+)
+
+
+def _provider_spec(model: str) -> dict:
+    """这个型号该用哪个端点（没有覆盖就返回空）。"""
+    if not model:
+        return {}
+    try:
+        from . import models
+        spec = models.model_provider(model)
+    except Exception:  # noqa: BLE001 - 配置读不出来就按默认端点走
+        return {}
+    return spec if isinstance(spec, dict) else {}
+
+
+def _provider_key(spec: dict, env_key: str) -> str:
+    """密钥：进程环境变量优先，其次 API 菜单里存过的那份（room/api_keys.json）。"""
+    from_env = os.environ.get(env_key, "").strip()
+    if from_env:
+        return from_env
+    store = str(spec.get("key_store") or "").strip()
+    if not store:
+        return ""
+    try:
+        from . import api_providers
+        return api_providers.key_for(store)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def provider_overrides(model: str) -> tuple[list[str], dict[str, str]]:
+    """把 model_providers 里的端点翻成 codex 的 `-c` 覆盖和子进程环境里的密钥。"""
+    spec = _provider_spec(model)
+    if not spec:
+        return [], {}
+    base = str(spec.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return [], {}
+    name = str(spec.get("name") or "自定义中转").strip() or "自定义中转"
+    wire = str(spec.get("wire_api") or DEFAULT_WIRE_API).strip() or DEFAULT_WIRE_API
+    env_key = str(spec.get("env_key") or spec.get("api_key_env") or "AGENT_PROVIDER_KEY").strip()
+    args = [
+        "-c", f"model_provider={PROVIDER_ID}",
+        "-c", f'model_providers.{PROVIDER_ID}.name="{name}"',
+        "-c", f'model_providers.{PROVIDER_ID}.base_url="{base}"',
+        "-c", f'model_providers.{PROVIDER_ID}.wire_api="{wire}"',
+        "-c", f"model_providers.{PROVIDER_ID}.env_key={env_key}",
+    ]
+    env: dict[str, str] = {}
+    key = _provider_key(spec, env_key)
+    if key:
+        env[env_key] = key
+    return args, env
+
+
+def classify_env_failure(stderr: str = "", stdout: str = "", summary: str = "",
+                         timedout: bool = False, endpoint: str = "") -> str:
+    """执行者是不是"根本没连上模型端点"？是就返回一段人话，否则返回空串。
+
+    这种失败不返工、不换模型——换一个型号还是同一个网络，只会再空烧几分钟。
+    调用方拿到非空结果就该停手，把原因和修法告诉用户。
+
+    提示要写到"用户照着就能做"的程度：这类失败九成是本机网络（没开 VPN/代理，
+    或者代理只接管了浏览器、没接管命令行），所以先让他查网络，再给两条替代路：
+    换个本机可达的模型，或者给这个型号配一条中转端点。
+
+    注意：调用方必须只在**模型一个字都没产出**时问这里。Codex 收尾时会打一条
+    `error sending request for url (https://chatgpt.com/backend-api/ps/mcp)`
+    （它自带的 MCP 通道），那条跟模型端点无关，不能据此判定"连不上"。
+    """
+    if timedout:
+        return ""
+    text = "\n".join([str(stderr or ""), str(stdout or ""), str(summary or "")]).lower()
+    hit = next((m for m in NETFAIL_MARKERS if m in text), "")
+    if not hit:
+        return ""
+    where = str(endpoint or "").strip() or "OpenAI 默认端点（chatgpt.com / api.openai.com）"
+    return (
+        f"执行者连不上模型端点（{hit}），目标是 {where}。\n"
+        f"这通常是网络问题：这台机器到该端点不通——没开 VPN/代理，或者代理只接管了浏览器、"
+        f"没接管命令行里的 codex。\n"
+        f"三条处理办法，任选一条：\n"
+        f"1) 连上 VPN/代理后，把这张卡重投一次（不用改任何配置）；\n"
+        f"2) 换个本机可达的模型：网页右栏点「执行」的模型徽章，或在群里发 "
+        f"`/model 执行 <型号>`；\n"
+        f"3) 用的是自建中转的话，在 room/model_providers.json 里给这个型号配 base_url"
+        f"（写法见 README「执行者端点不通」一节）。"
+    )
 
 
 def codex_home(workspace: Path) -> Path:
@@ -237,6 +341,8 @@ def _run_codex_once(
         args += ["--model", model]
     if reasoning_effort:
         args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
+    provider_args, provider_env = provider_overrides(model)
+    args += provider_args
     args.append("-")  # 从 stdin 读取提示词，避开命令行长度与转义问题
 
     # Codex 的 workspace-write 沙箱只允许写工作区；把临时目录指进工作区，
@@ -248,31 +354,20 @@ def _run_codex_once(
         "TEMP": str(scratch), "TMP": str(scratch), "TMPDIR": str(scratch),
         "CODEX_HOME": str(home),
     })
+    child_env.update(provider_env)
 
     started = time.time()
-    timedout = False
     try:
-        proc = subprocess.run(
-            args,
-            cwd=str(ws),
-            input=prompt,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=child_env, creationflags=quiet_flags())
-        rc, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        timedout = True
-        rc = 124
-        stdout, stderr = _as_text(exc.stdout), _as_text(exc.stderr)
-        stderr += f"\n[bridge] 超时 {timeout}s，已终止。"
+        rc, stdout, stderr, timedout = run_capped(
+            args, cwd=str(ws), input_text=prompt, env=child_env, timeout=timeout)
     except OSError as exc:
         return {
             "ok": False, "exit": 127, "timedout": False, "seconds": 0,
             "codex": codex, "workspace": str(ws), "last": "", "stdout": "", "stderr": "",
             "summary": f"启动 Codex 失败：{exc}",
         }
+    if timedout:
+        stderr = f"{stderr}\n[bridge] 超时 {timeout}s，已终止（含子进程树）。"
     elapsed = int(time.time() - started)
 
     out_path.write_text(stdout or "", encoding="utf-8")
@@ -285,6 +380,20 @@ def _run_codex_once(
         last_path.write_text(last, encoding="utf-8")
 
     summary = next((ln.strip() for ln in last.splitlines() if ln.strip()), "")
+    # 连不上端点这种失败，单独留一张便签：派发/编排据此立刻停手，而不是再空跑一轮。
+    #
+    # 只在**一个字都没产出**时才这么判。Codex 退出后还会顺带打一条
+    # `error sending request for url (https://chatgpt.com/backend-api/ps/mcp)`——
+    # 那是它自带的 MCP 通道，跟模型端点无关：T-261102-200022 就是这样，
+    # 执行者其实已经改完文件并自验通过，却因为末尾这行噪声被判成"连不上"。
+    endpoint = str(_provider_spec(model).get("base_url") or "")
+    env_hint = ""
+    if not last.strip():
+        env_hint = classify_env_failure(stderr=stderr or "", stdout=stdout or "",
+                                        summary=summary, timedout=timedout, endpoint=endpoint)
+    hint_path = Path(str(prefix) + ".hint.txt")
+    if env_hint:
+        hint_path.write_text(env_hint + "\n", encoding="utf-8")
     # 收掉沙箱留下的空临时目录，别把工作区搞成"一堆不知名的东西"
     scratch_removed = prune_scratch(ws)
     return {
@@ -302,6 +411,9 @@ def _run_codex_once(
         "reasoning_effort": reasoning_effort or "（模型默认）",
         "tokens": _session_tokens(started, home),
         "scratch_removed": scratch_removed,
+        "env_error": env_hint,
+        "hint": str(hint_path) if env_hint else "",
+        "endpoint": endpoint,
     }
 
 

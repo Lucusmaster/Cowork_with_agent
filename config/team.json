@@ -3,35 +3,58 @@
     "gpt-6.1-terra": {
       "cli": "codex",
       "backend": "openai",
-      "aliases": ["terra", "gpt6"]
+      "aliases": [
+        "terra",
+        "gpt6"
+      ]
     },
     "gpt-6-luna": {
       "cli": "codex",
       "backend": "openai",
-      "aliases": ["luna"]
+      "aliases": [
+        "luna"
+      ]
     },
     "gpt-6.1-sol": {
       "cli": "codex",
       "backend": "openai",
-      "aliases": ["sol"]
+      "aliases": [
+        "sol"
+      ]
     },
     "deepseek-v4.1-flash": {
       "cli": "deepseek",
       "backend": "deepseek",
-      "aliases": ["deepseek", "ds"],
+      "aliases": [
+        "deepseek",
+        "ds"
+      ],
       "note": "需要本机装 deepseek CLI"
     },
     "claude-opus-5-5": {
       "cli": "claude",
       "backend": "anthropic",
-      "aliases": ["claude", "opus"],
+      "aliases": [
+        "claude",
+        "opus"
+      ],
       "note": "需要本机装 claude CLI"
+    },
+    "claude-sonnet-5": {
+      "cli": "codex",
+      "backend": "openai",
+      "note": "需要 room/model_providers.json 给这个型号配可达端点"
+    },
+    "claude-opus-4-8": {
+      "cli": "codex",
+      "backend": "openai",
+      "note": "需要 room/model_providers.json 给这个型号配可达端点"
     }
   },
   "executor": {
     "model": "gpt-6.1-terra",
     "reasoning_effort": "low",
-    "timeout": 900,
+    "timeout": 1800,
     "sandbox": "workspace-write",
     "fallback_models": [
       "gpt-6.1-sol",
@@ -44,8 +67,7 @@
     "timeout": 600,
     "sandbox": "read-only",
     "fallback_models": [
-      "gpt-6.1-terra",
-      "gpt-6.1-sol"
+      "claude-sonnet-5"
     ]
   },
   "agents": [

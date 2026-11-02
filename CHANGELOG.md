@@ -1,3 +1,62 @@
+## 0.9.30 — 不再「写完 plan.md 就停」：端点可配、连不上立刻停手、超时真能杀
+
+用户实测反馈：这一轮在 `plan.md` 写完之后就不动了，干等四分钟后直接报错，代码一行没写。
+查下来是**三个叠在一起的问题**，这次一并修掉。
+
+### 1. 抓到的三层原因
+
+1. **执行者根本没连上模型端点。** `~/.codex/config.toml` 里只有 `model`/`effort`，没有任何
+   `[model_providers]`；这台机器直连 `chatgpt.com` / `api.openai.com` 超时，
+   `exec-*.err.txt` 里是 `workspace routing discovery timed out`、
+   `error sending request for url`，`--output-last-message` 落出 0 字节。
+2. **编排把"环境失败"当成"代码没写对"。** 验收自然不过 → 自动返工第二轮 → 再撞同一个网络，
+   于是用户看到的是"两轮 × 四分钟"的静默，压根不是"卡在计划阶段"。
+3. **超时在 Windows 上根本杀不掉。** 换到可用端点后暴露出来：执行者 900s 超时后，
+   `subprocess.run(timeout=)` 只 kill 直接子进程，收尾那次 `communicate()` 没有超时，
+   孙进程还握着 stdout 管道 → dispatch 又挂了 20 分钟不返回，编排也跟着吊死。
+
+### 2. 改了什么
+
+- **端点按型号配**（`agent_team/models.py` 的 `model_provider()` + `agent_team/codex_bridge.py`）：
+  `room/model_providers.json` 优先、`config/team.json` 的 `model_providers` 兜底，给单个型号写
+  `base_url` / `env_key` / `key_store` / `wire_api`；桥把它翻成
+  `-c model_provider=workbench -c model_providers.workbench.*` 并注入密钥。
+  **不碰 `~/.codex/config.toml`**——这台机器上别的 Codex 用法、CC Switch 的 Claude 路由都不受影响。
+  密钥优先读环境变量，读不到就取 API 菜单里存过的那份（`room/api_keys.json`），配置文件里不放 key。
+  `wire_api` 只支持 `responses`：Codex 0.166 起 `chat` 已被移除，写 `chat` 会直接报错退出。
+- **连不上就停手**（`codex_bridge.classify_env_failure()` + `worker._stop_env_blocked()`）：
+  认 Codex 自己的网络报错措辞（`workspace routing discovery timed out` /
+  `failed to refresh available models` / `error sending request for url` / `transport channel closed` /
+  `failed to connect` / `connection refused`），命中就写 `tasks/<id>/exec-NN.hint.txt`、
+  在 `rounds[]` 里记 `env_error` 与 `endpoint`、群里发一条说明；编排看到便签**只跑一轮就停**，
+  不验收、不返工、不烧第二遍，并在卡上留 `note` 讲清怎么修。
+- **提示直接说人话、能照着做**：不再只说"连不上端点"，而是写清目标端点
+  （没配中转时点名 `OpenAI 默认端点（chatgpt.com / api.openai.com）`）、点出最常见的原因
+  （没开 VPN/代理，或者**代理只接管了浏览器、没接管命令行里的 codex**），然后给三条替代路：
+  ① 连上 VPN 后把这张卡重投（不用改配置）；② 换本机可达的模型（网页右栏模型徽章，或群里
+  `/model 执行 <型号>`，并附上当前可选型号清单）；③ 在 `room/model_providers.json` 里给这个型号配中转端点。
+- **超时真能杀**（`agent_team/winproc.py` 的 `run_capped()` / `kill_tree()`）：
+  `subprocess.run(timeout=)` 换成 Popen + `communicate(timeout)`，超时先 `taskkill /PID … /T /F`
+  杀整棵进程树，再最多等 10s 收尾；收尾还收不回来就关管道返回 `124`。
+  Codex 桥和编排的 `run_step()` 都改走它；编排给执行者单轮留 1900s（比 `executor.timeout` 的 1800s 略大，
+  否则编排先把自己的子进程掐了，执行者的日志就全丢了）。
+- **默认 `executor.timeout` 900 → 1800s**：走中转时一轮就是很慢，900s 会把正常的轮次掐掉。
+- **顺带两处提示修正**：执行者模板里写死的「模型 gpt-6-luna」改成「任务卡指定的模型」；
+  prompt 里的「当前工作目录」改成真实产物工作区（之前写的是协作台仓库根）。
+
+### 3. 证据
+
+- 新增 13 项测试：`tests/test_codex_bridge.py`（端点表读取、`-c` 覆盖、密钥从本机存储注入、
+  真跑一次假 codex 看 argv/env、网络失败分类、便签落盘、便签读取）与
+  `tests/test_capped_run.py`（**孙进程握着管道时也必须几秒内返回**、正常命令输出、stdin 透传、缺 timeout 报错）。
+  第一项就是这次 20 分钟挂死的回归守卫。
+- 全套 722 项通过（`python -m unittest discover -s tests -t .`），`ruff check agent_team tests` 干净；
+  `config/team.json` 与 `agent_team/bundled/config/team.json`、`agents/executor.md` 与内置副本已同步。
+- 实测：`room/model_providers.json` 把 `claude-sonnet-5` 指到本机可达的中转后，
+  同一句鹈鹕需求重投，执行者 `codex exec` 的 argv 里带上
+  `-c model_providers.workbench.base_url="https://api.xunnia.com/v1"`，
+  真的开始改 `E:\测智商\pelican_bicycle.html`（不再是 0 字节 last message）。
+
 ## 0.9.29 — API 那栏「环境变量名」的坑：小写/留空/贴错 key 都不再报错
 
 用户实测反馈：在 API 组里填 DeepSeek 官方地址后，把 `sk-...` 贴进「key 所在的环境变量」
