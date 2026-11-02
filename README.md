@@ -561,6 +561,22 @@ python bin/team.py report -t <ID>
 换模型或档位有四层，按优先级：`dispatch` 命令行参数 → 任务卡里的 `executor: {model, effort}`（`new --model/--effort` 写入）→ **运行时切换**（见下）→ `config/team.json`；环境变量 `EXECUTOR_MODEL` / `EXECUTOR_EFFORT` 会覆盖配置文件里的默认值。
 每轮消耗的 tokens 会自动从 Codex 会话日志读回、写进 `task.json` 的 `rounds[].tokens`。
 
+模型额度打满（CLI 报 `Selected model is at capacity`）时，执行者会按 `executor.fallback_models`
+的顺序降级重试，而不是拿着同一张卡用同一个打满的模型再撞一次：
+
+```json
+"executor": {
+  "model": "gpt-6.1-terra",
+  "fallback_models": ["gpt-6.1-sol", "gpt-6-luna"]
+}
+```
+
+- 只有"容量 / 限流"这类失败才换模型；补丁冲突、语法错这种真失败立刻收手，不换模型重跑；
+- 链里写别名（`luna`）也认，会自动归一、去重，并排掉本轮已经用过的主模型；
+- 降级链里混着别的 CLI 的型号，会按每个型号自己的 CLI 路由；指向本机没装的 CLI 就跳过；
+- 真换过模型会写进 `task.json` 的 `rounds[].fallback_note`，命令行和群里也会打出
+  "原定 A，容量满载，降级为 B"。复核者的同名配置一直支持，逻辑同一套（`agent_team/fallback.py`）。
+
 ### 运行时换模型（不用改配置、不用重启）
 
 三个入口，改的都是同一个运行时覆盖文件 `room/model_overrides.json`，**下一张卡生效**：

@@ -96,9 +96,18 @@ class SanitizeTests(unittest.TestCase):
     def test_unknown_command_still_falls_back(self) -> None:
         card = worker.sanitize_plan({
             "title": "t", "goal": "g", "acceptance": ["a"],
-            "verify": ["curl http://example.com"], "scope": ["a.html"],
+            "verify": ["curl http://example.com"], "scope": ["tools/"],
         })
         self.assertEqual(card["verify"], [worker.DEFAULT_VERIFY])
+
+    def test_unknown_command_on_a_static_page_checks_the_product(self) -> None:
+        """空目录里做静态页：兜底也得是"检查产物"，不能退回 unittest。"""
+        card = worker.sanitize_plan({
+            "title": "t", "goal": "g", "acceptance": ["a"],
+            "verify": ["curl http://example.com"], "scope": ["pelican_bicycle.html"],
+        })
+        self.assertNotIn(worker.DEFAULT_VERIFY, card["verify"])
+        self.assertTrue(card["verify"][0].startswith("python -c"))
 
 
 if __name__ == "__main__":

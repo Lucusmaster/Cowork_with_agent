@@ -69,6 +69,13 @@ SAFE_VERIFY_PREFIXES = (
 )
 DEFAULT_VERIFY = "python -m unittest discover -s tests -t . -v"
 
+# 这些后缀的产出不需要"测试"，存在且能被解析就算过——空目录里做静态页时，
+# 硬塞 unittest discover 只会得到 `ImportError: Start directory is not importable: 'tests'`。
+STATIC_PRODUCT_SUFFIXES = (
+    ".html", ".htm", ".css", ".js", ".mjs", ".svg", ".md", ".txt",
+    ".json", ".csv", ".yml", ".yaml", ".toml", ".xml",
+)
+
 PLANNER_PROMPT = """你是一个任务规划助手。根据用户这条需求，产出一个严格 JSON 任务卡（不要输出任何解释、不要 Markdown 代码块）。
 
 用户需求：
@@ -301,7 +308,50 @@ def detect_workspace(text: str) -> tuple[Path | None, str]:
     return None, "没有指定要改哪个项目（给我一个仓库目录的绝对路径，例如 " + str(ROOT.parent / "my-project") + "）"
 
 
-def sanitize_plan(plan: dict) -> dict:
+def _static_products(scope: list[str]) -> list[str]:
+    return [item for item in scope if item.lower().endswith(STATIC_PRODUCT_SUFFIXES)]
+
+
+def _py_products(scope: list[str]) -> list[str]:
+    return [item for item in scope if item.lower().endswith(".py")]
+
+
+def default_verify(workspace: Path | None = None, scope: list[str] | None = None) -> str:
+    """验收命令兜底：按这次任务的产出挑，而不是一律 unittest。
+
+    规划器/大脑给的命令不在白名单里时（前缀写错、用了本机没有的 CLI），以前直接换成
+    `unittest discover -s tests -t . -v`；在空目录里做一张静态页，这条命令必然
+    `ImportError: Start directory is not importable: 'tests'`，两轮都卡死在验收上
+    （T-261102-012458）。现在的优先级：
+
+    1. scope 点名了 HTML/文档/配置这类静态产物 → `python -c` 断言这些文件都在；
+    2. 工作区本来就有 `tests/` → unittest discover（老行为，代码任务照旧）；
+    3. scope 点名了 .py → `python -m py_compile`（至少证明能编译）；
+    4. 什么都判断不出来 → unittest discover（保持老行为，失败原因也看得懂）。
+    """
+    workspace = Path(workspace) if workspace else None
+    scope_items = [str(item).replace("\\", "/").strip() for item in (scope or []) if str(item).strip()]
+    # 兜底命令是拼进 `python -c "..."` 的字面量：带引号/换行的路径直接跳过，别拼坏
+    scope_items = [item for item in scope_items if "'" not in item and '"' not in item]
+
+    products = _static_products(scope_items)
+    if products:
+        names = "', '".join(products[:8])
+        code = ("import pathlib, sys; missing = [n for n in ('" + names + "',) "
+                "if not pathlib.Path(n).is_file()]; print('missing:', missing); "
+                "sys.exit(1 if missing else 0)")
+        return f'python -c "{code}"'
+
+    if workspace is not None and (workspace / "tests").is_dir():
+        return DEFAULT_VERIFY
+
+    py_files = _py_products(scope_items)
+    if py_files:
+        return "python -m py_compile " + " ".join(py_files[:8])
+    return DEFAULT_VERIFY
+
+
+def sanitize_plan(plan: dict, workspace: Path | None = None) -> dict:
     verify = [v for v in (plan.get("verify") or []) if isinstance(v, str) and v.strip()]
     safe = []
     for cmd in verify:
@@ -310,8 +360,6 @@ def sanitize_plan(plan: dict) -> dict:
             continue
         if lowered.startswith(SAFE_VERIFY_PREFIXES):
             safe.append(cmd.strip())
-    if not safe:
-        safe = [DEFAULT_VERIFY]
     acceptance = [a.strip() for a in (plan.get("acceptance") or []) if str(a).strip()][:6]
     if not acceptance:
         acceptance = ["验收命令全部通过"]
@@ -322,6 +370,9 @@ def sanitize_plan(plan: dict) -> dict:
             scope.append(item)
     if not scope:
         scope = ["tools/", "tests/"]
+    if not safe:
+        # 兜底也要看产出：空目录里做静态页，别再退回 unittest discover
+        safe = [default_verify(workspace, scope)]
     return {
         "title": str(plan.get("title") or "").strip()[:60] or "自动任务",
         "goal": str(plan.get("goal") or "").strip() or "（规划器未给出目标）",
@@ -365,8 +416,11 @@ def plan_with_codex(request: str, workspace: Path) -> dict | None:
 
 
 # ---------------- 多任务拆分 + 并行分析 ----------------
-def split_cards(plan: dict) -> list[dict]:
-    """大脑的 task / tasks 规范成任务卡列表（tasks 优先，坏条目直接丢）。"""
+def split_cards(plan: dict, workspace: Path | None = None) -> list[dict]:
+    """大脑的 task / tasks 规范成任务卡列表（tasks 优先，坏条目直接丢）。
+
+    `workspace` 只是给验收命令兜底用（有 `tests/` 才退回 unittest），可以不给。
+    """
     raw = plan.get("tasks")
     items: list = []
     if isinstance(raw, list) and raw:
@@ -375,7 +429,7 @@ def split_cards(plan: dict) -> list[dict]:
         items = [plan["task"]]
     cards = []
     for item in items:
-        card = sanitize_plan(item)
+        card = sanitize_plan(item, workspace)
         if not card["title"] or card["title"] == "自动任务" and not item.get("goal"):
             continue
         cards.append(card)
@@ -772,7 +826,7 @@ def handle_continue(request: str) -> None:
             f"要做新东西就直接说需求。")
         return
 
-    card = sanitize_plan(plan)
+    card = sanitize_plan(plan, workspace)
     card["title"] = f"[第{stage}阶段] {card['title']}"[:40]
     log(f"继续阶段 {stage}：{card['title']} | 验收 {len(card['acceptance'])} 条")
 
@@ -1040,7 +1094,7 @@ def handle_chat(request: str) -> None:
         if asked and not imperative:
             room.post("deepseek", "要我现在就让 Codex 动手吗？回一句「动手」或「继续」我就开工。", "msg")
             return
-        cards = split_cards(plan)
+        cards = split_cards(plan, workspace)
         if not cards:
             room.post("deepseek",
                       "我大致明白你要什么，但拆不出可执行的任务卡。你说清「改哪个文件、做到什么程度、怎么算成功」，我就动手。",

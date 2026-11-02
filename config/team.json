@@ -32,7 +32,11 @@
     "model": "gpt-6.1-terra",
     "reasoning_effort": "low",
     "timeout": 900,
-    "sandbox": "workspace-write"
+    "sandbox": "workspace-write",
+    "fallback_models": [
+      "gpt-6.1-sol",
+      "gpt-6-luna"
+    ]
   },
   "reviewer": {
     "model": "gpt-6-luna",

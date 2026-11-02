@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from . import agent_clis
+from . import fallback
 from .winproc import quiet_flags
 
 READ_ONLY_DENY = ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
@@ -82,11 +83,39 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 def run_claude(prompt: str, workspace: str | None = None, out_prefix: str | None = None,
                sandbox: str = "workspace-write", timeout: int = 1200, model: str = "",
-               reasoning_effort: str = "") -> dict:
-    """跑一次 Claude Code。不抛异常，失败用 ok=False 表达；字段和 run_codex 一致。"""
+               reasoning_effort: str = "", fallback_models: list[str] | None = None) -> dict:
+    """跑一次 Claude Code。不抛异常，失败用 ok=False 表达；字段和 run_codex 一致。
+
+    容量满载（`at capacity`）时按 `fallback_models` 依次降级；重试和判定都在
+    `fallback` 里，这里只负责"用某个模型跑一次"。走 `run_codex` 的调用方已经由
+    `run_codex` 统一做降级，这里保留同名参数是为了直接调用 `run_claude` 时行为一致。
+    """
+    models_to_try = fallback.attempt_models(model, fallback_models)
+
+    def attempt(try_model: str, index: int) -> dict:
+        return _run_claude_once(
+            prompt=prompt,
+            workspace=workspace,
+            out_prefix=out_prefix,
+            sandbox=sandbox,
+            timeout=timeout,
+            model=try_model,
+            reasoning_effort=reasoning_effort,
+            attempt=index,
+        )
+
+    return fallback.run_with_fallback(attempt, models_to_try, label="claude")
+
+
+def _run_claude_once(prompt: str, workspace: str | None, out_prefix: str | None,
+                     sandbox: str, timeout: int, model: str, reasoning_effort: str,
+                     attempt: int) -> dict:
+    """执行一次 Claude Code 调用（内部函数，供 run_claude / run_codex 的降级重试使用）。"""
     ws = Path(workspace or agent_clis.ROOT).resolve()
     if out_prefix:
         prefix = Path(out_prefix).resolve()
+        if attempt > 0:
+            prefix = Path(str(prefix) + f"-attempt{attempt}")
     else:
         prefix = agent_clis.ROOT / "room" / "claude-runs" / f"claude-{os.getpid()}-{int(time.time())}"
     prefix.parent.mkdir(parents=True, exist_ok=True)

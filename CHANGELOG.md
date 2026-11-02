@@ -1,3 +1,48 @@
+## 0.9.23 — 鹈鹕骑车那一晚：验收命令看产出，模型满载会降级
+
+一张"用 HTML 画一只骑自行车的鹈鹕"的卡（T-261102-012458）两轮都没过，两轮的原因还不一样。
+顺着它修了三处。
+
+### 1. 验收命令不再一律 unittest（9c4d18a / 029f83b）
+
+空工作区里做一个静态页，规划器却给了 `python -m unittest discover -s tests -t . -v`——
+`ImportError: Start directory is not importable: 'tests'`，两轮都死在验收的第一步。
+
+- 规划者 / 验收者 / 大脑的提示词改成按产出挑命令，并把工作区现状（顶层有哪些文件、
+  有没有 `tests/`）一起喂进去，空目录里不会再照抄 `discover -s tests`；
+- 白名单补 `python -c`、`python -m json.tool`、`node --check`；`parse_verify_argv`
+  改成引号感知：`python -c "import sys; …"` 整段作为参数传下去，引号外的 `| ; >`
+  照旧拒绝，仍然不经过 shell；
+- 白名单外的命令，**兜底也看产出**：scope 点名了 HTML / 文档 / 配置 →
+  用 `python -c` 断言这些产物都在；点名了 `.py` 且工作区没有 `tests/` →
+  `python -m py_compile`；只有工作区真有 `tests/` 才回到 `unittest discover`。
+
+### 2. 模型满载会降级，不再拿同一张卡撞同一堵墙
+
+执行者第一轮烧掉 9.7 万 tokens 之后空手而归，日志里只有一句
+`ERROR: Selected model is at capacity. Please try a different model.`；
+第二轮 13 秒后又用同一个模型、同一个打满的额度再撞一次。
+
+- 新增 `agent_team/fallback.py`：只认"容量 / 限流"这一类结论才换模型；普通失败
+  （补丁冲突、语法错）立刻收手，不拿别的模型把真问题重跑一遍；
+- `run_codex` / `run_claude` 共用这条重试：每个候选模型各自按注册表路由，
+  降级链里混着别的 CLI 的型号也跑得对；某条降级链指向本机没装的 CLI 就跳过它，
+  不按死整条链；
+- `config/team.json` 的 `executor.fallback_models`（复核者本来就有同名配置）支持写别名，
+  自动归一、去重、排掉本轮实际用的主模型；换过模型会在 `task.json` 的
+  `rounds[].fallback_note`、`room` 事件和命令行里写明"原定 A，容量满载，降级为 B"；
+- 顺手修了注册表的一个坑：`fallback_models: ["luna"]` 这种别名会被"自动收录"成一个
+  叫 `luna` 的幽灵型号、菜单里多一条、`resolve("luna")` 直接命中它——现在先按别名
+  归一，再决定要不要收录。
+
+### 3. 证据
+
+- 新增 `tests/test_fallback.py`（28 项）：容量判定、降级顺序与留痕、跨 CLI 路由、
+  配置归一、验收命令兜底；其中一组**真的起一个假 codex 子进程**跑完整条链
+  （满载 → 降级 → 拿到产物），另有一组把验收命令**真跑**一遍（产物没生成 → 退出码 1，
+  生成后 → 0）；
+- 全套 641 项通过，`ruff check .` 干净。
+
 ## 0.9.22 — 图标不再是白纸（Pillow 的 ICO 写入器不能用）
 
 0.9.21 的图标装上桌面后显示成一张白纸——就是"无法识别的文件"那个样子。

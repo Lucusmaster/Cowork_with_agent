@@ -369,6 +369,9 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         task["ledger_baseline"] = ledger_snapshot()
         save_task(task)
 
+    # 容量降级链：执行者容量满载时按顺序换的备用模型（排掉本轮实际用的主模型）
+    fallback_chain = models.fallback_models("executor", exclude=model or "")
+
     print(f"产物工作区: {task_workspace(task)}")
     print(f"协作账本:   {ROOT}")
     room_event(f"开始第 {round_no} 轮执行 {tid}（{model or '默认模型'} / {effort or '默认档'}"
@@ -376,6 +379,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                tid, "dispatch", "run", "codex")
     print(f"第 {round_no} 轮派发 → Codex（模型: {model or '默认'}（{model_source}），"
           f"推理档: {effort or '默认'}，超时 {timeout}s）")
+    if fallback_chain:
+        print(f"  容量降级链: {' → '.join(fallback_chain)}")
     result = run_codex(
         prompt,
         workspace=str(task_workspace(task)),
@@ -384,6 +389,7 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         timeout=timeout,
         model=model or "",
         reasoning_effort=effort or "",
+        fallback_models=fallback_chain,
     )
 
     task.setdefault("rounds", []).append({
@@ -397,18 +403,23 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         "result": Path(result["last"]).name if result["last"] else "",
         "summary": result["summary"],
         "model": result.get("model", "") or model,
+        "model_requested": model,
         "model_source": model_source,
         "effort": result.get("reasoning_effort", ""),
         "tokens": result.get("tokens"),
+        "fallback_note": result.get("fallback_note", ""),
     })
     task["status"] = "executed" if result["ok"] else "exec-failed"
     task["updated_at"] = now_iso()
     save_task(task)
 
+    fallback_msg = f" [{result.get('fallback_note')}]" if result.get("fallback_note") else ""
     room_event(f"执行结束 {tid} 第 {round_no} 轮：退出码 {result['exit']}，{result['seconds']}s，"
-               f"{result.get('tokens') or '?'} tokens",
+               f"{result.get('tokens') or '?'} tokens{fallback_msg}",
                tid, "dispatch", "ok" if result["ok"] else "bad", "codex")
     print(f"退出码: {result['exit']}  耗时: {result['seconds']}s  用量: {result.get('tokens') or '未取到'} tokens")
+    if result.get("fallback_note"):
+        print(f"⚠ {result['fallback_note']}")
     print(f"产物: {result['last'] or '（无）'}")
     if not result["ok"]:
         print(f"执行者未正常结束，看日志: {result['stderr']}")

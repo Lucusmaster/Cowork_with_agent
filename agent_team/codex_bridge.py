@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from . import fallback
 from .winproc import quiet_flags
 from pathlib import Path
 from .paths import workbench_root  # noqa: E402
@@ -154,24 +155,61 @@ def run_codex(
     timeout: int = 1200,
     model: str = "",
     reasoning_effort: str = "",
+    fallback_models: list[str] | None = None,
 ) -> dict:
     """跑一次 Codex，返回结果字典（不抛异常，失败用 ok=False 表达）。
 
     这里也是所有角色调模型的唯一入口：注册表里这个模型的 `cli` 是 claude，就转给
     `claude_bridge`；是别的、协作台还没有执行适配的 CLI，就如实失败，不拿 codex 硬跑。
+
+    模型容量满载（`at capacity`）时按 `fallback_models` 依次降级——每个候选模型
+    各自按注册表路由，所以降级链里混着别的 CLI 的型号也跑得对。
     """
-    route = _route(model)
-    if route == "claude":
-        from .claude_bridge import run_claude
-        return run_claude(prompt, workspace=workspace, out_prefix=out_prefix, sandbox=sandbox,
-                          timeout=timeout, model=model, reasoning_effort=reasoning_effort)
-    if route != "codex":
-        return _no_adapter(route, model, workspace, out_prefix)
+    models_to_try = fallback.attempt_models(model, fallback_models)
+
+    def attempt(try_model: str, index: int) -> dict:
+        route = _route(try_model)
+        if route == "claude":
+            from .claude_bridge import _run_claude_once
+            return _run_claude_once(
+                prompt, workspace=workspace, out_prefix=out_prefix, sandbox=sandbox,
+                timeout=timeout, model=try_model, reasoning_effort=reasoning_effort,
+                attempt=index)
+        if route != "codex":
+            return _no_adapter(route, try_model, workspace, out_prefix)
+        return _run_codex_once(
+            prompt=prompt,
+            workspace=workspace,
+            out_prefix=out_prefix,
+            sandbox=sandbox,
+            timeout=timeout,
+            model=try_model,
+            reasoning_effort=reasoning_effort,
+            attempt=index,
+        )
+
+    return fallback.run_with_fallback(attempt, models_to_try, label="codex")
+
+
+def _run_codex_once(
+    prompt: str,
+    workspace: str | None,
+    out_prefix: str | None,
+    sandbox: str,
+    timeout: int,
+    model: str,
+    reasoning_effort: str,
+    attempt: int,
+) -> dict:
+    """执行一次 Codex 调用（内部函数，供 run_codex 降级逻辑使用）。"""
     ws = Path(workspace or ROOT).resolve()
     scratch = ws / ".tmp"
     scratch.mkdir(parents=True, exist_ok=True)
     if out_prefix:
         prefix = Path(out_prefix).resolve()
+        # 多次尝试时加后缀避免覆盖
+        if attempt > 0:
+            prefix = Path(str(prefix) + f"-attempt{attempt}")
     else:
         prefix = scratch / f"codex-{os.getpid()}-{int(time.time())}"
     prefix.parent.mkdir(parents=True, exist_ok=True)

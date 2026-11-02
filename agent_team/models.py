@@ -110,7 +110,12 @@ def registry(cfg: dict | None = None) -> dict[str, dict]:
                     out[mid] = {"cli": agent, "backend": "", "aliases": [], "note": "本机登记"}
     except Exception:  # noqa: BLE001 - 登记文件坏了不能让注册表跟着挂
         pass
-    # 自动收录：配置文件里凡是提到过的型号都算"认识"
+    # 自动收录：配置文件里凡是提到过的型号都算"认识"。
+    # 但要先按别名归一：`fallback_models: ["luna"]` 里的 luna 是 gpt-6-luna 的别名，
+    # 不能因此凭空多出一个叫 luna 的型号（否则模型菜单里出现幽灵条目，
+    # 而 `resolve("luna")` 也会直接命中这个幽灵 id，别名等于失效）。
+    alias_to_id = {str(alias).lower(): mid
+                   for mid, spec in out.items() for alias in spec.get("aliases") or [] if str(alias).strip()}
     mentioned: list[str] = []
     for entry in _agent_entries(cfg):
         mentioned.append(str(entry.get("model") or "").strip())
@@ -120,8 +125,11 @@ def registry(cfg: dict | None = None) -> dict[str, dict]:
             mentioned.append(str(block.get("model") or "").strip())
             mentioned.extend(str(m).strip() for m in (block.get("fallback_models") or []))
     for mid in mentioned:
-        if mid and mid not in out:
-            out[mid] = {"cli": "codex", "backend": "", "aliases": [], "note": "自动收录"}
+        if not mid:
+            continue
+        canonical = alias_to_id.get(mid.lower(), mid)
+        if canonical not in out:
+            out[canonical] = {"cli": "codex", "backend": "", "aliases": [], "note": "自动收录"}
     return out
 
 
@@ -253,6 +261,37 @@ def effort_for(role: str) -> str:
     if isinstance(block, dict) and str(block.get("reasoning_effort") or "").strip():
         return str(block["reasoning_effort"]).strip()
     return ""
+
+
+def fallback_models(role: str, exclude: str = "") -> list[str]:
+    """降级链：模型容量满载（`at capacity`）时按顺序尝试的备用模型。
+
+    只读配置里这个角色块的 `fallback_models`（`executor` / `reviewer` 都支持），
+    没有就返回空列表（不自动降级）。返回的是**规范 id**：配置里写别名（`luna`）
+    也认，认不出的型号原样保留，让下游 CLI 自己报错；`exclude` 用来排掉主模型
+    ——运行时把执行者切到 luna 之后，链里不该再出现 luna 试第二遍。
+    """
+    role = resolve_role(role) or str(role or "").strip()
+    cfg = config()
+    block = cfg.get(role)
+    if not isinstance(block, dict):
+        return []
+    raw = block.get("fallback_models")
+    if not isinstance(raw, list):
+        return []
+    skip = str(exclude or "").strip().lower()
+    chain: list[str] = []
+    seen = {skip} if skip else set()
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        name = resolve(text) or text
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        chain.append(name)
+    return chain
 
 
 def clis() -> dict[str, bool]:
